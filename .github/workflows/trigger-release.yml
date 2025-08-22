@@ -13,8 +13,18 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.event.issue.title, 'release')
     steps:
+      - name: Generate GitHub App Token
+        id: generate_token
+        uses: tibdex/github-app-token@v2
+        with:
+          app_id: ${{ secrets.APP_ID }}
+          private_key: ${{ secrets.PRIVATE_KEY }}
+
       - name: Checkout main branch
         uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ steps.generate_token.outputs.token }}
 
       - name: Parse release issue title
         id: parse_title

@@ -16,6 +16,9 @@ jobs:
     name: Release
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v4
@@ -41,5 +44,5 @@ jobs:
           version: npm run ci:version
           publish: ./scripts/release.sh ${{ github.event.before }} ${{ github.event.after }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.ORG_PAT }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN_ELEVATED }}

@@ -6,6 +6,10 @@ on:
     - cron: '0 * * * *'
   workflow_dispatch:
 
+permissions:
+  contents: write
+  pull-requests: write
+
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
 jobs:
@@ -58,7 +62,6 @@ jobs:
         with:
           version: npm run ci:version
           publish: npm run ci:release
-          ignore: microfox-scripts
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.ORG_PAT }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN_ELEVATED }}

@@ -20,7 +20,7 @@ jobs:
         with:
           # Checkout the main branch explicitly
           ref: main
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.ORG_PAT }}
 
       - name: Parse release issue title
         id: parse_title
@@ -78,7 +78,7 @@ jobs:
 
       - name: Close the issue
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.ORG_PAT }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
           gh issue close $ISSUE_NUMBER --comment "Changeset file created and pushed. Closing issue."

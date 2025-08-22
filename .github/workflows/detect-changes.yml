@@ -168,7 +168,11 @@ jobs:
             echo "Changes detected in .changeset/ or CHANGELOG.md. Committing..."
             git config --local user.email "github-actions[bot]@users.noreply.github.com"
             git config --local user.name "github-actions[bot]"
-            git add .changeset/ CHANGELOG.md # Only add these specific paths
+            git add .changeset/ # Add the changeset directory
+            # Add root CHANGELOG.md if it exists, but don't error if it doesn't
+            git add CHANGELOG.md 2>/dev/null || true
+            # Add any CHANGELOG.md files within the packages directory
+            find packages/ -name "CHANGELOG.md" -exec git add {} + 2>/dev/null || true
             # Customize commit message, maybe include PR number if available
             PR_NUMBER=$(echo "${{ github.event.head_commit.message }}" | sed -n 's/Merge pull request #\([0-9]*\).*/\1/p')
             COMMIT_MSG="chore: add changeset(s) and update changelog"

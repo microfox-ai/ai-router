@@ -15,9 +15,6 @@ jobs:
     steps:
       - name: Checkout main branch
         uses: actions/checkout@v4
-        with:
-          ref: main
-          token: ${{ steps.generate_token.outputs.token }}
 
       - name: Parse release issue title
         id: parse_title

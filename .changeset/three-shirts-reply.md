@@ -1,5 +1,5 @@
 ---
-'@ai-router': major
+'@microfox/ai-router': patch
 ---
 
 init package

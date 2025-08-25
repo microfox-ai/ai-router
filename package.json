@@ -1,5 +1,5 @@
 {
-  "name": "@microfox/ai-router",
+  "name": "ai-router",
   "version": "1.0.0",
   "scripts": {
     "changeset": "changeset",

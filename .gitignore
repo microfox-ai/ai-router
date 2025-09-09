@@ -12,6 +12,7 @@ server/dist
 public/dist
 .turbo
 test-results
+.plan
 
 # Microfox report files
 packages/*/research-report.md

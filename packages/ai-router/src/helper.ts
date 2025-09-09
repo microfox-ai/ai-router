@@ -31,21 +31,20 @@ export class StreamWriter<METADATA, TOOLS extends UITools> {
       messageMetadata: metadata as NEW_METADATA,
     });
   };
-  writeCustomTool = <K extends keyof TOOLS>(
-    tool: {
-      toolCallId?: string;
-      toolName: K;
-      inputTextDelta?: string[];
-      input?: any;
-      output?: any;
-    } & Omit<TOOLS[K], 'toolCallId'>
-  ) => {
-    const toolCallId = tool.toolName?.toString() + '-' + this.generateId();
+  writeCustomTool = <K extends keyof TOOLS>(tool: {
+    toolCallId?: string;
+    toolName: K;
+    inputTextDelta?: string[];
+    input?: any;
+    output?: any;
+  }) => {
+    const toolCallId =
+      tool.toolCallId || tool.toolName?.toString() + '-' + this.generateId();
     if ('input' in tool && tool.input) {
       this.writer.write({
         type: 'tool-input-available' as const,
         input: tool.input,
-        toolCallId: toolCallId || tool.toolCallId || '',
+        toolCallId: toolCallId,
         toolName: tool.toolName as string,
       });
     }
@@ -55,14 +54,14 @@ export class StreamWriter<METADATA, TOOLS extends UITools> {
     ) {
       this.writer.write({
         type: 'tool-input-start' as const,
-        toolCallId: toolCallId || tool.toolCallId || '',
+        toolCallId: toolCallId,
         toolName: tool.toolName as string,
       });
       if (tool.inputTextDelta) {
         for (const delta of tool.inputTextDelta) {
           this.writer.write({
             type: 'tool-input-delta' as const,
-            toolCallId: toolCallId || tool.toolCallId || '',
+            toolCallId: toolCallId,
             inputTextDelta: delta,
           });
         }
@@ -71,16 +70,17 @@ export class StreamWriter<METADATA, TOOLS extends UITools> {
     if ('output' in tool && tool.output) {
       this.writer.write({
         type: 'tool-output-available' as const,
-        toolCallId: toolCallId || tool.toolCallId || '',
+        toolCallId: toolCallId,
         output: tool.output,
       });
     }
   };
   writeObjectAsTool = <K extends keyof TOOLS>(tool: {
     toolName: K;
-    result: GenerateObjectResult<TOOLS[K]['output']>;
+    result?: GenerateObjectResult<TOOLS[K]['output']>;
+    input?: GenerateObjectResult<TOOLS[K]['input']>;
   }) => {
-    if (!tool.result.object) {
+    if (!tool.result?.object) {
       throw new Error('No object found in the GenerateObjectResult');
     }
 
@@ -95,18 +95,21 @@ export class StreamWriter<METADATA, TOOLS extends UITools> {
     this.writer.write({
       type: 'tool-input-available' as const,
       toolCallId: toolCallId,
-      input: {
-        usage: tool.result.usage,
-        warnings: tool.result.warnings,
-        finishReason: tool.result.finishReason,
-      },
+      input:
+        (tool.input ?? tool.result)
+          ? {
+              usage: tool.result?.usage,
+              warnings: tool.result?.warnings,
+              finishReason: tool.result?.finishReason,
+            }
+          : undefined,
       toolName: tool.toolName as string,
     });
 
     this.writer.write({
       type: 'tool-output-available' as const,
       toolCallId: toolCallId,
-      output: tool.result.object,
+      output: tool.result?.object,
     });
   };
 }

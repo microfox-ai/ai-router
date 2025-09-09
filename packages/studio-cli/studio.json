@@ -1,0 +1,21 @@
+{
+  "version": "0.1.0",
+  "templates": {
+    "perplexity-clone": {
+      "name": "Perplexity Clone",
+      "description": "The default starter kit with a full-featured UI.",
+      "dependencies": ["@upstash/redis", "zod", "ai"],
+      "devDependencies": ["@types/node"],
+      "shadcnComponents": ["button", "card", "dialog", "tabs"],
+      "files": "https://cdn.microfox.ai/templates/perplexity-clone-v0.1.0.tar.gz"
+    },
+    "minimal": {
+      "name": "Minimal Starter",
+      "description": "A minimal setup with only the core dependencies.",
+      "dependencies": ["ai"],
+      "devDependencies": [],
+      "shadcnComponents": ["button"],
+      "files": "https://cdn.microfox.ai/templates/minimal-v0.1.0.tar.gz"
+    }
+  }
+}

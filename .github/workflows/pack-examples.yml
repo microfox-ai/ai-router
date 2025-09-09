@@ -1,0 +1,43 @@
+name: Pack Changed Examples
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'examples/**'
+
+jobs:
+  pack-on-change:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 
+
+      - name: Setup Node.js 20.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Get Changed Example Files
+        id: changed-examples
+        uses: tj-actions/changed-files@v46.0.1
+        with:
+          files: |
+            examples/**
+
+      - name: Run pack script for changed examples
+        if: steps.changed-examples.outputs.any_changed == 'true'
+        run: |
+          echo "Changed files: ${{ steps.changed-examples.outputs.all_changed_files }}"
+          for file in ${{ steps.changed-examples.outputs.all_changed_files }}; do
+            echo "$file" | cut -d/ -f1,2
+          done | sort -u | while read -r dir; do
+            echo "Packing directory: $dir"
+            node scripts/pack.mjs "$dir"
+          done

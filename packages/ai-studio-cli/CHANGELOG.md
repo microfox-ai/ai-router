@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.2
+
+### Patch Changes
+
+- 12121e7: Triggered by issue #14: release @microfox/ai-studio-cli
+
 ## 1.0.1
 
 ### Patch Changes

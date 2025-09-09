@@ -1,5 +1,5 @@
 {
-  "name": "@microfox/studio-cli",
+  "name": "@microfox/ai-studio-cli",
   "version": "1.0.0",
   "description": "A TypeScript SDK for Studio Cli.",
   "main": "./dist/index.js",
@@ -10,7 +10,7 @@
     "CHANGELOG.md"
   ],
   "bin": {
-    "studio-cli": "./dist/index.js"
+    "ai-studio-cli": "./dist/index.js"
   },
   "scripts": {
     "build": "tsup",

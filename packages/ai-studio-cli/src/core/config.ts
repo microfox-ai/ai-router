@@ -9,8 +9,6 @@ export const configSchema = z.object({
   ai: z.string(),
   utils: z.string(),
   importAlias: z.string(),
-  installShadcn: z.boolean(),
-  setupAgents: z.boolean(),
   useStudio: z.boolean(),
   chatSessionDb: z.enum(['local', 'supabase', 'upstash-redis']).optional(),
 });
@@ -24,25 +22,9 @@ const DEFAULT_IMPORT_ALIAS = '@/';
 
 export async function promptForConfig(): Promise<Config> {
   const responses: {
-    installShadcn?: boolean;
-    setupAgents?: boolean;
     useStudio?: boolean;
     chatSessionDb?: 'local' | 'supabase' | 'upstash-redis';
   } = await prompts([
-    {
-      type: 'confirm',
-      name: 'installShadcn',
-      message: 'This step requires to install Shadcn components. Proceed?',
-      initial: true,
-    },
-    {
-      type: 'toggle',
-      name: 'setupAgents',
-      message: 'Setup Basic Agents in AiRouter?',
-      initial: true,
-      active: 'Yes',
-      inactive: 'No',
-    },
     {
       type: 'toggle',
       name: 'useStudio',
@@ -65,8 +47,8 @@ export async function promptForConfig(): Promise<Config> {
       name: 'chatSessionDb',
       message: 'What Db to support for Chat Sessions?',
       choices: [
-        { title: 'Local File System', value: 'local' },
-        { title: 'Supabase', value: 'supabase' },
+        { title: 'Local Storage (Recommended)', value: 'local' },
+        // { title: 'Supabase', value: 'supabase' },
         { title: 'Upstash Redis', value: 'upstash-redis' },
       ],
       initial: 0,

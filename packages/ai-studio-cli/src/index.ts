@@ -6,7 +6,7 @@ import { initCommand } from './commands/init';
 const program = new Command();
 
 program
-  .name('studio-cli')
+  .name('ai-studio-cli')
   .description(
     'A CLI for scaffolding and managing Microfox AI Studio projects.'
   )

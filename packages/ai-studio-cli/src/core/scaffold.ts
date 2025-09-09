@@ -2,7 +2,7 @@ import chalk from 'chalk';
 import ora from 'ora';
 import path from 'path';
 import fs from 'fs-extra';
-import tar from 'tar';
+import * as tar from 'tar';
 import { Project } from 'ts-morph';
 import { Readable } from 'stream';
 import { Config } from './config';
@@ -76,21 +76,15 @@ export async function scaffoldProject(templateName: string, config: Config) {
       cwd: tmpDir,
     });
 
-    const templateDir = path.join(tmpDir, 'template');
+    const templateDir = tmpDir;
 
     // 2. Install dependencies
     const packageJsonPath = path.join(templateDir, 'package.json');
     const componentsJsonPath = path.join(templateDir, 'components.json');
 
-    let dependencies: string[] = [];
-    let devDependencies: string[] = [];
     let shadcnComponents: string[] = [];
 
-    if (await fs.pathExists(packageJsonPath)) {
-      const packageJson: PackageJson = await fs.readJson(packageJsonPath);
-      dependencies = Object.keys(packageJson.dependencies || {});
-      devDependencies = Object.keys(packageJson.devDependencies || {});
-    } else {
+    if (!(await fs.pathExists(packageJsonPath))) {
       spinner.warn(
         chalk.yellow(
           'No `package.json` found in the template. Skipping dependency installation.'
@@ -98,44 +92,27 @@ export async function scaffoldProject(templateName: string, config: Config) {
       );
     }
 
-    if (await fs.pathExists(componentsJsonPath)) {
-      const componentsJson: ComponentsJson =
-        await fs.readJson(componentsJsonPath);
-      shadcnComponents = componentsJson.components || [];
-    }
-
-    await installDependencies(dependencies, devDependencies, shadcnComponents);
+    await installDependencies(templateDir);
 
     // 3. Copy files to target directories
     spinner.text = 'Copying files...';
-    await fs.copy(
-      path.join(templateDir, 'components', 'ai'),
-      path.join(process.cwd(), 'components', 'ai')
-    );
-    await fs.copy(
-      path.join(templateDir, 'components', 'studio'),
-      path.join(process.cwd(), 'components', 'studio')
-    );
-    await fs.copy(
-      path.join(templateDir, 'components', 'studio'),
-      path.join(process.cwd(), 'components', 'studio')
-    );
-    await fs.copy(
-      path.join(templateDir, 'app', 'ai'),
-      path.join(process.cwd(), 'app', 'ai')
-    );
-    await fs.copy(
-      path.join(templateDir, 'app', 'api', 'studio'),
-      path.join(process.cwd(), 'app', 'api', 'studio')
-    );
-    await fs.copy(
-      path.join(templateDir, 'app', 'studio'),
-      path.join(process.cwd(), 'app', 'studio')
-    );
-    await fs.copy(
-      path.join(templateDir, 'lib', 'studio'),
-      path.join(process.cwd(), 'lib', 'studio')
-    );
+
+    const directoriesToCopy = [
+      ['components', 'ai'],
+      ['components', 'studio'],
+      ['app', 'ai'],
+      ['app', 'api', 'studio'],
+      ['app', 'studio'],
+      ['lib', 'studio'],
+    ];
+
+    for (const dirParts of directoriesToCopy) {
+      const sourceDir = path.join(templateDir, ...dirParts);
+      const targetDir = path.join(process.cwd(), ...dirParts);
+      if (await fs.pathExists(sourceDir)) {
+        await fs.copy(sourceDir, targetDir);
+      }
+    }
 
     // 4. Transform imports
     spinner.text = 'Transforming imports...';
@@ -145,7 +122,7 @@ export async function scaffoldProject(templateName: string, config: Config) {
     spinner.text = 'Updating .gitignore...';
     await addGitignoreEntries(process.cwd());
 
-    spinner.succeed(chalk.green('✓ Project scaffolding complete.'));
+    spinner.succeed(chalk.green('Project scaffolding complete.'));
   } catch (error) {
     spinner.fail(chalk.red('Failed to scaffold project.'));
     console.error(error);

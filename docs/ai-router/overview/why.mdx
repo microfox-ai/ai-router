@@ -79,7 +79,6 @@ If you know Express.js, you already know AI Router:
 // Express.js style routing
 router.use('*', authMiddleware);
 router.agent('/users/:id', userAgent);
-router.tool('/search', searchTool);
 ```
 
 #### 3. **ADK Inspiration**
@@ -87,21 +86,51 @@ router.tool('/search', searchTool);
 Agents can be attached as tools to LLM calls, enabling agent sub-agent architecture similar to Google's Agent Development Kit:
 
 ```typescript
-router.agent('/blog-writer', async ctx => {
+router.agent('/blog-writer', async (ctx) => {
   const { topic } = ctx.request.params;
   const { text } = await generateText({
     model: openai('gpt-4'),
     prompt: `Write a blog post about ${topic}.`,
     tools: {
       // Attach the existing agent as a tool for the LLM to use
-      researcher: ctx.next.agentAsTool('/research'),
+      ...ctx.next.agentAsTool('/research'),
     },
   });
   ctx.response.write({ type: 'text', text });
 });
 ```
 
-#### 4. **Full-Stack First**
+#### 4. **Leaner Orchestration** with Internal shared state.
+
+```typescript
+router.agent('/', async (ctx) => {
+  const stream = streamText({
+    model: openai('gpt-4'),
+    prompt: `Write a blog post about ${topic}.`,
+    tools: {
+      ...ctx.next.agentAsTool('/agent-1'),
+      ...ctx.next.agentAsTool('/agent-2'),
+    },
+  });
+});
+
+router.agent('/agent-1', async (ctx) => {
+  ctx.state.topic = 'LONG RESEARCH INFORMATION';
+  // only return the action keeping the orchestration token usage very low.
+  return { action: 'done' };
+});
+
+router.agent('/agent-2', async (ctx) => {
+  // access the value from the state even though the orchestrator does not know about it.
+  const { topic } = ctx.request.state;
+  const { text } = await generateText({
+    model: openai('gpt-4'),
+    prompt: `Write a blog post about ${topic}.`,
+  });
+});
+```
+
+#### 5. **Full-Stack First**
 
 Built specifically for modern web applications:
 

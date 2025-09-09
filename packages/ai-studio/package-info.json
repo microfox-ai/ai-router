@@ -1,0 +1,14 @@
+{
+  "name": "@microfox/ai-studio",
+  "title": "Ai Studio TypeScript SDK",
+  "description": "A TypeScript SDK for Ai Studio.",
+  "platformType": "tool",
+  "path": ".",
+  "dependencies": ["zod"],
+  "status": "unstable",
+  "documentation": "https://www.npmjs.com/package/@microfox/ai-studio",
+  "icon": "https://via.placeholder.com/64x64.png?text=<%= simpleName.charAt(0).toUpperCase() %>",
+  "constructors": [],
+  "extraInfo": [],
+  "authType": "none"
+}

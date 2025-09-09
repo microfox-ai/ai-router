@@ -10,11 +10,114 @@ import {
   JSONValue,
   ToolCallOptions,
   convertToModelMessages,
+  ToolSet,
+  DataUIPart,
+  pipeUIMessageStreamToResponse,
+  readUIMessageStream,
 } from 'ai';
 import { StreamWriter } from './helper.js';
 import { UITools } from './types.js';
-import { z, ZodObject } from 'zod';
+import { z, ZodObject, ZodType } from 'zod';
 import path from 'path';
+import { Store, MemoryStore } from './store.js';
+
+// Add global logger management
+let globalLogger: AiLogger | undefined = undefined;
+
+/**
+ * Sets a global logger that will be used by all router instances when no instance-specific logger is set.
+ * This is useful for debugging across multiple router instances.
+ * @param logger The logger to use globally, or undefined to disable global logging
+ */
+export function setGlobalLogger(logger?: AiLogger) {
+  globalLogger = logger;
+}
+
+/**
+ * Gets the current global logger.
+ * @returns The current global logger or undefined if none is set
+ */
+export function getGlobalLogger(): AiLogger | undefined {
+  return globalLogger;
+}
+
+// --- Helper Functions ---
+/**
+ * Clubs parts based on toolCallId for tool-* types and id for data-* types
+ * @param parts Array of parts to club
+ * @returns Clubbed parts array
+ */
+function clubParts(parts: any[]): any[] {
+  if (!parts || parts.length === 0) return parts;
+
+  const clubbedParts: any[] = [];
+  const toolCallIdGroups = new Map<string, any[]>();
+  const dataIdGroups = new Map<string, any[]>();
+
+  // Group parts by toolCallId for tool-* types and by id for data-* types
+  for (const part of parts) {
+    if (part.type?.startsWith('tool-') && (part as any).toolCallId) {
+      const toolCallId = (part as any).toolCallId;
+      if (!toolCallIdGroups.has(toolCallId)) {
+        toolCallIdGroups.set(toolCallId, []);
+      }
+      toolCallIdGroups.get(toolCallId)!.push(part);
+    } else if (part.type?.startsWith('data-') && part.id) {
+      const id = part.id;
+      if (!dataIdGroups.has(id)) {
+        dataIdGroups.set(id, []);
+      }
+      dataIdGroups.get(id)!.push(part);
+    } else {
+      // For parts that don't match the clubbing criteria, add them directly
+      clubbedParts.push(part);
+    }
+  }
+
+  // Add clubbed tool parts
+  for (const [toolCallId, toolParts] of toolCallIdGroups) {
+    if (toolParts.length === 1) {
+      clubbedParts.push(toolParts[0]);
+    } else {
+      // Merge multiple parts with same toolCallId
+      const mergedPart = { ...toolParts[0] };
+      // Combine any additional properties from other parts
+      for (let i = 1; i < toolParts.length; i++) {
+        const currentPart = toolParts[i];
+        // Merge properties, giving priority to later parts
+        Object.keys(currentPart).forEach((key) => {
+          if (key !== 'type' && key !== 'toolCallId') {
+            mergedPart[key] = currentPart[key];
+          }
+        });
+      }
+      clubbedParts.push(mergedPart);
+    }
+  }
+
+  // Add clubbed data parts
+  for (const [id, dataParts] of dataIdGroups) {
+    if (dataParts.length === 1) {
+      clubbedParts.push(dataParts[0]);
+    } else {
+      // Merge multiple parts with same id
+      const mergedPart = { ...dataParts[0] };
+      // Combine any additional properties from other parts
+      for (let i = 1; i < dataParts.length; i++) {
+        const currentPart = dataParts[i];
+        // Merge properties, giving priority to later parts
+        Object.keys(currentPart).forEach((key) => {
+          if (key !== 'type' && key !== 'id') {
+            mergedPart[key] = currentPart[key];
+          }
+        });
+      }
+      clubbedParts.push(mergedPart);
+    }
+  }
+
+  return clubbedParts;
+}
 
 // --- Custom Errors ---
 export class AiKitError extends Error {
@@ -31,6 +134,10 @@ export class AgentNotFoundError extends AiKitError {
   }
 }
 
+/**
+ * @deprecated This error class is deprecated and will be removed in a future version.
+ * Use agent-as-tools pattern instead.
+ */
 export class ToolNotFoundError extends AiKitError {
   constructor(path: string) {
     super(`[AiAgentKit] Tool not found at path: ${path}`);
@@ -38,6 +145,10 @@ export class ToolNotFoundError extends AiKitError {
   }
 }
 
+/**
+ * @deprecated This error class is deprecated and will be removed in a future version.
+ * Use agent-as-tools pattern instead.
+ */
 export class ToolValidationError extends AiKitError {
   constructor(path: string, validationError: z.ZodError) {
     const message = `[AiAgentKit] Tool call validation failed for path: ${path}: ${validationError.message}`;
@@ -133,7 +244,7 @@ function hasDynamicParams(pattern: string): boolean {
 }
 
 export type AiStreamWriter<
-  METADATA,
+  METADATA = unknown,
   PARTS extends UIDataTypes = UIDataTypes,
   TOOLS extends UITools = UITools,
 > = UIMessageStreamWriter<UIMessage<METADATA, PARTS, TOOLS>> &
@@ -152,20 +263,23 @@ export type AiStreamWriter<
  * @template ContextState - The type for the shared state object.
  */
 export type AiContext<
-  METADATA,
+  METADATA extends Record<string, any> = Record<string, any>,
+  ContextState extends Record<string, any> = Record<string, any>,
+  PARAMS extends Record<string, any> = Record<string, any>,
   PARTS extends UIDataTypes = UIDataTypes,
   TOOLS extends UITools = UITools,
-  ContextState extends Record<string, any> = Record<string, any>,
 > = {
   request: {
     /** The message history for the current request. */
     messages: UIMessage<METADATA, PARTS, TOOLS>[];
     /** Parameters passed from an internal tool or agent call. */
-    params?: Record<string, any>;
+    params: PARAMS;
     [key: string]: any;
-  };
+  } & METADATA;
   /** A shared, mutable state object that persists for the lifetime of a single request. */
   state: ContextState;
+  /** A shared, mutable store object that persists for the lifetime of a single request. */
+  store: Store;
   /**
    * Internal execution context for the router. Should not be modified by user code.
    * @internal
@@ -188,12 +302,12 @@ export type AiContext<
    * The stream writer to send data back to the end-user's UI.
    * Includes helpers for writing structured data like tool calls and metadata.
    */
-  response: AiStreamWriter<METADATA, PARTS, TOOLS>;
+  response: AiStreamWriter<Partial<METADATA>, PARTS, TOOLS>;
   /**
    * Provides functions for an agent to dispatch calls to other agents or tools.
    * @internal
    */
-  next: NextHandler<METADATA, PARTS, TOOLS, ContextState>;
+  next: NextHandler<METADATA, ContextState, PARAMS, PARTS, TOOLS>;
 
   _onExecutionStart?: () => void;
   _onExecutionEnd?: () => void;
@@ -203,41 +317,57 @@ export type AiContext<
 export type NextFunction = () => Promise<any>;
 /** A function that handles a request for a specific agent path. */
 export type AiHandler<
-  METADATA,
+  METADATA extends Record<string, any> = Record<string, any>,
+  ContextState extends Record<string, any> = Record<string, any>,
+  PARAMS extends Record<string, any> = Record<string, any>,
   PARTS extends UIDataTypes = UIDataTypes,
   TOOLS extends UITools = UITools,
-  ContextState extends Record<string, any> = Record<string, any>,
-> = (ctx: AiContext<METADATA, PARTS, TOOLS, ContextState>) => Promise<any>;
+> = (
+  ctx: AiContext<METADATA, ContextState, PARAMS, PARTS, TOOLS>
+) => Promise<any>;
 
-/** A function that handles a request for a specific tool path, with validated parameters. */
+/**
+ * @deprecated Use agent-as-tools pattern instead. This type will be removed in a future version.
+ * Create agents and use `.actAsTool()` to expose them as tools.
+ */
 export type AiToolHandler<
-  METADATA,
+  METADATA extends Record<string, any> = Record<string, any>,
+  ContextState extends Record<string, any> = Record<string, any>,
+  PARAMS extends Record<string, any> = Record<string, any>,
   PARTS extends UIDataTypes = UIDataTypes,
   TOOLS extends UITools = UITools,
-  ContextState extends Record<string, any> = Record<string, any>,
 > =
   | ((
-      ctx: AiContext<METADATA, PARTS, TOOLS, ContextState>,
-      params: Record<string, any>
+      ctx: AiContext<METADATA, ContextState, PARAMS, PARTS, TOOLS>,
+      params: PARAMS
     ) => Promise<any>)
-  | ((ctx: AiContext<METADATA, PARTS, TOOLS, ContextState>) => Tool<any, any>);
+  | ((
+      ctx: AiContext<METADATA, ContextState, PARAMS, PARTS, TOOLS>
+    ) => Tool<any, any>);
 
-/** A function that creates a Tool on-demand with access to the request context. */
+/**
+ * @deprecated Use agent-as-tools pattern instead. This type will be removed in a future version.
+ * Create agents and use `.actAsTool()` to expose them as tools.
+ */
 export type AiToolFactory<
-  METADATA,
-  PARTS extends UIDataTypes,
-  TOOLS extends UITools,
-  ContextState extends Record<string, any>,
-> = (ctx: AiContext<METADATA, PARTS, TOOLS, ContextState>) => Tool<any, any>;
+  METADATA extends Record<string, any> = Record<string, any>,
+  ContextState extends Record<string, any> = Record<string, any>,
+  PARAMS extends Record<string, any> = Record<string, any>,
+  PARTS extends UIDataTypes = UIDataTypes,
+  TOOLS extends UITools = UITools,
+> = (
+  ctx: AiContext<METADATA, ContextState, PARAMS, PARTS, TOOLS>
+) => Tool<any, any>;
 
 /** A function that acts as middleware, processing a request and optionally passing control to the next handler. */
 export type AiMiddleware<
-  METADATA,
+  METADATA extends Record<string, any> = Record<string, any>,
+  ContextState extends Record<string, any> = Record<string, any>,
+  PARAMS extends Record<string, any> = Record<string, any>,
   PARTS extends UIDataTypes = UIDataTypes,
   TOOLS extends UITools = UITools,
-  ContextState extends Record<string, any> = Record<string, any>,
 > = (
-  ctx: AiContext<METADATA, PARTS, TOOLS, ContextState>,
+  ctx: AiContext<METADATA, ContextState, PARAMS, PARTS, TOOLS>,
   next: NextFunction
 ) => Promise<any>;
 
@@ -252,29 +382,62 @@ export type AiLogger = {
 
 /** Internal representation of a registered handler in the router's stack. */
 type Layer<
-  METADATA,
+  METADATA extends Record<string, any> = Record<string, any>,
+  ContextState extends Record<string, any> = Record<string, any>,
+  PARAMS extends Record<string, any> = Record<string, any>,
   PARTS extends UIDataTypes = UIDataTypes,
   TOOLS extends UITools = UITools,
-  ContextState extends Record<string, any> = Record<string, any>,
 > = {
   path: string | RegExp;
-  handler: AiMiddleware<METADATA, PARTS, TOOLS, ContextState>;
+  handler: AiMiddleware<METADATA, ContextState, PARAMS, PARTS, TOOLS>;
   isTool: boolean;
   toolOptions?:
     | {
         type: 'static';
         schema: ZodObject<any>;
         description?: string;
-        handler: AiToolHandler<METADATA, PARTS, TOOLS, ContextState>;
+        handler: AiToolHandler<METADATA, ContextState, PARAMS, PARTS, TOOLS>;
       }
     | {
         type: 'factory';
-        factory: AiToolFactory<METADATA, PARTS, TOOLS, ContextState>;
+        factory: AiToolFactory<METADATA, ContextState, PARAMS, PARTS, TOOLS>;
       };
   isAgent: boolean;
   // Dynamic parameter support
   hasDynamicParams?: boolean;
   paramNames?: string[];
+};
+
+export type AgentTool<
+  INPUT extends JSONValue | unknown | never = any,
+  OUTPUT extends JSONValue | unknown | never = any,
+> = Tool<INPUT, OUTPUT> & {
+  name: string;
+  id: string;
+  metadata?: Record<string, any> & {
+    absolutePath?: string;
+    name?: string;
+    description?: string;
+    toolKey?: string;
+    icon?: string;
+    parentTitle?: string;
+    title?: string;
+    hideUI?: boolean;
+  };
+};
+
+export type AgentData = {
+  metadata?: Record<string, any> & {
+    absolutePath?: string;
+    name?: string;
+    description?: string;
+    toolKey?: string;
+    icon?: string;
+    parentTitle?: string;
+    title?: string;
+    hideUI?: boolean;
+  };
+  [key: string]: any;
 };
 
 /**
@@ -288,17 +451,19 @@ type Layer<
  * @template ContextState - The base type for the shared state object.
  */
 export class AiRouter<
-  KIT_METADATA,
+  KIT_METADATA extends Record<string, any> = Record<string, any>,
+  ContextState extends Record<string, any> = {},
+  PARAMS extends Record<string, any> = Record<string, any>,
   PARTS extends UIDataTypes = UIDataTypes,
   TOOLS extends UITools = UITools,
-  ContextState extends Record<string, any> = {},
+  REGISTERED_TOOLS extends ToolSet = {},
 > {
-  private stack: Layer<KIT_METADATA, PARTS, TOOLS, any>[] = [];
-  private actAsToolDefinitions: Map<
-    string | RegExp,
-    { description?: string; inputSchema: ZodObject<any> }
-  > = new Map();
-  private logger: AiLogger = console;
+  private stack: Layer<KIT_METADATA, ContextState, PARAMS, PARTS, TOOLS>[] = [];
+  public actAsToolDefinitions: Map<string | RegExp, AgentTool<any, any>> =
+    new Map();
+  private logger?: AiLogger = undefined;
+  private _store: Store = new MemoryStore();
+  public toolExecutionPromise: Promise<any> = Promise.resolve();
 
   /** Configuration options for the router instance. */
   public options: {
@@ -314,17 +479,38 @@ export class AiRouter<
    * @param options Optional configuration for the router.
    */
   constructor(
-    stack?: Layer<KIT_METADATA, PARTS, TOOLS, any>[],
+    stack?: Layer<KIT_METADATA, ContextState, PARAMS, PARTS, TOOLS>[],
     options?: { maxCallDepth?: number; logger?: AiLogger }
   ) {
-    this.logger = options?.logger ?? console;
-    this.logger.log('AiAgentKit v3 initialized.');
+    // Remove logger from constructor - it should be set via setLogger
     if (stack) {
       this.stack = stack;
     }
     if (options?.maxCallDepth) {
       this.options.maxCallDepth = options.maxCallDepth;
     }
+  }
+
+  setStore(store: Store) {
+    this._store = store;
+  }
+
+  /**
+   * Sets a logger for this router instance.
+   * If no logger is set, the router will fall back to the global logger.
+   * @param logger The logger to use for this router instance, or undefined to use global logger
+   */
+  setLogger(logger?: AiLogger) {
+    this.logger = logger;
+  }
+
+  /**
+   * Gets the effective logger for this router instance.
+   * Returns instance logger if set, otherwise falls back to global logger.
+   * @returns The effective logger or undefined if no logging should occur
+   */
+  private _getEffectiveLogger(): AiLogger | undefined {
+    return this.logger ?? globalLogger;
   }
 
   /**
@@ -336,23 +522,26 @@ export class AiRouter<
    * @param agents The agent middleware function(s).
    */
   agent<
-    MW_METADATA,
-    MW_TOOLS extends UITools,
-    MW_STATE extends Record<string, any>,
+    const TAgents extends (
+      | AiMiddleware<any, any, any, any, any>
+      | AiRouter<any, any, any, any, any, any>
+    )[],
   >(
     agentPath:
       | string
       | RegExp
-      | AiMiddleware<MW_METADATA, PARTS, MW_TOOLS, ContextState & MW_STATE>,
-    ...agents: (
-      | AiMiddleware<MW_METADATA, PARTS, MW_TOOLS, ContextState & MW_STATE>
-      | AiRouter<MW_METADATA, PARTS, MW_TOOLS, ContextState & MW_STATE>
-    )[]
+      | AiMiddleware<KIT_METADATA, ContextState, PARAMS, PARTS, TOOLS>,
+    ...agents: TAgents
   ): AiRouter<
-    KIT_METADATA | MW_METADATA,
+    KIT_METADATA,
+    ContextState,
+    PARAMS,
     PARTS,
-    TOOLS & MW_TOOLS,
-    ContextState & MW_STATE
+    TOOLS,
+    REGISTERED_TOOLS &
+      (TAgents[number] extends AiRouter<any, any, any, any, any, infer R>
+        ? R
+        : {})
   > {
     let prefix: string | RegExp = '/';
     if (typeof agentPath === 'string' || agentPath instanceof RegExp) {
@@ -367,7 +556,7 @@ export class AiRouter<
         if (handler instanceof AiRouter && typeof prefix === 'string') {
           const stackToMount = handler.getStackWithPrefix(prefix);
           this.stack.push(...(stackToMount as any));
-          this.logger.log(
+          this.logger?.log(
             `Router mounted: path=${prefix}, layers=${stackToMount.length}`
           );
           // Also mount actAsTool definitions from the sub-router
@@ -389,7 +578,7 @@ export class AiRouter<
         isTool: false,
         isAgent: true, // Mark as an agent
       });
-      this.logger.log(`Agent registered: path=${prefix}`);
+      this.logger?.log(`Agent registered: path=${prefix}`);
     }
 
     return this as any;
@@ -402,12 +591,22 @@ export class AiRouter<
    * @param path The path prefix to mount the handler on.
    * @param handler The middleware function or AiAgentKit router instance to mount.
    */
-  use(
+  use<
+    THandler extends
+      | AiMiddleware<KIT_METADATA, ContextState, PARAMS, PARTS, TOOLS>
+      | AiRouter<any, any, any, any, any, any>,
+  >(
     mountPathArg: string | RegExp,
-    handler:
-      | AiMiddleware<KIT_METADATA, PARTS, TOOLS, ContextState>
-      | AiRouter<any, any, any, any>
-  ): this {
+    handler: THandler
+  ): AiRouter<
+    KIT_METADATA,
+    ContextState,
+    PARAMS,
+    PARTS,
+    TOOLS,
+    REGISTERED_TOOLS &
+      (THandler extends AiRouter<any, any, any, any, any, infer R> ? R : {})
+  > {
     if (mountPathArg instanceof RegExp && handler instanceof AiRouter) {
       throw new AiKitError(
         '[AiAgentKit] Mounting a router on a RegExp path is not supported.'
@@ -454,28 +653,98 @@ export class AiRouter<
    * @param path The path of the agent being defined.
    * @param options The tool definition, including a Zod schema and description.
    */
-  actAsTool(
-    path: string | RegExp,
-    options: {
-      description?: string;
-      inputSchema: ZodObject<any>;
+  actAsTool<
+    const TPath extends string | RegExp,
+    const TTool extends AgentTool<any, any>,
+  >(
+    path: TPath,
+    options: TTool
+  ): AiRouter<
+    KIT_METADATA,
+    ContextState,
+    PARAMS,
+    PARTS,
+    TOOLS,
+    REGISTERED_TOOLS & {
+      [K in TTool['id']]: Tool<
+        z.infer<TTool['inputSchema']>,
+        z.infer<TTool['outputSchema']>
+      > & {
+        metadata: TTool['metadata'] & {
+          toolKey: TTool['id'];
+          name: TTool['name'];
+          description: TTool['description'];
+        };
+      };
     }
-  ) {
+  > {
     this.actAsToolDefinitions.set(path, options);
-    this.logger.log(
-      `[actAsTool] Added definition: ${path} -> ${JSON.stringify(options)}`
-    );
-    this.logger.log(
+    this.logger?.log(`[actAsTool] Added definition: at path ${path}`);
+    this.logger?.log(
       `[actAsTool] Router now has ${this.actAsToolDefinitions.size} definitions`
     );
-    return this;
+    return this as any;
   }
 
+  getToolSet(): REGISTERED_TOOLS {
+    let allTools = Array.from(this.actAsToolDefinitions.entries()).map(
+      ([key, value]) => {
+        return {
+          ...value,
+          metadata: {
+            ...value.metadata,
+            absolutePath: key,
+          },
+        } as AgentTool<any, any>;
+      }
+    ) as AgentTool<any, any>[];
+    return allTools.reduce((acc, _tool) => {
+      const { inputSchema, outputSchema } = _tool;
+      acc[_tool.id] = {
+        ...tool<z.infer<typeof inputSchema>, z.infer<typeof outputSchema>>(
+          _tool
+        ),
+        metadata: {
+          ..._tool.metadata,
+          toolKey: _tool.id,
+          name: _tool.name,
+          description: _tool.description,
+        },
+      } as AgentTool<z.infer<typeof inputSchema>, z.infer<typeof outputSchema>>;
+      return acc;
+    }, {} as any) as REGISTERED_TOOLS;
+  }
+
+  getToolDefinition(path: string) {
+    let definition = this.actAsToolDefinitions.get(path);
+    if (!definition) {
+      this.logger?.error(
+        `[getToolDefinition] No definition found for path: ${path}`
+      );
+      throw new AgentDefinitionMissingError(path);
+    }
+    return definition;
+  }
+
+  /**
+   * @deprecated Use agent-as-tools pattern instead. Create an agent and use `.actAsTool()` to expose it as a tool.
+   * This method will be removed in a future version.
+   *
+   * Example migration:
+   * ```typescript
+   * // Old way (deprecated):
+   * router.tool('/calculator', { schema: z.object({...}) }, async (ctx, params) => {...});
+   *
+   * // New way (recommended):
+   * router.agent('/calculator', async (ctx) => {...})
+   *   .actAsTool('/calculator', { id: 'calculator', name: 'Calculator', ... });
+   * ```
+   */
   // Overload for factory-based tools
   tool<
-    TOOL_METADATA,
-    TOOL_TOOLS extends UITools,
-    TOOL_STATE extends Record<string, any>,
+    TOOL_METADATA extends Record<string, any> = Record<string, any>,
+    TOOL_TOOLS extends UITools = UITools,
+    TOOL_STATE extends Record<string, any> = Record<string, any>,
   >(
     path: string | RegExp,
     factory: AiToolFactory<
@@ -490,12 +759,16 @@ export class AiRouter<
     TOOLS & TOOL_TOOLS,
     ContextState & TOOL_STATE
   >;
+  /**
+   * @deprecated Use agent-as-tools pattern instead. Create an agent and use `.actAsTool()` to expose it as a tool.
+   * This method will be removed in a future version.
+   */
   // Overload for static tools
   tool<
-    TOOL_METADATA,
-    TOOL_TOOLS extends UITools,
-    TOOL_STATE extends Record<string, any>,
-    TOOL_PARAMS extends ZodObject<any>,
+    TOOL_METADATA extends Record<string, any> = Record<string, any>,
+    TOOL_TOOLS extends UITools = UITools,
+    TOOL_STATE extends Record<string, any> = Record<string, any>,
+    TOOL_PARAMS extends ZodObject<any> = ZodObject<any>,
   >(
     path: string | RegExp,
     options: {
@@ -505,9 +778,10 @@ export class AiRouter<
     handler: (
       ctx: AiContext<
         TOOL_METADATA,
+        ContextState & TOOL_STATE,
+        z.infer<TOOL_PARAMS>,
         PARTS,
-        TOOL_TOOLS,
-        ContextState & TOOL_STATE
+        TOOL_TOOLS
       >,
       params: z.infer<TOOL_PARAMS>
     ) => Promise<any>
@@ -517,12 +791,16 @@ export class AiRouter<
     TOOLS & TOOL_TOOLS,
     ContextState & TOOL_STATE
   >;
+  /**
+   * @deprecated Use agent-as-tools pattern instead. Create an agent and use `.actAsTool()` to expose it as a tool.
+   * This method will be removed in a future version.
+   */
   // Implementation
   tool<
-    TOOL_METADATA,
-    TOOL_TOOLS extends UITools,
-    TOOL_STATE extends Record<string, any>,
-    TOOL_PARAMS extends ZodObject<any>,
+    TOOL_METADATA extends Record<string, any> = Record<string, any>,
+    TOOL_TOOLS extends UITools = UITools,
+    TOOL_STATE extends Record<string, any> = Record<string, any>,
+    TOOL_PARAMS extends ZodObject<any> = ZodObject<any>,
   >(
     path: string | RegExp,
     optionsOrFactory:
@@ -548,9 +826,14 @@ export class AiRouter<
     TOOLS & TOOL_TOOLS,
     ContextState & TOOL_STATE
   > {
-    this.logger.log(`[AiAgentKit][tool] Registering tool at path:`, path);
+    this.logger?.warn(
+      `[DEPRECATION WARNING] router.tool() is deprecated and will be removed in a future version. ` +
+        `Please migrate to the agent-as-tools pattern: ` +
+        `router.agent('${path}', async (ctx) => {...}).actAsTool('${path}', {...})`
+    );
+    this.logger?.log(`[AiAgentKit][tool] Registering tool at path:`, path);
     if (this.stack.some((l) => l.isTool && l.path === path)) {
-      this.logger.error(
+      this.logger?.error(
         `[AiAgentKit][tool] Tool already registered for path: ${path}`
       );
       throw new AiKitError(`A tool is already registered for path: ${path}`);
@@ -559,11 +842,11 @@ export class AiRouter<
       const factory = optionsOrFactory as AiToolFactory<any, any, any, any>;
       const isDynamicPath = typeof path === 'string' && hasDynamicParams(path);
 
-      const toolMiddleware: AiMiddleware<any, any, any, any> = async (
+      const toolMiddleware: AiMiddleware<any, any, any, any, any> = async (
         ctx,
         _next
       ) => {
-        this.logger.log(
+        this.logger?.log(
           `[Tool Middleware] Executing factory for path "${path}". Messages in context: ${
             ctx.request.messages?.length ?? 'undefined'
           }`
@@ -580,7 +863,7 @@ export class AiRouter<
         // Validate parameters using the tool's schema
         const schema = toolObject.inputSchema as ZodObject<any> | undefined;
         if (!schema) {
-          this.logger.warn(
+          this.logger?.warn(
             `[AiAgentKit][tool] Factory-based tool at path ${path} has no inputSchema. Executing without params.`
           );
           return toolObject.execute({} as any, {} as ToolCallOptions);
@@ -589,7 +872,7 @@ export class AiRouter<
         const parsedParams = schema.safeParse(ctx.request.params);
 
         if (!parsedParams.success) {
-          this.logger.error(
+          this.logger?.error(
             `[AiAgentKit][tool] Tool call validation failed for path: ${path}:`,
             parsedParams.error.message
           );
@@ -618,7 +901,7 @@ export class AiRouter<
         isAgent: false,
         hasDynamicParams: isDynamicPath,
       });
-      this.logger.log(
+      this.logger?.log(
         `Tool registered: path=${path}, type=factory${
           isDynamicPath ? ' (dynamic)' : ''
         }`
@@ -636,13 +919,14 @@ export class AiRouter<
         : null;
       const toolMiddleware: AiMiddleware<
         TOOL_METADATA,
+        ContextState & TOOL_STATE,
+        z.infer<TOOL_PARAMS>,
         PARTS,
-        TOOL_TOOLS,
-        ContextState & TOOL_STATE
+        TOOL_TOOLS
       > = async (ctx, _next) => {
         if (isDynamicPath && typeof path === 'string') {
           const pathParams = extractPathParams(path, ctx.request.path || '');
-          this.logger.log(
+          this.logger?.log(
             `[AiAgentKit][tool] Extracted dynamic path params:`,
             pathParams
           );
@@ -650,19 +934,19 @@ export class AiRouter<
             ctx.request.params = {
               ...ctx.request.params,
               ...pathParams,
-            };
+            } as z.infer<TOOL_PARAMS>;
           }
         }
         const parsedParams = options.schema.safeParse(ctx.request.params);
         if (!parsedParams.success) {
-          this.logger.error(
+          this.logger?.error(
             `[AiAgentKit][tool] Tool call validation failed for path: ${path}:`,
             parsedParams.error.message
           );
           throw new ToolValidationError(path.toString(), parsedParams.error);
         }
         const staticHandler = handler as (
-          ctx: AiContext<any, any, any, any>,
+          ctx: AiContext<any, any, any, any, any>,
           params: Record<string, any>
         ) => Promise<any>;
         return staticHandler(ctx, parsedParams.data);
@@ -681,14 +965,14 @@ export class AiRouter<
         hasDynamicParams: isDynamicPath,
         paramNames: dynamicParamInfo?.paramNames,
       });
-      this.logger.log(
+      this.logger?.log(
         `Tool registered: path=${path}, type=static${
           isDynamicPath ? ' (dynamic)' : ''
         }`
       );
       return this as any;
     }
-    this.logger.error(
+    this.logger?.error(
       `[AiAgentKit][tool] Invalid arguments for tool registration at path: ${path}`
     );
     throw new AiKitError(
@@ -732,6 +1016,64 @@ export class AiRouter<
   }
 
   /**
+   * Outputs all registered paths, and the tool definitions, middlewares, and agents registered on each path.
+   * @returns A map of paths to their registered handlers.
+   */
+  registry(): {
+    map: Record<string, { middlewares: any[]; tools: any[]; agents: any[] }>;
+    tools: REGISTERED_TOOLS;
+  } {
+    const registryMap: Record<
+      string,
+      { middlewares: any[]; tools: any[]; agents: any[] }
+    > = {};
+
+    for (const layer of this.stack) {
+      const pathKey = layer.path.toString();
+      if (!registryMap[pathKey]) {
+        registryMap[pathKey] = { middlewares: [], tools: [], agents: [] };
+      }
+
+      if (layer.isTool) {
+        let toolInfo: any = { type: layer.toolOptions?.type };
+        if (layer.toolOptions?.type === 'static') {
+          toolInfo = {
+            ...toolInfo,
+            schema: layer.toolOptions.schema,
+            description: layer.toolOptions.description,
+          };
+        } else if (layer.toolOptions?.type === 'factory') {
+          toolInfo = {
+            ...toolInfo,
+            factory: layer.toolOptions.factory.toString(),
+          };
+        }
+        registryMap[pathKey].tools.push(toolInfo);
+      } else if (layer.isAgent) {
+        const agentInfo: any = {
+          handler: layer.handler.name || 'anonymous',
+        };
+        const actAsToolDef = this.actAsToolDefinitions.get(layer.path);
+        if (actAsToolDef) {
+          agentInfo.actAsTool = {
+            ...actAsToolDef,
+          };
+        }
+        registryMap[pathKey].agents.push(agentInfo);
+      } else {
+        registryMap[pathKey].middlewares.push({
+          handler: layer.handler.name || 'anonymous',
+        });
+      }
+    }
+
+    return {
+      map: registryMap,
+      tools: this.getToolSet(),
+    };
+  }
+
+  /**
    * Resolves a path based on the parent path and the requested path.
    * - If path starts with `@/`, it's an absolute path from the root.
    * - Otherwise, it's a relative path.
@@ -753,22 +1095,29 @@ export class AiRouter<
    * @internal
    */
   private _createSubContext(
-    parentCtx: AiContext<KIT_METADATA, PARTS, TOOLS, ContextState>,
+    parentCtx: AiContext<KIT_METADATA, ContextState, PARAMS, PARTS, TOOLS>,
     options: {
       type: 'agent' | 'tool';
       path: string;
       messages?: UIMessage<KIT_METADATA, PARTS, TOOLS>[];
-      params?: Record<string, any>;
+      params: PARAMS;
     }
   ) {
     const parentDepth = parentCtx.executionContext.callDepth ?? 0;
     const newCallDepth = parentDepth + (options.type === 'agent' ? 1 : 0);
 
-    const subContext: AiContext<KIT_METADATA, PARTS, TOOLS, ContextState> = {
+    const subContext: AiContext<
+      KIT_METADATA,
+      ContextState,
+      PARAMS,
+      PARTS,
+      TOOLS
+    > = {
       ...parentCtx,
       // State is passed by reference to allow sub-agents to modify the parent's state.
       // The execution context is a shallow copy to ensure call-specific data is isolated.
       state: parentCtx.state,
+      store: parentCtx.store,
       executionContext: {
         ...parentCtx.executionContext,
         currentPath: options.path,
@@ -794,7 +1143,13 @@ export class AiRouter<
     // The current path for the new context is the path we are about to execute.
     subContext.executionContext.currentPath = options.path;
 
-    subContext.next = new NextHandler(
+    subContext.next = new NextHandler<
+      KIT_METADATA,
+      ContextState,
+      PARAMS,
+      PARTS,
+      TOOLS
+    >(
       subContext,
       this,
       (parentCtx as any)._onExecutionStart,
@@ -814,14 +1169,25 @@ export class AiRouter<
     path: string | RegExp,
     callDepth: number = 0
   ): AiLogger {
+    const effectiveLogger = this._getEffectiveLogger();
+
+    // If no logger is available, return a no-op logger
+    if (!effectiveLogger) {
+      return {
+        log: () => {},
+        warn: () => {},
+        error: () => {},
+      };
+    }
+
     const indent = '  '.repeat(callDepth);
     const prefix = `${indent}[${path.toString()}]`;
     // Add requestId to every log message for better tracking.
     const fullPrefix = `[${requestId}]${prefix}`;
     return {
-      log: (...args: any[]) => this.logger.log(fullPrefix, ...args),
-      warn: (...args: any[]) => this.logger.warn(fullPrefix, ...args),
-      error: (...args: any[]) => this.logger.error(fullPrefix, ...args),
+      log: (...args: any[]) => effectiveLogger.log(fullPrefix, ...args),
+      warn: (...args: any[]) => effectiveLogger.warn(fullPrefix, ...args),
+      error: (...args: any[]) => effectiveLogger.error(fullPrefix, ...args),
     };
   }
 
@@ -833,7 +1199,9 @@ export class AiRouter<
    * - Static segments are more specific than dynamic segments.
    * @internal
    */
-  private _getSpecificityScore(layer: Layer<any, any, any, any>): number {
+  private _getSpecificityScore(
+    layer: Layer<KIT_METADATA, ContextState, PARAMS, PARTS, TOOLS>
+  ): number {
     const path = layer.path.toString();
     let score = 0;
 
@@ -863,7 +1231,7 @@ export class AiRouter<
    */
   private async _execute(
     path: string,
-    ctx: AiContext<KIT_METADATA, PARTS, TOOLS, ContextState>,
+    ctx: AiContext<KIT_METADATA, ContextState, PARAMS, PARTS, TOOLS>,
     isInternalCall = false
   ) {
     // The context's `currentPath` is now the single source of truth.
@@ -988,6 +1356,17 @@ export class AiRouter<
           // The original Promise wrapper was redundant and could hide issues.
           const result = await layer.handler(ctx, next);
 
+          // if (!isInternalCall) {
+          //   console.log('toolDefinition', result);
+          //   const toolDefinition = this.actAsToolDefinitions.get(path);
+          //   if (toolDefinition && !toolDefinition.metadata?.hideUI) {
+          //     ctx.response.writeCustomTool({
+          //       toolName: toolDefinition.id as string,
+          //       toolCallId: toolDefinition.id + '-' + ctx.response.generateId(),
+          //       output: result,
+          //     });
+          //   }
+          // }
           ctx.logger.log(`<- Finished ${layerType}: ${layerPath}`);
           return result;
         } catch (err) {
@@ -1022,16 +1401,17 @@ export class AiRouter<
   handle(
     path: string,
     initialContext: Omit<
-      AiContext<KIT_METADATA, PARTS, TOOLS, ContextState>,
+      AiContext<KIT_METADATA, ContextState, PARAMS, PARTS, TOOLS>,
       | 'state'
       | 'response'
       | 'next'
       | 'requestId'
       | 'logger'
       | 'executionContext'
+      | 'store'
     >
   ): Response {
-    this.logger.log(`Handling request for path: ${path}`);
+    this.logger?.log(`Handling request for path: ${path}`);
     const self = this; // Reference to the router instance
 
     // --- Execution Lifecycle Management ---
@@ -1043,121 +1423,249 @@ export class AiRouter<
     // --- End Execution Lifecycle Management ---
 
     return createUIMessageStreamResponse({
-      stream: createUIMessageStream({
-        originalMessages: initialContext.request.messages,
-        execute: async ({ writer }) => {
-          const streamWriter = new StreamWriter<KIT_METADATA, TOOLS>(writer);
-          const requestId = generateId();
+      stream: self.handleStream(
+        path,
+        initialContext,
+        executionCompletionPromise,
+        executionCompletionResolver
+      ),
+    });
+  }
 
-          const ctx: AiContext<KIT_METADATA, PARTS, TOOLS, ContextState> & {
-            _onExecutionStart: () => void;
-            _onExecutionEnd: () => void;
-          } = {
-            ...initialContext,
-            request: {
-              ...initialContext.request,
-              path: path, // Set the initial path for the root context
-            },
-            state: {} as any,
-            executionContext: { currentPath: path, callDepth: 0 },
-            requestId: requestId,
-            logger: self._createLogger(requestId, path, 0),
-            response: {
-              ...streamWriter.writer,
-              writeMessageMetadata: streamWriter.writeMessageMetadata,
-              writeCustomTool: streamWriter.writeCustomTool,
-              writeObjectAsTool: streamWriter.writeObjectAsTool,
-              generateId: generateId,
-            },
-            next: undefined as any, // Will be replaced right after
-            _onExecutionStart: () => {
-              self.pendingExecutions++;
-              self.logger.log(
-                `[AiAgentKit][lifecycle] Execution started. Pending: ${self.pendingExecutions}`
-              );
-            },
-            _onExecutionEnd: () => {
-              self.pendingExecutions--;
-              self.logger.log(
-                `[AiAgentKit][lifecycle] Execution ended. Pending: ${self.pendingExecutions}`
-              );
-              if (self.pendingExecutions === 0 && executionCompletionResolver) {
-                self.logger.log(
-                  `[AiAgentKit][lifecycle] All executions finished. Resolving promise.`
-                );
-                executionCompletionResolver();
-              }
-            },
-          };
-          ctx.next = new NextHandler(
-            ctx,
-            self,
-            ctx._onExecutionStart,
-            ctx._onExecutionEnd
-          ) as any;
+  handleStream(
+    path: string,
+    initialContext: Omit<
+      AiContext<KIT_METADATA, ContextState, PARAMS, PARTS, TOOLS>,
+      | 'state'
+      | 'response'
+      | 'next'
+      | 'requestId'
+      | 'logger'
+      | 'executionContext'
+      | 'store'
+    >,
+    executionCompletionPromise: Promise<void>,
+    executionCompletionResolver: (() => void) | null
+  ) {
+    const self = this;
+    return createUIMessageStream({
+      originalMessages: initialContext.request.messages,
+      execute: async ({ writer }) => {
+        const streamWriter = new StreamWriter<KIT_METADATA, TOOLS>(writer);
+        const requestId = generateId();
 
-          ctx._onExecutionStart();
-          self.logger.log(
-            `[AiAgentKit][lifecycle] Main execution chain started.`
-          );
+        // If the configured store is a MemoryStore, create a new one for each request
+        // to prevent state leakage between concurrent requests. If it's a different
+        // type of store, we assume it's designed to be shared.
+        const store =
+          self._store instanceof MemoryStore ? new MemoryStore() : self._store;
 
-          // Fire off the main execution chain. We don't await it here because, in a streaming
-          // context, the await might resolve prematurely when the agent yields control.
-          // Instead, we catch errors and use .finally() to reliably mark the end of this
-          // specific execution, while the main function body waits on the lifecycle promise.
-          // self
-          //   ._execute(path, ctx)
-          //   .catch((err) => {
-          //     ctx.logger.error("Unhandled error in main execution chain", err);
-          //     // Optionally, you could write an error message to the stream here.
-          //   })
-          //   .finally(() => {
-          //     ctx._onExecutionEnd();
-          //   });
-
-          try {
-            await self._execute(path, ctx);
-          } catch (err) {
-            ctx.logger.error('Unhandled error in main execution chain', err);
-          } finally {
-            ctx._onExecutionEnd();
-            self.logger.log(
-              `[AiAgentKit][lifecycle] Main execution chain finished.`
+        const ctx: AiContext<
+          KIT_METADATA,
+          ContextState,
+          PARAMS,
+          PARTS,
+          TOOLS
+        > & {
+          _onExecutionStart: () => void;
+          _onExecutionEnd: () => void;
+        } = {
+          ...initialContext,
+          request: {
+            ...initialContext.request,
+            path: path, // Set the initial path for the root context
+          },
+          state: {} as any,
+          store: store,
+          executionContext: { currentPath: path, callDepth: 0 },
+          requestId: requestId,
+          logger: self._createLogger(requestId, path, 0),
+          response: {
+            ...streamWriter.writer,
+            writeMessageMetadata: streamWriter.writeMessageMetadata,
+            writeCustomTool: streamWriter.writeCustomTool,
+            writeObjectAsTool: streamWriter.writeObjectAsTool,
+            generateId: generateId,
+          },
+          next: undefined as any, // Will be replaced right after
+          _onExecutionStart: () => {
+            self.pendingExecutions++;
+            self.logger?.log(
+              `[AiAgentKit][lifecycle] Execution started. Pending: ${self.pendingExecutions}`
             );
+          },
+          _onExecutionEnd: () => {
+            self.pendingExecutions--;
+            self.logger?.log(
+              `[AiAgentKit][lifecycle] Execution ended. Pending: ${self.pendingExecutions}`
+            );
+            if (self.pendingExecutions === 0 && executionCompletionResolver) {
+              self.logger?.log(
+                `[AiAgentKit][lifecycle] All executions finished. Resolving promise.`
+              );
+              executionCompletionResolver();
+            }
+          },
+        };
+        ctx.next = new NextHandler(
+          ctx,
+          self,
+          ctx._onExecutionStart,
+          ctx._onExecutionEnd
+        ) as any;
+
+        ctx._onExecutionStart();
+        self.logger?.log(
+          `[AiAgentKit][lifecycle] Main execution chain started.`
+        );
+
+        // Fire off the main execution chain. We don't await it here because, in a streaming
+        // context, the await might resolve prematurely when the agent yields control.
+        // Instead, we catch errors and use .finally() to reliably mark the end of this
+        // specific execution, while the main function body waits on the lifecycle promise.
+        // self
+        //   ._execute(path, ctx)
+        //   .catch((err) => {
+        //     ctx.logger.error("Unhandled error in main execution chain", err);
+        //     // Optionally, you could write an error message to the stream here.
+        //   })
+        //   .finally(() => {
+        //     ctx._onExecutionEnd();
+        //   });
+
+        try {
+          const response = await self._execute(path, ctx);
+          const toolDefinition = this.actAsToolDefinitions.get(path);
+          if (toolDefinition && !toolDefinition.metadata?.hideUI) {
+            ctx.response.writeCustomTool({
+              toolName: toolDefinition.id as string,
+              toolCallId: toolDefinition.id + '-' + ctx.response.generateId(),
+              output: response,
+            });
           }
-
-          // ctx.next
-          //   .callAgent(path, initialContext.request.params)
-          //   .catch((err) => {
-          //     ctx.logger.error("Unhandled error in main execution chain", err);
-          //   });
-
-          // Wait for the promise that resolves only when all executions (the main one
-          // and all sub-calls) have completed.
-          await executionCompletionPromise;
-          self.logger.log(
-            `[AiAgentKit][lifecycle] All executions truly finished. Stream can be safely closed.`
+          return response;
+        } catch (err) {
+          ctx.logger.error('Unhandled error in main execution chain', err);
+        } finally {
+          ctx._onExecutionEnd();
+          self.logger?.log(
+            `[AiAgentKit][lifecycle] Main execution chain finished.`
           );
-        },
-      }),
+        }
+
+        // ctx.next
+        //   .callAgent(path, initialContext.request.params)
+        //   .catch((err) => {
+        //     ctx.logger.error("Unhandled error in main execution chain", err);
+        //   });
+
+        // Wait for the promise that resolves only when all executions (the main one
+        // and all sub-calls) have completed.
+        await executionCompletionPromise;
+        self.logger?.log(
+          `[AiAgentKit][lifecycle] All executions truly finished. Stream can be safely closed.`
+        );
+      },
+    });
+  }
+
+  /**
+   * Handles an incoming request and returns a promise that resolves with the full,
+   * non-streamed response. This is useful for environments where streaming is not
+   * desired or for testing.
+   *
+   * @param path The path of the agent or tool to execute.
+   * @param initialContext The initial context for the request, typically containing messages.
+   * @returns A `Promise<Response>` that resolves with the final JSON response.
+   */
+  async toAwaitResponse(
+    path: string,
+    initialContext: Omit<
+      AiContext<KIT_METADATA, ContextState, PARAMS, PARTS, TOOLS>,
+      | 'state'
+      | 'response'
+      | 'next'
+      | 'requestId'
+      | 'logger'
+      | 'executionContext'
+      | 'store'
+    >
+  ): Promise<Response> {
+    this.logger?.log(`Handling request for path: ${path}`);
+    const self = this; // Reference to the router instance
+
+    // --- Execution Lifecycle Management ---
+    let executionCompletionResolver: (() => void) | null = null;
+    const executionCompletionPromise = new Promise<void>((resolve) => {
+      executionCompletionResolver = resolve;
+    });
+
+    const stream = this.handleStream(
+      path,
+      initialContext,
+      executionCompletionPromise,
+      executionCompletionResolver
+    );
+
+    const messageStream = readUIMessageStream({
+      stream,
+      onError: (error) => {
+        this.logger?.error('Error reading UI message stream', error);
+      },
+    });
+
+    let finalMessages: UIMessage[] = [];
+    const thisMessageId = generateId();
+    for await (const message of messageStream) {
+      if (message.id?.length > 0) {
+        finalMessages.push(message);
+      } else if (finalMessages.find((m) => m.id === thisMessageId)) {
+        finalMessages = finalMessages.map((m) =>
+          m.id === thisMessageId
+            ? {
+                ...m,
+                metadata: {
+                  ...(m.metadata ?? {}),
+                  ...(message.metadata ?? {}),
+                },
+                parts: clubParts([
+                  ...(m.parts ?? []),
+                  ...(message.parts ?? []),
+                ]),
+              }
+            : m
+        );
+      } else {
+        finalMessages.push({
+          ...message,
+          id: thisMessageId,
+        });
+      }
+    }
+    const responseBody = JSON.stringify(finalMessages);
+    return new Response(responseBody, {
+      headers: { 'Content-Type': 'application/json' },
     });
   }
 }
 
+export type AiRouterType = typeof AiRouter;
+
 class NextHandler<
-  METADATA,
-  PARTS extends UIDataTypes,
-  TOOLS extends UITools,
-  ContextState extends Record<string, any>,
+  METADATA extends Record<string, any> = Record<string, any>,
+  ContextState extends Record<string, any> = Record<string, any>,
+  PARAMS extends Record<string, any> = Record<string, any>,
+  PARTS extends UIDataTypes = UIDataTypes,
+  TOOLS extends UITools = UITools,
 > {
   public maxCallDepth: number;
 
   constructor(
-    private ctx: AiContext<METADATA, PARTS, TOOLS, ContextState>,
-    private router: AiRouter<METADATA, PARTS, TOOLS, ContextState>,
+    private ctx: AiContext<METADATA, ContextState, PARAMS, PARTS, TOOLS>,
+    private router: AiRouter<METADATA, ContextState, PARAMS, PARTS, TOOLS>,
     private onExecutionStart: () => void,
     private onExecutionEnd: () => void,
-    parentNext?: NextHandler<METADATA, PARTS, TOOLS, ContextState>
+    parentNext?: NextHandler<METADATA, ContextState, PARAMS, PARTS, TOOLS>
   ) {
     this.maxCallDepth = this.router.options.maxCallDepth;
   }
@@ -1165,7 +1673,9 @@ class NextHandler<
   async callAgent(
     agentPath: string,
     params?: Record<string, any>,
-    options?: ToolCallOptions
+    options?: {
+      streamToUI?: boolean;
+    }
   ): Promise<{ ok: true; data: any } | { ok: false; error: Error }> {
     this.onExecutionStart();
     try {
@@ -1186,14 +1696,34 @@ class NextHandler<
       const subContext = (this.router as any)._createSubContext(this.ctx, {
         type: 'agent',
         path: resolvedPath,
-        params: params,
+        params: params ?? ({} as PARAMS),
         messages: this.ctx.request.messages,
       });
+
+      const definition = this.router.actAsToolDefinitions.get(resolvedPath);
+      const toolCallId = definition?.id + '-' + this.ctx.response.generateId();
+      if (options?.streamToUI && definition) {
+        this.ctx.response.writeCustomTool({
+          toolName: definition?.id,
+          toolCallId: toolCallId,
+          input: subContext.request.params,
+        });
+      }
+
       const data = await (this.router as any)._execute(
         resolvedPath,
         subContext,
         true
       );
+
+      if (options?.streamToUI && definition) {
+        this.ctx.response.writeCustomTool({
+          toolName: definition?.id,
+          toolCallId: toolCallId,
+          output: data,
+        });
+      }
+
       return { ok: true, data };
     } catch (error: any) {
       this.ctx.logger.error(`[callAgent] Error:`, error);
@@ -1203,11 +1733,28 @@ class NextHandler<
     }
   }
 
+  /**
+   * @deprecated Use agent-as-tools pattern instead. Use `ctx.next.callAgent()` to call agents that are exposed as tools.
+   * This method will be removed in a future version.
+   *
+   * Example migration:
+   * ```typescript
+   * // Old way (deprecated):
+   * const result = await ctx.next.callTool('/calculator', { a: 5, b: 3 });
+   *
+   * // New way (recommended):
+   * const result = await ctx.next.callAgent('/calculator', { a: 5, b: 3 });
+   * ```
+   */
   async callTool<T extends z.ZodObject<any>>(
     toolPath: string,
     params: z.infer<T>,
     options?: ToolCallOptions
   ): Promise<{ ok: true; data: any } | { ok: false; error: Error }> {
+    this.ctx.logger.warn(
+      `[DEPRECATION WARNING] ctx.next.callTool() is deprecated and will be removed in a future version. ` +
+        `Please use ctx.next.callAgent() instead to call agents that are exposed as tools.`
+    );
     this.onExecutionStart();
     try {
       const parentPath = this.ctx.executionContext.currentPath || '/';
@@ -1221,7 +1768,7 @@ class NextHandler<
       const subContext = (this.router as any)._createSubContext(this.ctx, {
         type: 'tool',
         path: resolvedPath,
-        params: params,
+        params: params ?? ({} as PARAMS),
         messages: this.ctx.request.messages,
       });
       const data = await (this.router as any)._execute(
@@ -1238,10 +1785,27 @@ class NextHandler<
     }
   }
 
+  /**
+   * @deprecated Use agent-as-tools pattern instead. Use `ctx.next.agentAsTool()` to attach agents as tools.
+   * This method will be removed in a future version.
+   *
+   * Example migration:
+   * ```typescript
+   * // Old way (deprecated):
+   * const tool = ctx.next.attachTool('/calculator');
+   *
+   * // New way (recommended):
+   * const tool = ctx.next.agentAsTool('/calculator');
+   * ```
+   */
   attachTool<SCHEMA extends z.ZodObject<any>>(
     toolPath: string,
     _tool?: Omit<Tool<z.infer<SCHEMA>, any>, 'description'>
   ): Tool<z.infer<SCHEMA>, any> {
+    this.ctx.logger.warn(
+      `[DEPRECATION WARNING] ctx.next.attachTool() is deprecated and will be removed in a future version. ` +
+        `Please use ctx.next.agentAsTool() instead to attach agents as tools.`
+    );
     const parentPath = this.ctx.executionContext.currentPath || '/';
     const resolvedPath = (this.router as any)._resolvePath(
       parentPath,
@@ -1286,7 +1850,7 @@ class NextHandler<
 
   agentAsTool<INPUT extends JSONValue | unknown | never = any, OUTPUT = any>(
     agentPath: string,
-    toolDefinition?: Tool<INPUT, OUTPUT>
+    toolDefinition?: AgentTool<INPUT, OUTPUT>
   ) {
     const parentPath = this.ctx.executionContext.currentPath || '/';
     const resolvedPath = (this.router as any)._resolvePath(
@@ -1329,15 +1893,88 @@ class NextHandler<
       );
       throw new AgentDefinitionMissingError(resolvedPath);
     }
+    const { id, metadata, ...restDefinition } = definition;
     return {
-      ...definition,
-      execute: async (params: any, options: any) => {
-        const result = await this.callAgent(agentPath, params, options);
-        if (!result.ok) {
-          throw result.error;
+      [id]: {
+        ...restDefinition,
+        metadata: {
+          ...metadata,
+          toolKey: id,
+          name: restDefinition.name,
+          description: restDefinition.description,
+          absolutePath: restDefinition.path,
+        },
+        execute: (params: any, options: any) => {
+          const executeInternal = async () => {
+            const result = await this.callAgent(agentPath, params, options);
+            if (!result.ok) {
+              throw result.error;
+            }
+            return result.data;
+          };
+          const newPromise = this.router.toolExecutionPromise.then(
+            executeInternal,
+            executeInternal
+          );
+          this.router.toolExecutionPromise = newPromise;
+          return newPromise;
+        },
+      } as Tool<INPUT, OUTPUT>,
+    };
+  }
+
+  getToolDefinition(agentPath: string | RegExp) {
+    const parentPath = this.ctx.executionContext.currentPath || '/';
+    const resolvedPath = (this.router as any)._resolvePath(
+      parentPath,
+      agentPath
+    );
+    let preDefined;
+    const pathsToTry = [resolvedPath];
+    // If the agentPath starts with '/', it's an absolute path from root, so also try it directly
+    if (typeof agentPath === 'string' && agentPath.startsWith('/')) {
+      pathsToTry.unshift(agentPath);
+    }
+    for (const pathToTry of pathsToTry) {
+      for (const [key, value] of (this.router as any).actAsToolDefinitions) {
+        if (typeof key === 'string') {
+          // Check for exact match first
+          if (key === pathToTry) {
+            preDefined = value;
+            break;
+          }
+          // Then check for dynamic path parameters
+          if (extractPathParams(key, pathToTry) !== null) {
+            preDefined = value;
+            break;
+          }
         }
-        return result.data;
+        // Basic RegExp match
+        if (key instanceof RegExp && key.test(pathToTry)) {
+          preDefined = value;
+          break;
+        }
+      }
+      if (preDefined) break;
+    }
+
+    const definition = preDefined;
+    if (!definition) {
+      this.ctx.logger.error(
+        `[agentAsTool] No definition found for agent at resolved path: ${resolvedPath}`
+      );
+      throw new AgentDefinitionMissingError(resolvedPath);
+    }
+    const { metadata, ...restDefinition } = definition;
+    return {
+      ...restDefinition,
+      metadata: {
+        ...metadata,
+        toolKey: restDefinition.id,
+        name: restDefinition.name,
+        description: restDefinition.description,
+        absolutePath: restDefinition.path,
       },
-    } as Tool<INPUT, OUTPUT>;
+    } as AgentTool<any, any>;
   }
 }

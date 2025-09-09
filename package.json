@@ -33,9 +33,11 @@
   },
   "dependencies": {
     "chalk": "^5.6.2",
+    "execa": "^9.6.0",
     "glob": "^11.0.3",
     "minimist": "^1.2.8",
     "ora": "^8.2.0",
+    "prompts": "^2.4.2",
     "rehype-raw": "^7.0.0",
     "rehype-stringify": "^10.0.1",
     "remark-rehype": "^11.1.2",

@@ -1,6 +1,6 @@
 {
   "name": "next-perplexity-clone",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -11,7 +11,7 @@
   "dependencies": {
     "@ai-sdk/google": "^2.0.11",
     "@ai-sdk/react": "^2.0.30",
-    "@microfox/ai-router": "^1.1.2",
+    "@microfox/ai-router": "^2.0.0",
     "@microfox/brave": "^1.2.3",
     "@microfox/db-upstash": "^1.1.8",
     "@microfox/tool-kit": "^1.1.22",

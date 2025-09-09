@@ -13,10 +13,15 @@ npx @microfox/studio-cli init
 This command will guide you through the following steps:
 
 1.  **Project Validation**: Ensures you are in a valid Next.js project with the App Router.
-2.  **Configuration**: Prompts you to configure paths for components, AI logic, and utility functions. It will also ask for your preferred import alias (e.g., `@/`). This configuration is saved to a `microfox.config.ts` file.
-3.  **Template Selection**: Allows you to choose from a list of available starter templates.
-4.  **Dependency Installation**: Installs all necessary npm dependencies and `shadcn/ui` components required by the selected template.
-5.  **File Scaffolding**: Copies the template files into your project and intelligently transforms the import paths to match your configuration.
+2.  **Configuration**: Prompts you for your preferences on installing Shadcn components, setting up basic AI agents, and using the AI Studio. It also asks for your preferred database for chat sessions if you opt for the studio.
+3.  **Dependency Installation**: Installs all necessary npm dependencies and `shadcn/ui` components.
+4.  **File Scaffolding**: Copies the template files into your project and intelligently transforms the import paths to match your configuration.
+
+You can also specify a template to use with the `--template` flag:
+
+```bash
+npx @microfox/studio-cli init --template <template-name>
+```
 
 ## Testing Locally
 

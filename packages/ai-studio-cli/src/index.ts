@@ -15,3 +15,6 @@ program
 program.addCommand(initCommand);
 
 program.parse(process.argv);
+
+const aiStudioCli = program;
+export { aiStudioCli };

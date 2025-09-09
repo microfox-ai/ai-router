@@ -1,10 +1,20 @@
 # Changelog
 
+## 1.0.1
+
+### Patch Changes
+
+- e3847c0: Changes from PR #11: examples-&-types
+- Updated dependencies [e3847c0]
+- Updated dependencies [3dc4cc4]
+  - @microfox/ai-router@2.0.0
+
 All notable changes to this project will be documented in this file.
 
 ## [1.0.0] - <%= new Date().toISOString().split('T')[0] %>
 
 ### Added
+
 - Initial release
 - Basic SDK structure
 - TypeScript support
@@ -24,4 +34,4 @@ All notable changes to this project will be documented in this file.
 
 ### Removed
 - Deprecated feature
---> 
+-->

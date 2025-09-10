@@ -1,6 +1,6 @@
 {
   "name": "@microfox/ai-studio-cli",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "A TypeScript SDK for Studio Cli.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",

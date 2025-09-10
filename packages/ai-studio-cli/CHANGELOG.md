@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.3
+
+### Patch Changes
+
+- deab909: release: update dependencies and refactor styles in next-perplexity-clone example
+- 1f37089: release: new updtaes
+
 ## 1.0.2
 
 ### Patch Changes

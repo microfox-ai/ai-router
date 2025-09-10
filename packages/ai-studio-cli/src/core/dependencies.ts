@@ -48,21 +48,31 @@ export async function installDependencies(templateDir: string) {
     // spinner.text = 'Installing dependencies with `npm install`...';
     // await runCommand('npm', ['install']);
 
-    // 3. Initialize shadcn/ui (this is idempotent)
-    spinner.text = 'Initializing shadcn/ui...';
-    await runCommand('npx', [
-      'shadcn@latest',
-      'init',
-      '-y',
-      '--base-color',
-      'neutral',
-    ]);
+    const componentsJsonPath = path.join(process.cwd(), 'components.json');
+    let shadcnSetupDone = false;
+    if (fs.pathExistsSync(componentsJsonPath)) {
+      spinner.text = 'Valid shadcn/ui setup detected.';
+    } else {
+      // 3. Initialize shadcn/ui (this is idempotent)
+      spinner.text = 'Initializing shadcn/ui...';
+      await runCommand('npx', [
+        'shadcn@latest',
+        'init',
+        '-y',
+        '--base-color',
+        'neutral',
+      ]);
 
-    // 4. Add shadcn/ui components
-    spinner.text = `Adding shadcn/ui components...`;
-    await runCommand('npx', ['shadcn@latest', 'add', '--all']);
+      // 4. Add shadcn/ui components
+      spinner.text = `Adding shadcn/ui components...`;
+      await runCommand('npx', ['shadcn@latest', 'add', '--all']);
+      shadcnSetupDone = true;
+    }
 
-    spinner.succeed(chalk.green('Dependencies installed successfully.'));
+    spinner.succeed(chalk.green('Template Dependencies configured.'));
+    if (shadcnSetupDone) {
+      console.log(chalk.green('Shadcn UI setup is done.'));
+    }
   } catch (error) {
     spinner.fail(chalk.red('Failed to install dependencies.'));
     console.error(error);

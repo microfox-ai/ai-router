@@ -1,8 +1,15 @@
 import { Command } from 'commander';
 import { setupProject } from '../core/project';
-import { promptForConfig, writeConfigFile } from '../core/config';
+import {
+  promptForConfig,
+  writeConfigFile,
+  Config,
+  loadConfig,
+} from '../core/config';
 import { scaffoldProject } from '../core/scaffold';
 import chalk from 'chalk';
+import path from 'path';
+import fs from 'fs';
 
 export const initCommand = new Command()
   .name('init')
@@ -14,14 +21,22 @@ export const initCommand = new Command()
   )
   .action(async (options) => {
     const projectName = await setupProject();
-    const config = await promptForConfig();
-    writeConfigFile(config);
+    let config: Config | null = await loadConfig();
+
+    if (config) {
+      console.log(chalk.green('✓ Existing configuration loaded.'));
+    } else {
+      config = await promptForConfig();
+      writeConfigFile(config);
+    }
+
     await scaffoldProject(options.template, config);
 
     if (typeof projectName === 'string') {
       console.log(chalk.green('\n🎉 Your project is ready!'));
       console.log(chalk.cyan('\nNext steps:'));
       console.log(chalk.yellow(`  cd ${projectName}`));
+      console.log(chalk.yellow(`  npm run install`));
       console.log(chalk.yellow(`  npm run dev`));
       console.log(
         chalk.yellow(`  Open http://localhost:3000/studio in your browser.`)

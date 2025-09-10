@@ -142,3 +142,65 @@ export function writeConfigFile(config: Config) {
     chalk.green(`✓ Configuration file written to \`microfox.config.ts\`.`)
   );
 }
+
+export async function loadConfig(): Promise<Config | null> {
+  const configFilePath = path.join(process.cwd(), 'microfox.config.ts');
+  if (!fs.existsSync(configFilePath)) {
+    return null;
+  }
+
+  const content = fs.readFileSync(configFilePath, 'utf-8');
+
+  const dbTypeMatch = content.match(
+    /type:\s*['"](local|supabase|upstash-redis)['"]/
+  );
+  const chatSessionDb = dbTypeMatch
+    ? (dbTypeMatch[1] as 'local' | 'supabase' | 'upstash-redis')
+    : undefined;
+
+  const useStudio = !!chatSessionDb;
+
+  const tsconfigPath = path.join(process.cwd(), 'tsconfig.json');
+  let importAlias = DEFAULT_IMPORT_ALIAS;
+  if (fs.existsSync(tsconfigPath)) {
+    try {
+      const tsconfigRaw = fs.readFileSync(tsconfigPath, 'utf-8');
+      // Remove comments from tsconfig before parsing
+      const tsconfig = JSON.parse(
+        tsconfigRaw.replace(/\/\*[\s\S]*?\*\/|\/\/.*/g, '')
+      );
+      const paths = tsconfig.compilerOptions?.paths;
+      if (paths) {
+        const aliasKey = Object.keys(paths).find((key) => key.endsWith('/*'));
+        if (aliasKey) {
+          importAlias = aliasKey.slice(0, -1);
+        }
+      }
+    } catch (e) {
+      console.log(
+        chalk.yellow(
+          'Could not parse tsconfig.json, using default import alias.'
+        )
+      );
+    }
+  }
+
+  const fullConfig = {
+    components: DEFAULT_COMPONENTS_PATH,
+    ai: DEFAULT_AI_PATH,
+    utils: DEFAULT_UTILS_PATH,
+    importAlias,
+    useStudio,
+    chatSessionDb,
+  };
+
+  try {
+    return configSchema.parse(fullConfig);
+  } catch (error) {
+    console.log(chalk.red('Could not validate the loaded configuration.'));
+    if (error instanceof z.ZodError) {
+      console.error(error.errors);
+    }
+    process.exit(1);
+  }
+}

@@ -14,7 +14,7 @@ import remarkRehype from 'remark-rehype';
 import rehypeRaw from 'rehype-raw';
 import rehypeStringify from 'rehype-stringify';
 import { processTimeSince } from './remarkTimeSince';
-import '@/components/ui/tiptap.css';
+import '@/components/studio/tiptap.css';
 
 interface TiptapMarkdownProps {
     children: string;

@@ -303,7 +303,7 @@ const NavigationItem = ({
             className={`${isActive ? "bg-gray-200" : "hover:bg-gray-100"} rounded-lg cursor-pointer ${isCollapsed ? "p-2 w-full flex justify-center" : "p-2 px-3"} group`}
         >
             {href ? (
-                <Link href={href} className="flex items-center justify-between">
+                <Link href={href} target={href.startsWith('http') ? '_blank' : undefined} className="flex items-center justify-between">
                     {content}
                 </Link>
             ) : (

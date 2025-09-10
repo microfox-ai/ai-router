@@ -64,7 +64,9 @@ export async function setupProject() {
     process.exit(1);
   }
 
-  console.log(chalk.cyan(`Creating a new Next.js app: ${projectName}`));
+  const spinner = ora(
+    chalk.cyan(`Creating a new Next.js app: ${projectName}`)
+  ).start();
   try {
     await execa(
       'npx',
@@ -82,13 +84,13 @@ export async function setupProject() {
       ]
       // { stdio: 'inherit' }
     );
-    console.log(chalk.green('\n✓ Next.js project created successfully.'));
+    spinner.succeed(chalk.green('Next.js project created successfully.'));
 
     process.chdir(path.join(currentDir, projectName));
     console.log(chalk.cyan(`changed directory to: ${projectName}`));
     return projectName;
   } catch (error) {
-    console.error(chalk.red('\nFailed to create Next.js project.'));
+    spinner.fail(chalk.red('Failed to create Next.js project.'));
     console.error(error);
     process.exit(1);
   }

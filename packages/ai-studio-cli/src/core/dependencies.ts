@@ -45,8 +45,8 @@ export async function installDependencies(templateDir: string) {
     });
 
     // 2. Install all dependencies
-    spinner.text = 'Installing dependencies with `npm install`...';
-    await runCommand('npm', ['install']);
+    // spinner.text = 'Installing dependencies with `npm install`...';
+    // await runCommand('npm', ['install']);
 
     // 3. Initialize shadcn/ui (this is idempotent)
     spinner.text = 'Initializing shadcn/ui...';

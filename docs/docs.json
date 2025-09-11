@@ -1,0 +1,116 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Microfox",
+  "colors": {
+    "primary": "#16A34A",
+    "light": "#07C983",
+    "dark": "#15803D"
+  },
+  "favicon": "/favicon.ico",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "AI Router",
+        "icon": "split",
+        "page": "ai-router/index",
+        "groups": [
+          {
+            "group": "Introduction",
+            "pages": [
+              "ai-router/intro/index",
+              "ai-router/intro/why",
+              "ai-router/intro/core"
+            ]
+          },
+          {
+            "group": "Getting Started",
+            "pages": [
+              "ai-router/overview/quickstart",
+              "ai-router/overview/ai-router",
+              "ai-router/overview/type-safety",
+              "ai-router/overview/structure",
+              "ai-router/overview/ai-studio"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "ai-router/foundation/basics",
+              "ai-router/foundation/agents",
+              "ai-router/foundation/agent-as-tool",
+              "ai-router/foundation/state",
+              "ai-router/foundation/stream",
+              "ai-router/foundation/middleware"
+            ]
+          },
+          {
+            "group": "Other",
+            "pages": [
+              "ai-router/advanced/advanced-usage",
+              "ai-router/overview/langgraph",
+              "ai-router/advanced/langgraph-migration"
+            ]
+          },
+          {
+            "group": "Examples",
+            "pages": ["ai-router/examples/perplexity-clone"]
+          },
+          {
+            "group": "API Reference",
+            "pages": [
+              "ai-router/api-reference/router",
+              "ai-router/api-reference/context-object",
+              "ai-router/api-reference/next-handler",
+              "ai-router/api-reference/error-types"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg"
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Blog",
+        "href": "https://microfox.app/blog"
+      },
+      {
+        "label": "GitHub",
+        "href": "https://github.com/microfox-ai"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "App",
+      "href": "https://microfox.app"
+    }
+  },
+  "styling": {
+    "eyebrows": "breadcrumbs"
+  },
+  "contextual": {
+    "options": [
+      "copy",
+      "view",
+      "chatgpt",
+      "claude",
+      "perplexity",
+      "mcp",
+      "cursor",
+      "vscode"
+    ]
+  },
+  "footer": {
+    "socials": {
+      "x": "https://x.com/microfoxai",
+      "github": "https://github.com/microfox-ai",
+      "linkedin": "https://www.linkedin.com/company/microfoxautomates",
+      "discord": "https://discord.gg/microfox"
+    }
+  }
+}

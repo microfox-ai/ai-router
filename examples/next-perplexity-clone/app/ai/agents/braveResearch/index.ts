@@ -12,7 +12,7 @@ export const braveResearchAgent = aiRouter
     //return deepResearch(ctx);
     const { query, deep, count } = ctx.request.params;
     const result = await ctx.next.callAgent(
-      deep ? '/fast' : '/fast',
+      deep ? '/deep' : '/fast',
       {
         query,
         type: 'web',

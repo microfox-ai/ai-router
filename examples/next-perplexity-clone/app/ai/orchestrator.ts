@@ -34,14 +34,9 @@ export const mainOrchestrator: AiMiddleware<{
       system: dedent`
         You are a helpful assistant that can use the following tools to help the user:
         
-        Tools:
-        ${props.next.getToolDefinition('/research/brave')?.metadata?.toolKey}
-        - Use this tool to research the web for any information.
-        ${props.next.getToolDefinition('/summarize')?.metadata?.toolKey}
-        - Use this tool to summarise the research.
 
         Notes:
-        You Must summarise the research using the ${props.next.getToolDefinition('/summarize')?.metadata?.toolKey} tool.
+        You Must summarise the research using the summarise tool.
       `,
       messages: convertToModelMessages(messages),
       tools: {
@@ -49,6 +44,15 @@ export const mainOrchestrator: AiMiddleware<{
         ...props.next.agentAsTool('/summarize'),
       },
       toolChoice: 'required',
+      stopWhen: [
+        stepCountIs(2),
+        ({ steps }) =>
+          steps.some((step) =>
+            step.toolResults.some(
+              (tool) => tool.toolName === 'summarizeResearch',
+            ),
+          ),
+      ],
       onFinish: (result) => {
         console.log('TOTAL USAGE', result.totalUsage);
       },

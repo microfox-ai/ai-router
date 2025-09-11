@@ -1,5 +1,6 @@
 ---
-title: 'Agent-as-Tools Pattern'
+title: 'Agent-as-Tools'
+sidebarTitle: 'Agent-as-Tools'
 description: 'Learn how to expose agents as tools for LLM integration and create powerful agent compositions.'
 ---
 
@@ -19,7 +20,9 @@ The **Agent-as-Tools** pattern is the core paradigm of modern ai-router applicat
 
 ### Step 1: Create and Expose an Agent as a Tool
 
-```typescript
+<CodeGroup>
+
+```typescript:research-agent.ts
 import { AiRouter } from '@microfox/ai-router';
 import { z } from 'zod';
 
@@ -63,11 +66,7 @@ researchAgent
 router.agent('/research', researchAgent);
 ```
 
-### Step 2: Use the Agent as a Tool
-
-Now you can use this agent as a tool in LLM functions or other agents:
-
-```typescript
+```typescript:blog-writer.ts
 import { streamText } from 'ai';
 import { openai } from '@ai-sdk/openai';
 
@@ -86,17 +85,19 @@ router.agent('/blog-writer', async (ctx) => {
 });
 ```
 
+</CodeGroup>
+
 ## Advanced Patterns
 
 ### Complex Agent Compositions
 
 You can create sophisticated workflows by composing multiple agents:
 
-```typescript
+<CodeGroup>
+
+```typescript:data-analysis-agent.ts
 // Create specialized agents
 const dataAnalysisAgent = new AiRouter();
-const reportGeneratorAgent = new AiRouter();
-const emailSenderAgent = new AiRouter();
 
 // Define each agent with specific capabilities
 dataAnalysisAgent
@@ -118,6 +119,10 @@ dataAnalysisAgent
     }),
     metadata: { icon: '📊', category: 'analysis' },
   });
+```
+
+```typescript:report-generator-agent.ts
+const reportGeneratorAgent = new AiRouter();
 
 reportGeneratorAgent
   .agent('/', async (ctx) => {
@@ -139,7 +144,9 @@ reportGeneratorAgent
     }),
     metadata: { icon: '📄', category: 'generation' },
   });
+```
 
+```typescript:workflow-orchestrator.ts
 // Main orchestrator agent
 router.agent('/workflow-orchestrator', async (ctx) => {
   const { data } = ctx.request.params;
@@ -163,11 +170,13 @@ router.agent('/report-generation', reportGeneratorAgent);
 router.agent('/email-sender', emailSenderAgent);
 ```
 
+</CodeGroup>
+
 ### Conditional Agent Attachment
 
 You can conditionally attach agents based on context:
 
-```typescript
+```typescript:smart-assistant.ts
 router.agent('/smart-assistant', async (ctx) => {
   const { query, userRole } = ctx.request.params;
 
@@ -202,9 +211,10 @@ router.agent('/smart-assistant', async (ctx) => {
 
 Agents can call other agents and also be exposed as tools:
 
-```typescript
+<CodeGroup>
+
+```typescript:research-agent-with-summarizer.ts
 const researchAgent = new AiRouter();
-const summarizerAgent = new AiRouter();
 
 // Research agent that can call the summarizer
 researchAgent
@@ -240,6 +250,10 @@ researchAgent
     }),
     metadata: { icon: '🔍', category: 'research' },
   });
+```
+
+```typescript:summarizer-agent.ts
+const summarizerAgent = new AiRouter();
 
 // Summarizer agent
 summarizerAgent
@@ -268,13 +282,15 @@ router.agent('/research', researchAgent);
 router.agent('/summarizer', summarizerAgent);
 ```
 
+</CodeGroup>
+
 ## Configuration Options
 
 ### Tool Configuration
 
 The `.actAsTool()` method accepts several configuration options:
 
-```typescript
+```typescript:tool-configuration.ts
 agent.actAsTool('/', {
   // Required
   id: 'unique-tool-id',
@@ -317,7 +333,7 @@ agent.actAsTool('/', {
 
 Agents can stream their responses when used as tools:
 
-```typescript
+```typescript:streaming-agent.ts
 const streamingAgent = new AiRouter();
 
 streamingAgent
@@ -357,7 +373,9 @@ streamingAgent
 
 Create agents that can be used in multiple contexts:
 
-```typescript
+<CodeGroup>
+
+```typescript:reusable-agent.ts
 // Good: Generic and reusable
 const dataProcessorAgent = new AiRouter();
 dataProcessorAgent
@@ -377,7 +395,9 @@ dataProcessorAgent
     }),
     // ...
   });
+```
 
+```typescript:specific-agent.ts
 // Avoid: Too specific
 const userEmailProcessorAgent = new AiRouter();
 userEmailProcessorAgent.agent('/', async (ctx) => {
@@ -388,11 +408,15 @@ userEmailProcessorAgent.agent('/', async (ctx) => {
 // ...
 ```
 
+</CodeGroup>
+
 ### 2. Provide Clear Descriptions
 
 Make your tools (aka agents) easy to understand and use:
 
-```typescript
+<CodeGroup>
+
+```typescript:clear-descriptions.ts
 // Good: Clear and descriptive
 .actAsTool('/', {
   id: 'weatherForecast',
@@ -404,7 +428,9 @@ Make your tools (aka agents) easy to understand and use:
   }),
   // ...
 });
+```
 
+```typescript:vague-descriptions.ts
 // Avoid: Vague descriptions
 .actAsTool('/', {
   id: 'weather',
@@ -417,11 +443,13 @@ Make your tools (aka agents) easy to understand and use:
 });
 ```
 
+</CodeGroup>
+
 ### 3. Handle Errors Gracefully
 
 Provide meaningful error messages and handle edge cases:
 
-```typescript
+```typescript:robust-agent.ts
 const robustAgent = new AiRouter();
 
 robustAgent
@@ -473,7 +501,7 @@ robustAgent
 
 Provide useful metadata for better tool discovery and usage:
 
-```typescript
+```typescript:metadata-example.ts
 .actAsTool('/', {
   id: 'imageGenerator',
   name: 'AI Image Generator',
@@ -514,7 +542,7 @@ Provide useful metadata for better tool discovery and usage:
 
 ### Next.js API Route Integration
 
-```typescript
+```typescript:api-route.ts
 // app/api/ai/chat/route.ts
 import { AiRouter } from '@microfox/ai-router';
 import { streamText } from 'ai';
@@ -559,10 +587,9 @@ export async function POST(request: Request) {
 
 ### Real-world Example: Content Creation Workflow
 
-```typescript
-// Content creation workflow with multiple specialized agents
-const contentWorkflow = new AiRouter();
+<CodeGroup>
 
+```typescript:content-research-agent.ts
 // Research agent
 const researchAgent = new AiRouter();
 researchAgent
@@ -589,7 +616,9 @@ researchAgent
     }),
     metadata: { icon: '🔍', category: 'research' },
   });
+```
 
+```typescript:content-writing-agent.ts
 // Writing agent
 const writingAgent = new AiRouter();
 writingAgent
@@ -620,7 +649,9 @@ writingAgent
     }),
     metadata: { icon: '✍️', category: 'writing' },
   });
+```
 
+```typescript:seo-agent.ts
 // SEO agent
 const seoAgent = new AiRouter();
 seoAgent
@@ -648,6 +679,11 @@ seoAgent
     }),
     metadata: { icon: '🎯', category: 'seo' },
   });
+```
+
+```typescript:content-workflow.ts
+// Content creation workflow with multiple specialized agents
+const contentWorkflow = new AiRouter();
 
 // Main content creation agent
 contentWorkflow.agent('/create-content', async (ctx) => {
@@ -672,6 +708,8 @@ router.agent('/writing', writingAgent);
 router.agent('/seo', seoAgent);
 router.agent('/content-workflow', contentWorkflow);
 ```
+
+</CodeGroup>
 
 ## Next Steps
 

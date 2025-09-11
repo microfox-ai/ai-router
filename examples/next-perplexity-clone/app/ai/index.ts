@@ -8,6 +8,7 @@ import { contextLimiter } from './middlewares/contextLimiter';
 import { mainOrchestrator } from './orchestrator';
 
 const aiRouter = new AiRouter<any, any, any, any>();
+aiRouter.setLogger(console);
 // aiRouter.setStore(new MemoryStore());
 
 const aiMainRouter = aiRouter

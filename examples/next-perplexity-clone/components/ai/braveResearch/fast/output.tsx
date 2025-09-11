@@ -11,6 +11,7 @@ import { WebSearchSource } from "../types";
 import { BraveSourceFooter } from "./footer";
 import { BraveSourceHeader } from "./header";
 import { Inter, Krub } from 'next/font/google';
+import { useLayout } from "@/components/studio/context/LayoutProvider";
 
 const inter = Inter({ subsets: ['latin'] });
 const krub = Krub({ subsets: ['latin'], weight: '400' });
@@ -18,7 +19,6 @@ const krub = Krub({ subsets: ['latin'], weight: '400' });
 export const BraveResults: ComponentType<{
     tool: ToolUIPart<Pick<AiRouterTools, "braveResearchFast" | "braveResearchDeep">>
 }> = (props) => {
-
 
     const { tool } = props;
     const output = tool.output;

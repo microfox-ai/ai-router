@@ -1,5 +1,6 @@
 ---
-title: 'Routing'
+title: 'Ai Routing In-Depth'
+sidebarTitle: 'Ai Routing In-Depth'
 description: 'Learn the fundamental concepts of ai-router and how to get started.'
 ---
 
@@ -67,7 +68,8 @@ router.agent('/users/:id/posts', async (ctx) => {
 
 You can mount sub-agents to create a hierarchy of specialized agents using the new agent-as-tools pattern:
 
-```typescript
+<CodeGroup>
+```typescript Setup & Imports
 import { AiRouter, MemoryStore } from '@microfox/ai-router';
 import { z } from 'zod';
 
@@ -75,6 +77,9 @@ import { z } from 'zod';
 const mainRouter = new AiRouter();
 mainRouter.setStore(new MemoryStore());
 
+````
+
+```typescript Code Generation Agent
 // Sub-agent for code generation
 const codeAgent = new AiRouter();
 codeAgent
@@ -102,7 +107,9 @@ codeAgent
       title: 'Code Generator',
     },
   });
+````
 
+```typescript Test Runner Agent
 // Sub-agent for testing
 const testAgent = new AiRouter();
 testAgent
@@ -132,7 +139,9 @@ testAgent
       title: 'Test Runner',
     },
   });
+```
 
+```typescript Agent Mounting & Orchestration
 // Mount sub-agents to main router using .agent() method
 mainRouter.agent('/code', codeAgent);
 mainRouter.agent('/test', testAgent);
@@ -163,6 +172,8 @@ mainRouter.agent('/', async (ctx) => {
   return { error: 'Code generation failed' };
 });
 ```
+
+</CodeGroup>
 
 ## The Context Object
 
@@ -277,10 +288,4 @@ export default function Chat() {
 ai-router provides comprehensive streaming support built on top of the Vercel AI SDK v5. This enables real-time, interactive AI experiences where responses are delivered as they're generated. The new agent-as-tools pattern integrates seamlessly with streaming LLM functions.
 
 For detailed information about streaming capabilities, helper functions, and integration patterns, see the [Streaming Support](/ai-router/foundation/stream) documentation.
-
-### ✅ New Patterns (Recommended)
-
-- **Agent-as-Tools**: Use `.actAsTool()` to expose agents as tools for LLM integration
-- **Store Management**: Configure stores with `setStore(new MemoryStore())`
-- **Agent Calling**: Use `ctx.next.callAgent('/path', params)` for agent-to-agent communication
 ````

@@ -67,7 +67,7 @@ jobs:
           fi
 
       - name: Publish to npm
-        run: npx changeset publish --tag ${{ steps.get_tag.outputs.tag }}
+        run: npx changeset publish
         env:
           GITHUB_TOKEN: ${{ secrets.ORG_PAT || secrets.GITHUB_TOKEN }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN_ELEVATED }}

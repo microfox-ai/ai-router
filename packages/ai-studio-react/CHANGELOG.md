@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.2-beta.0
+
+### Patch Changes
+
+- Updated dependencies [470af66]
+  - @microfox/ai-router@2.0.1-beta.0
+
 ## 1.0.1
 
 ### Patch Changes

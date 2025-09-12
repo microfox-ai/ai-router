@@ -1,5 +1,11 @@
 # @microfox/ai-router
 
+## 2.0.1-beta.1
+
+### Patch Changes
+
+- 07d4a18: beta release
+
 ## 2.0.1-beta.0
 
 ### Patch Changes

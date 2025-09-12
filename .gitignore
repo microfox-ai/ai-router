@@ -13,6 +13,7 @@ public/dist
 .turbo
 test-results
 .plan
+*.plan
 
 # Microfox report files
 packages/*/research-report.md

@@ -30,6 +30,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          registry-url: 'https://registry.npmjs.org'
 
       - name: Install Dependencies
         run: npm i
@@ -69,5 +70,5 @@ jobs:
       - name: Publish to npm
         run: npx changeset publish
         env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN_ELEVATED }}
           GITHUB_TOKEN: ${{ secrets.ORG_PAT || secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN_ELEVATED }}

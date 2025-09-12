@@ -36,7 +36,7 @@ export const initCommand = new Command()
       console.log(chalk.green('\n🎉 Your project is ready!'));
       console.log(chalk.cyan('\nNext steps:'));
       console.log(chalk.yellow(`  cd ${projectName}`));
-      console.log(chalk.yellow(`  npm run install`));
+      console.log(chalk.yellow(`  npm i`));
       console.log(chalk.yellow(`  npm run dev`));
       console.log(
         chalk.yellow(`  Open http://localhost:3000/studio in your browser.`)

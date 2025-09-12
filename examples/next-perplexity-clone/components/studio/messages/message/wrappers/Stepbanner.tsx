@@ -1,6 +1,6 @@
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { AgentData, AgentTool } from "@microfox/ai-router";
-import { ChevronDown, ChevronLeft, ChevronRight, CircleIcon, CommandIcon, NotebookTextIcon } from "lucide-react";
+import { AlignStartHorizontalIcon, ChevronDown, ChevronLeft, ChevronRight, CircleIcon, CommandIcon, NotebookTextIcon, NotepadTextIcon, TypeIcon, TypeOutlineIcon } from "lucide-react";
 import { useAppChat } from "../../../context/AppChatProvider";
 import { useMessageParts } from "../../../context/MessageProvider";
 import { useComponents } from "../../../context/ComponentProvider";
@@ -58,44 +58,10 @@ export const StepBanner = () => {
             ...p, metadata: {
             }
         };
-        // const { mcpType, mcpName, toolName } = parseMcpType(p.type as `tool-${string}`);
-        // if (mcpType === "") {
-        //     return null;
-        // }
-        // // This is a workaround pattern for the mcirofox inner distribution.
-        // return {
-        //     mcpName,
-        //     mcpType,
-        //     packageName: mcpName?.startsWith("@microfox") ? mcpName : `@microfox/${mcpName}`, toolName, ...p
-        // };
     }).filter((p) => p !== null);
 
-    console.log("partsWithMetadata", partsWithMetadata);
-    // const packageNames = toolPackages.filter((p) => p.packageName && p.mcpType === "pkg").map((p) => p.packageName).join(",");
-    // const agentNames = toolPackages.filter((p) => p.packageName && p.mcpType === "agent").map((p) => p.mcpName).join(",");
-
-    // const { data: packageInfos, mutate: mutatePackageInfos } = useSWR<Package[]>(
-    //     packageNames && packageNames.length > 0 ? `/api/packages/infos?packageNames=${packageNames}` : null,
-    //     async (url: string) => {
-    //         const res = await fetch(url);
-    //         if (!res.ok) throw new Error("Failed to fetch packages");
-    //         return res.json();
-    //     }, {
-    //     revalidateOnFocus: false,
-    // });
-
-    // const { data: agentInfos, mutate: mutateAgentInfos } = useSWR<AgentInfo[]>(
-    //     agentNames && agentNames.length > 0 ? `/api/agents/infos?agentNames=${agentNames}` : null,
-    //     async (url: string) => {
-    //         const res = await fetch(url);
-    //         if (!res.ok) throw new Error("Failed to fetch agents");
-    //         return res.json();
-    //     }, {
-    //     revalidateOnFocus: false,
-    // });
-
     return (
-        <div className="flex mb-4 border-b border-neutral-200 gap-1 bg-transparent items-center sticky bg-white z-10 top-[0px] shadow-xs">
+        <div className="flex mb-4 border-b border-neutral-200 gap-1 bg-transparent items-center sticky bg-white z-9 top-[0px] shadow-xs">
             <ChevronLeft
                 className={`h-4 w-4 text-gray-500 cursor-pointer ${activePart > 0 ? "opacity-100" : "opacity-50"
                     }`}
@@ -131,9 +97,33 @@ export const StepBanner = () => {
                     const parentTitle = p.metadata?.parentTitle;
                     const isTextPart = p.type === "text";
 
+                    if (isTextPart) {
+
+                        if (isActivePart) {
+                            return null;
+                            // return (<span className="text-md font-medium text-neutral-800">{
+                            //     p.type === "text" ?
+                            //         isFinalSummaryActive ? "Final Summary" : "Text" :
+                            //         title
+                            // }</span>)
+                        }
+
+                        if (_index === partsWithMetadata.length - 1) {
+                            return null;
+                        }
+
+                        return (
+                            <div key={p.type + _index} className="flex items-center gap-2">
+                                <NotepadTextIcon className="w-4 h-4" />
+                                <span className="text-md font-medium text-neutral-800">Text</span>
+                            </div>
+                        )
+                    }
+
                     if (isTextPart && isActivePart && isFinalSummaryActive) {
                         return null;
                     }
+
 
                     return (
                         <div key={p.type + _index} className="flex items-center gap-2">
@@ -148,34 +138,27 @@ export const StepBanner = () => {
                                     <TooltipTrigger>
                                         {icon ?
                                             <img src={icon ?? ""} alt={title} className="w-4 h-4 rounded-full" /> :
-                                            p.type === "text" ?
-                                                <></> :
-                                                <></>
+                                            <TypeIcon className="w-4 h-4" />
                                         }
                                     </TooltipTrigger>
                                     <TooltipContent>
-                                        {title} {parentTitle ? `in ${parentTitle}` : ""}
+                                        {(title && title.length > 0) ?
+                                            `${title} ${parentTitle ? `in ${parentTitle}` : ``}` :
+                                            `Toolcall ${parentTitle ? `in ${parentTitle}` : ``}`}
                                     </TooltipContent>
                                 </Tooltip>
                                 {isActivePart && (
                                     <span className="text-md font-medium text-neutral-800">{
-                                        p.type === "text" ?
-                                            isFinalSummaryActive ? "Final Summary" : "Text" :
-                                            title
+                                        title
                                     }</span>
                                 )}
                             </div>
-                            {_index !== partsWithMetadata.length - 1 || isActivePart && (
-                                <ChevronRight className="w-3 h-3" />
-                            )}
+                            <ChevronRight className="w-3 h-3" />
                         </div>
                     )
                 })}
                 {hasFinalSummary && (
                     <>
-                        {partsWithMetadata.length > 0 && (
-                            <CommandIcon className="w-3 h-3 text-neutral-400 self-center" />
-                        )}
                         <div
                             onClick={() => {
                                 if (displayParts) {

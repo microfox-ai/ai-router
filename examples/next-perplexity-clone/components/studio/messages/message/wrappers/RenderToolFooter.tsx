@@ -16,7 +16,7 @@ export const RenderToolFooter = () => {
         getToolComponent(lastActiveToolPart.type, "footer_sticky")
         : null;
     if (FooterComponent) {
-        return <FooterComponent tool={lastActiveToolPart as any} />
+        return <FooterComponent tool={lastActiveToolPart as any} isStickyRender={true} />
     }
 
     //const { toolName, mcpName } = parseMcpType(lastActiveToolPart?.type ?? "");

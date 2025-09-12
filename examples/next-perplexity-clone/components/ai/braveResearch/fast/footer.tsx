@@ -7,12 +7,15 @@ import { mapBraveWebSearch } from "../mapper";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { HoverSourcePopup } from "./header";
 import { ToolUIPart } from "ai";
+import { useMessageParts } from "@/components/studio/context/MessageProvider";
 
 
 export const BraveSourceFooter = ({
-    tool
+    tool,
+    isStickyRender
 }: {
     tool: ToolUIPart<Pick<AiRouterTools, "braveResearchFast" | "braveResearchDeep">>
+    isStickyRender?: boolean
 }) => {
     const [scope, animate] = useAnimate();
     const [animationControls, setAnimationControls] =
@@ -34,6 +37,13 @@ export const BraveSourceFooter = ({
     }, [animate, scope]);
 
     if (!tool.output) {
+        return null;
+    }
+
+    const { stickyUiParts, activePart, displayParts } = useMessageParts();
+    const activePartIsText = activePart > 0 && displayParts[activePart - 1].type === "text";
+    // if this is sticky render, only render if the active part is not text
+    if (!activePartIsText && isStickyRender) {
         return null;
     }
 

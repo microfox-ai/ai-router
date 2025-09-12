@@ -1,11 +1,11 @@
 import {
   messageStore,
   sessionStore,
-} from '@/app/ai/middlewares/chatSessionUpstash';
+} from '@/app/api/studio/chat/sessions/chatSessionUpstash';
 import {
   ChatSessionData,
   sesionLocalStore,
-} from '@/app/ai/middlewares/chatSessionLocal';
+} from '@/app/api/studio/chat/sessions/chatSessionLocal';
 import { NextRequest, NextResponse } from 'next/server';
 import { StudioConfig } from '@/microfox.config';
 

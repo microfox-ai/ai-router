@@ -2,7 +2,7 @@ import { AiMiddleware } from '@microfox/ai-router';
 
 /**
  * Middleware to limit the number of messages in the context
- * @param count
+ * @param count - From the last message, number of messages to keep
  * @returns
  */
 export const contextLimiter = (count: number) => {
@@ -14,7 +14,7 @@ export const contextLimiter = (count: number) => {
     if (messages.length < count) {
       return next();
     } else {
-      props.request.messages = messages.slice(0, -count);
+      props.request.messages = [...messages.slice(-count)];
       return next();
     }
   };

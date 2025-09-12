@@ -81,7 +81,7 @@ export const useAppContext = (
                     },
                     body: {
                         ...body,
-                        messages: messages,
+                        messages: [messages[messages.length - 1]],
                         sessionId: sessionId
                     },
                 };

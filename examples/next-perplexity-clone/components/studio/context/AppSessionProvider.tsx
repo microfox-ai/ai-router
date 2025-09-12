@@ -11,7 +11,7 @@ import {
     useEffect,
     useState
 } from "react";
-import { ChatSession } from "@/app/ai/middlewares/chatSessionUpstash";
+import { ChatSession } from "@/app/api/studio/chat/sessions/chatSessionUpstash";
 import { toast } from "sonner";
 import useSWR from "swr";
 import useLocalState from "./hooks/useLocalState";

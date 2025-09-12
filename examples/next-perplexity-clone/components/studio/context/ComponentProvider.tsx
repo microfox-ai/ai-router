@@ -20,9 +20,9 @@ type ToolComponentMap<T extends UITools = UITools> = {
     output?: ComponentType<{ tool: ToolUIPart<T> }>;
     full?: ComponentType<{ tool: ToolUIPart<T> }>;
     header?: ComponentType<{ tool: ToolUIPart<T> }>;
-    header_sticky?: ComponentType<{ tool: ToolUIPart<T> }>;
+    header_sticky?: ComponentType<{ tool: ToolUIPart<T>, isStickyRender?: boolean }>;
     footer?: ComponentType<{ tool: ToolUIPart<T> }>;
-    footer_sticky?: ComponentType<{ tool: ToolUIPart<T> }>;
+    footer_sticky?: ComponentType<{ tool: ToolUIPart<T>, isStickyRender?: boolean }>;
     side?: ComponentType<{ tool: ToolUIPart<T> }>;
 } & {
     [key: string]: ComponentType<{ tool: ToolUIPart<T> }>;
@@ -61,14 +61,14 @@ export const useComponentProviderValue = ({
      * @param {string} name The name of the component to retrieve.
      * @returns {ComponentType<any> | undefined} The component if found, otherwise undefined.
      */
-    const getToolComponent = (id: string, type: keyof ToolComponentMap) => {
+    const getToolComponent = <P extends keyof ToolComponentMap = keyof ToolComponentMap>(id: string, type: P extends keyof ToolComponentMap ? P : keyof ToolComponentMap) => {
         let _id = (id as string)?.replace("tool-", "");
         if (components?.tools && _id in components.tools) {
-            return components.tools?.[_id as keyof AiComponentMap["tools"]]?.[type];
+            return components.tools
+                ?.[_id as keyof AiComponentMap["tools"]]?.[type] as ToolComponentMap[P];
         }
         return undefined;
     };
-
 
     const getDataComponent = (id: any, type: keyof DataComponentMap) => {
         let _id = (id as string)?.replace("data-", "") as string;

@@ -16,7 +16,12 @@ export const deepResearchAgent = aiRouter
       query: z.string(),
     }),
     outputSchema: z.object({
-      searchType: z.enum(['web', 'image', 'video', 'news']),
+      searchInput: z.object({
+        type: z.enum(['web', 'image', 'video', 'news']),
+        country: z.string().optional(),
+        count: z.number().optional(),
+        freshness: z.string().optional(),
+      }),
       response: z.any(),
     }),
     metadata: {

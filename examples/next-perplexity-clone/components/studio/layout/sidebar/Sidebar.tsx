@@ -23,6 +23,8 @@ import {
     BookIcon,
     SplitIcon,
     HomeIcon,
+    GitPullRequest,
+    CircleDot,
 } from "lucide-react";
 import { useParams, usePathname } from "next/navigation";
 
@@ -39,7 +41,7 @@ import { useAppSession } from "@/components/studio/context/AppSessionProvider";
 import dayjs from "dayjs";
 import React from "react";
 import { Input } from "@/components/ui/input";
-import { ChatSession } from "@/app/ai/middlewares/chatSessionUpstash";
+import { ChatSession } from "@/app/api/studio/chat/sessions/chatSessionUpstash";
 
 
 interface SidebarProps {
@@ -104,6 +106,14 @@ const navigationConfig: NavigationConfig[] = [
         ),
         label: "Read Docs",
         href: "https://docs.microfox.app/ai-router/overview/why",
+    },
+    {
+        icon: <CircleDot strokeWidth={2.5} className={cn("h-4 w-4")} />,
+        collapsedIcon: (
+            <CircleDot strokeWidth={2.5} className={cn("h-[18px] w-[18px]")} />
+        ),
+        label: "Report Issue",
+        href: "https://github.com/microfox-ai/ai-router/issues",
     },
     // {
     //     icon: <LayoutDashboard strokeWidth={2.5} className={cn("h-4 w-4")} />,

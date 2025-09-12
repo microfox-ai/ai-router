@@ -4,17 +4,36 @@ import { z } from 'zod';
 import { streamText, convertToModelMessages, generateId } from 'ai';
 import dedent from 'dedent';
 import { mapBraveWebSearch } from '@/components/ai/braveResearch/mapper';
+import { WebSearchOutput } from '@/components/ai/braveResearch/types';
+import { downsizeResearchData } from './helpers';
 
 const aiRouter = new AiRouter();
 
 export const summarizeAgent = aiRouter
   .agent('/', async (ctx) => {
-    console.log('ctx.state.braveResearch started');
-    //return deepResearch(ctx);
+    ctx.response.writeMessageMetadata({
+      loader: 'Summarizing...',
+    });
     const { type, summaryRequirements } = ctx.request.params;
 
-    const researchData = ctx.state.braveResearch?.data;
-    if (!researchData) {
+    const researchData = ctx.state.researchData
+      ? ctx.state.researchData?.reduce(
+          (
+            acc: Record<string, WebSearchOutput>,
+            data: { response: any; searchInput: any },
+            index: number,
+          ) => {
+            acc[`Search ${index + 1}`] = mapBraveWebSearch({
+              response: data.response,
+              searchInput: data.searchInput,
+            });
+            return acc;
+          },
+          {},
+        )
+      : {};
+
+    if (!researchData || Object.keys(researchData).length === 0) {
       ctx.response.writeMessageMetadata({
         error: 'No research data available',
       });
@@ -47,12 +66,9 @@ export const summarizeAgent = aiRouter
       `,
       prompt: `
       The User's Request is this: ${summaryRequirements}
-      Summarise the following information: ${JSON.stringify(
-        mapBraveWebSearch({
-          response: researchData.response,
-          searchType: researchData.searchType,
-        }),
-      )}`,
+      Summarise the following information: ${downsizeResearchData(researchData, 10000)}`,
+      // Cheap Mode => Increase this to adjust longer Sumamries
+      maxOutputTokens: 3000,
       onFinish: (output) => {
         console.log('SUMMARY USAGE', output.totalUsage);
       },

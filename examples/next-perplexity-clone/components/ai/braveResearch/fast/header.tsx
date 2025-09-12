@@ -1,7 +1,7 @@
 'use client';
 
 import { MediaDialog, MediaDialogItem } from "@/components/studio/ui/media";
-import { BraveWebSearchOutput, WebSearchSource } from "../types";
+import { WebSearchOutput, WebSearchSource } from "../types";
 import { InternalMarkdown } from "@/components/studio/global/markdown";
 import Link from "next/link";
 import { Expand, ExternalLink, ExternalLinkIcon } from "lucide-react";
@@ -10,6 +10,7 @@ import { mapBraveWebSearch } from "../mapper";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { AiRouterTools } from "@/app/ai";
 import { ToolUIPart } from "ai";
+import { useMessageParts } from "@/components/studio/context/MessageProvider";
 
 
 export const HoverSourcePopup = ({ source }: { source: WebSearchSource }) => {
@@ -59,12 +60,21 @@ export const HoverSourcePopup = ({ source }: { source: WebSearchSource }) => {
 
 export const BraveSourceHeader = ({
     tool,
+    isStickyRender
 }: {
     tool: ToolUIPart<Pick<AiRouterTools, "braveResearchFast" | "braveResearchDeep">>
-
+    isStickyRender?: boolean
 }) => {
     const [selectedMedia, setSelectedMedia] = useState<MediaDialogItem | null>(null);
     if (!tool.output) {
+        return null;
+    }
+    const { stickyUiParts, activePart, displayParts } = useMessageParts();
+
+    // only stick this if the active part is text part
+    const activePartIsText = activePart > 0 && displayParts[activePart - 1].type === "text";
+    // if this is sticky render, only render if the active part is not text
+    if (!activePartIsText && isStickyRender) {
         return null;
     }
 

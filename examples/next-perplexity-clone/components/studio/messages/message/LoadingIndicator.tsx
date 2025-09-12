@@ -29,7 +29,7 @@ export const LoadingIndicator = ({ message }: LoadingIndicatorProps) => {
     const loader = message.metadata?.loader;
 
     return (
-        <div className="flex gap-2 items-center">
+        <div className="flex gap-2 items-center sticky top-0 z-10 bg-white py-4">
             <div className="bg-black/80 animate-bounce h-4 w-4 rounded-full p-0 text-xs text-white"></div>
             {(() => {
 
@@ -43,7 +43,7 @@ export const LoadingIndicator = ({ message }: LoadingIndicatorProps) => {
                             exit={{ opacity: 0, y: -10 }}
                             transition={{ duration: 0.3 }}
                         >
-                            {loader}
+                            {loader || "Loading..."}
                         </motion.div>
                     </AnimatePresence>
                 );

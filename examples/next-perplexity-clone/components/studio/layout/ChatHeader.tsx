@@ -1,4 +1,4 @@
-import { ChatSession } from "@/app/ai/middlewares/chatSessionUpstash";
+import { ChatSession } from "@/app/api/studio/chat/sessions/chatSessionUpstash";
 import {
     Breadcrumb,
     BreadcrumbItem,

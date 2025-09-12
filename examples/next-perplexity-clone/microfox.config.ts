@@ -1,5 +1,7 @@
 export const StudioConfig = {
   appName: 'Perplexity Clone',
+  appDescription:
+    'A clone of Perplexity built with AI Router & Ai SDk - Uses Brave, Google Search & Gemini a the LLM Model, All of which can be further configured.',
   projectInfo: {
     framework: 'next-js',
   },

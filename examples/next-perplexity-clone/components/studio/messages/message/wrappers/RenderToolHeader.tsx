@@ -16,8 +16,9 @@ export const RenderToolHeader = () => {
         lastActiveToolPart ?
             getToolComponent(lastActiveToolPart.type, "header_sticky")
             : null;
+
     if (HeaderComponent) {
-        return <HeaderComponent tool={lastActiveToolPart as any} />
+        return <HeaderComponent tool={lastActiveToolPart as any} isStickyRender={true} />
     }
 
     //console.log("lastActiveToolPart", mcpName, toolName, lastActiveToolPart);

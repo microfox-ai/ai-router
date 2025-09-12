@@ -36,7 +36,10 @@ export const fastResearchAgent = aiRouter
           results = await braveSDK.batchNewsSearch(params);
           break;
       }
-      return { response: results, searchType: type };
+      return {
+        response: results,
+        searchInput: { type, ...params },
+      };
     } else if (query) {
       let params: any = {
         q: query,
@@ -58,7 +61,7 @@ export const fastResearchAgent = aiRouter
           results = await braveSDK.videoSearch(params);
           break;
       }
-      return { response: results, searchType: type };
+      return { response: results, searchInput: { type, ...params } };
     } else {
       throw new Error('No query or queries provided');
     }
@@ -85,8 +88,13 @@ export const fastResearchAgent = aiRouter
         path: ['query'],
       }),
     outputSchema: z.object({
-      searchType: z.enum(['web', 'image', 'video', 'news']),
-      response: z.any(),
+      searchInput: z.object({
+        type: z.enum(['web', 'image', 'video', 'news']),
+        country: z.string().optional(),
+        count: z.number().optional(),
+        freshness: z.string().optional(),
+      }),
+      response: z.any().or(z.array(z.any())),
     }),
     metadata: {
       icon: 'https://raw.githubusercontent.com/microfox-ai/microfox/refs/heads/main/logos/brave.svg',

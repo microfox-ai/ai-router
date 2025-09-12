@@ -1,17 +1,32 @@
 import { ToolUIPart } from 'ai';
-import { BraveWebSearchOutput } from './types';
+import { WebSearchOutput } from './types';
+import { Query } from '@microfox/brave';
 
 export const mapBraveWebSearch = (data: {
-  searchType: 'web' | 'image' | 'video' | 'news';
+  searchInput: {
+    type: 'web' | 'image' | 'video' | 'news';
+    country?: string;
+    count?: number;
+    freshness?: string;
+  };
   response: any;
 }) => {
-  let output: BraveWebSearchOutput = {
+  const query = data.response.query as Query;
+  let output: WebSearchOutput = {
+    query: {
+      q: query.original,
+      country: query.country,
+      // freshness: query.freshness,
+      // count: query.count,
+    },
     video_sources: [],
     web_sources: [],
     image_sources: [],
   };
 
-  if (data.searchType === 'web') {
+  let searchType = data.searchInput.type;
+
+  if (searchType === 'web') {
     if (data.response.videos) {
       output.video_sources = data.response.videos.results
         ?.filter((video: any) => video)
@@ -78,7 +93,7 @@ export const mapBraveWebSearch = (data: {
         }));
     }
     return output;
-  } else if (data.searchType === 'image') {
+  } else if (searchType === 'image') {
     output.image_sources = mapBraveImageSearch(data.response);
     return output;
   }

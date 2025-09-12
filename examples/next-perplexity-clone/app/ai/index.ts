@@ -1,24 +1,72 @@
+import { google } from '@ai-sdk/google';
 import { AiRouter } from '@microfox/ai-router';
-import { InferUITools } from 'ai';
+import {
+  convertToModelMessages,
+  InferUITools,
+  stepCountIs,
+  streamText,
+} from 'ai';
+import dedent from 'dedent';
 import { braveResearchAgent } from './agents/braveResearch';
 import { summarizeAgent } from './agents/summarize';
 import { systemAgent } from './agents/system';
-import { chatRestoreLocal } from './middlewares/chatSessionLocal';
 import { contextLimiter } from './middlewares/contextLimiter';
-import { mainOrchestrator } from './orchestrator';
+import { onlyTextParts } from './middlewares/onlyTextParts';
+import { chatRestoreLocal } from '../api/studio/chat/sessions/chatSessionLocal';
 
 const aiRouter = new AiRouter<any, any, any, any>();
-aiRouter.setLogger(console);
-// aiRouter.setStore(new MemoryStore());
+// aiRouter.setLogger(console);
 
 const aiMainRouter = aiRouter
-  // .use('/', chatRestoreUpstash)
-  .use('/', chatRestoreLocal)
-  .use('/', contextLimiter(5))
-  .agent('/', mainOrchestrator)
   .agent('/system', systemAgent)
   .agent('/summarize', summarizeAgent)
-  .agent('/research/brave', braveResearchAgent);
+  .agent('/research', braveResearchAgent)
+  .use('/', contextLimiter(5))
+  .use('/', onlyTextParts(100))
+  .agent('/', async (props) => {
+    // Ai decides what to do based on the last message & user intent.
+    props.response.writeMessageMetadata({
+      loader: 'Deciding...',
+    });
+    console.log('REQUEST MESSAGES', props.request.messages.length);
+    const stream = streamText({
+      model: google('gemini-2.5-pro'),
+      system: dedent`
+          You are a helpful assistant that can use the following tools to help the user
+          Use the summary tool to summarise the research.
+          If you do research or websearch, always follow it up with calling the summary tool.
+        `,
+      messages: convertToModelMessages(
+        props.state.onlyTextMessages || props.request.messages,
+      ),
+      tools: {
+        ...props.next.agentAsTool('/research'),
+        ...props.next.agentAsTool('/summarize'),
+      },
+      toolChoice: 'auto',
+      stopWhen: [
+        stepCountIs(10),
+        ({ steps }) =>
+          steps.some((step) =>
+            step.toolResults.some(
+              (tool) => tool.toolName === 'summarizeResearch',
+            ),
+          ),
+      ],
+      onError: (error) => {
+        console.error('ORCHESTRATION ERROR', error);
+      },
+      onFinish: (result) => {
+        console.log('ORCHESTRATION USAGE', result.totalUsage);
+      },
+    });
+    props.response.merge(
+      stream.toUIMessageStream({
+        sendFinish: false,
+        sendStart: false,
+      }),
+    );
+  });
 
 // console.log('--------REGISTRY--------');
 // console.log(aiMainRouter.registry());

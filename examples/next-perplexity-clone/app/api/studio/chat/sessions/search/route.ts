@@ -2,8 +2,8 @@ import {
   ChatSessionData,
   sesionLocalStore,
   sessionLocalListOut,
-} from '@/app/ai/middlewares/chatSessionLocal';
-import { sessionStore } from '@/app/ai/middlewares/chatSessionUpstash';
+} from '@/app/api/studio/chat/sessions/chatSessionLocal';
+import { sessionStore } from '@/app/api/studio/chat/sessions/chatSessionUpstash';
 import { StudioConfig } from '@/microfox.config';
 import { NextRequest, NextResponse } from 'next/server';
 

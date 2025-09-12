@@ -2,6 +2,8 @@ import { AiRouter } from '@microfox/ai-router';
 import { z } from 'zod';
 import { deepResearchAgent } from './deep';
 import { fastResearchAgent } from './fast';
+import { generateObject } from 'ai';
+import { google } from '@ai-sdk/google';
 
 const aiRouter = new AiRouter();
 
@@ -10,22 +12,41 @@ export const braveResearchAgent = aiRouter
   .agent('/fast', fastResearchAgent)
   .agent('/', async (ctx) => {
     //return deepResearch(ctx);
-    const { query, deep, count } = ctx.request.params;
+    ctx.response.writeMessageMetadata({
+      loader: 'Researching...',
+    });
+    const { query, count } = ctx.request.params;
+    const queryObject = await generateObject({
+      model: google('gemini-2.5-flash'),
+      schema: z.object({
+        deep: z
+          .boolean()
+          .describe('Whether to use deep search which will take more time'),
+        count: z.number().describe('The number of results to return'),
+        freshness: z.enum(['pd', 'pw', 'pm', 'py']),
+      }),
+      prompt: 'Generate a query for the brave research',
+    });
+    console.log('RESEARCH PARAM USAGE', queryObject.usage);
     const result = await ctx.next.callAgent(
-      deep ? '/deep' : '/fast',
+      queryObject.object.deep ? '/fast' : '/fast',
       {
         query,
         type: 'web',
-        count,
+        count: queryObject.object.count,
+        freshness: queryObject.object.freshness,
       },
       {
         streamToUI: true,
       },
     );
     if (result.ok) {
-      ctx.state.braveResearch = {
-        data: result.data,
-      };
+      // append the result to the research data
+      ctx.state.researchData = ctx.state.researchData
+        ? [...ctx.state.researchData, result.data]
+        : [result.data];
+
+      // ONLY Output the status to save token usage on the orchestration.
       return {
         status: 'Research Completed!',
       };
@@ -39,11 +60,6 @@ export const braveResearchAgent = aiRouter
     description: 'Research the web for information with brave search',
     inputSchema: z.object({
       query: z.string().describe('The query to search for'),
-      deep: z
-        .boolean()
-        .optional()
-        .describe('Whether to use deep search which will take more time'),
-      count: z.number().optional().describe('The number of results to return'),
     }),
     outputSchema: z.object({
       status: z.string().describe('The status of the research'),

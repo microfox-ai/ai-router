@@ -121,18 +121,8 @@ export const MessageWrapper = ({
             {message.role === "assistant" &&
               status === "streaming" &&
               index === length - 1 && (
-                //(!message.content || message.content?.trim()?.length === 0) &&
                 <LoadingIndicator message={message} />
               )}
-            {/* {IN_DEV && (
-              <div className="text-xs bg-red-800">
-                {message.annotations?.map((a: any, idx: number) => (
-                  <div key={idx + a.type} className="text-xs text-white bg-red-500 my-2">
-                    {a.type} - {typeof a.value === "string" ? a.value : a.key ?? "no key"} - {a.content} - {a.text} - {a.contents}
-                  </div>
-                ))}
-              </div>
-            )} */}
             {message?.parts &&
               message?.parts?.length > 0 &&
               displayParts.length === 1 && (
@@ -160,24 +150,8 @@ export const MessageWrapper = ({
                   />
                 )}
                 {toolParts && toolParts?.length > 0 && <RenderToolFooter />}
-                {/* {message.customTools?.map((toolInvocation, idx) => (
-                  <ToolInvocationPart
-                    key={idx + toolInvocation.type}
-                    part={toolInvocation}
-                    messageId={message.id}
-                    message={message}
-                  />
-                ))} */}
               </div>
             )}
-            {/* {uiAnnotations && uiAnnotations.length > 0 && (
-              <AnnotationUIList
-                uiAnnotations={uiAnnotations as any[]}
-                lastMessage={index === length - 1}
-                lastAnnotationIndices={lastAnnotationIndices}
-                messageIndex={index}
-              />
-            )} */}
             {stickyUiParts.length > 0 && (
               <StickyUiPartsWrapper>
                 {stickyUiParts.map((part) => (
@@ -190,15 +164,6 @@ export const MessageWrapper = ({
                 ))}
               </StickyUiPartsWrapper>
             )}
-            {/* {lastToolInvocation && (
-              <div className="mt-2 flex flex-col gap-2">
-                <ToolInvocationPart
-                  part={lastToolInvocation}
-                  messageId={message.id}
-                  message={message}
-                />
-              </div>
-            )} */}
             {message.metadata?.attachments && (
               <div className="mt-2 flex flex-wrap justify-evenly gap-2">
                 {message.metadata?.attachments.map((m: any, idx: number) =>

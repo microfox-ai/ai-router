@@ -270,7 +270,7 @@ export type AiContext<
   TOOLS extends UITools = UITools,
 > = {
   request: {
-    /** The message history for the current request. */
+    /** The message history for the current request. The user can modify this array to change the message history or manipulate the message history, but beware that in the routing, the messages are passed as a reference and not a copy, making the mutatated value available to all the handlers in the request chain. */
     messages: UIMessage<METADATA, PARTS, TOOLS>[];
     /** Parameters passed from an internal tool or agent call. */
     params: PARAMS;

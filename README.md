@@ -116,7 +116,6 @@ import { AiRouter, MemoryStore } from '@microfox/ai-router';
 
 // Create a new router instance
 const router = new AiRouter();
-router.setStore(new MemoryStore());
 
 // Define your agents
 router.agent('/', async (ctx) => {

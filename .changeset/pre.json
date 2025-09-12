@@ -1,11 +1,14 @@
 {
-  "mode": "exit",
+  "mode": "pre",
   "tag": "beta",
   "initialVersions": {
+    "next-perplexity-clone": "0.1.1",
     "@microfox/ai-router": "2.0.0",
     "@microfox/ai-studio": "1.0.0",
     "@microfox/ai-studio-cli": "1.0.3",
     "@microfox/ai-studio-react": "1.0.1"
   },
-  "changesets": []
+  "changesets": [
+    "honest-emus-trade"
+  ]
 }

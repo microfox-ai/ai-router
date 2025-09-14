@@ -104,13 +104,21 @@ export async function scaffoldProject(templateName: string, config: Config) {
       ['app', 'api', 'studio'],
       ['app', 'studio'],
       ['lib', 'studio'],
+      ['app', 'page.tsx'],
     ];
 
     for (const dirParts of directoriesToCopy) {
-      const sourceDir = path.join(templateDir, ...dirParts);
-      const targetDir = path.join(process.cwd(), ...dirParts);
-      if (await fs.pathExists(sourceDir)) {
-        await fs.copy(sourceDir, targetDir);
+      const sourcePath = path.join(templateDir, ...dirParts);
+      const targetPath = path.join(process.cwd(), ...dirParts);
+      if (await fs.pathExists(sourcePath)) {
+        const stat = await fs.stat(sourcePath);
+        if (stat.isDirectory()) {
+          await fs.copy(sourcePath, targetPath);
+        } else {
+          // For files, ensure the target directory exists and copy the file
+          await fs.ensureDir(path.dirname(targetPath));
+          await fs.copyFile(sourcePath, targetPath);
+        }
       }
     }
 

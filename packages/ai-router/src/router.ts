@@ -338,12 +338,12 @@ export type AiToolHandler<
   TOOLS extends UITools = UITools,
 > =
   | ((
-      ctx: AiContext<METADATA, ContextState, PARAMS, PARTS, TOOLS>,
-      params: PARAMS
-    ) => Promise<any>)
+    ctx: AiContext<METADATA, ContextState, PARAMS, PARTS, TOOLS>,
+    params: PARAMS
+  ) => Promise<any>)
   | ((
-      ctx: AiContext<METADATA, ContextState, PARAMS, PARTS, TOOLS>
-    ) => Tool<any, any>);
+    ctx: AiContext<METADATA, ContextState, PARAMS, PARTS, TOOLS>
+  ) => Tool<any, any>);
 
 /**
  * @deprecated Use agent-as-tools pattern instead. This type will be removed in a future version.
@@ -392,16 +392,16 @@ type Layer<
   handler: AiMiddleware<METADATA, ContextState, PARAMS, PARTS, TOOLS>;
   isTool: boolean;
   toolOptions?:
-    | {
-        type: 'static';
-        schema: ZodObject<any>;
-        description?: string;
-        handler: AiToolHandler<METADATA, ContextState, PARAMS, PARTS, TOOLS>;
-      }
-    | {
-        type: 'factory';
-        factory: AiToolFactory<METADATA, ContextState, PARAMS, PARTS, TOOLS>;
-      };
+  | {
+    type: 'static';
+    schema: ZodObject<any>;
+    description?: string;
+    handler: AiToolHandler<METADATA, ContextState, PARAMS, PARTS, TOOLS>;
+  }
+  | {
+    type: 'factory';
+    factory: AiToolFactory<METADATA, ContextState, PARAMS, PARTS, TOOLS>;
+  };
   isAgent: boolean;
   // Dynamic parameter support
   hasDynamicParams?: boolean;
@@ -470,8 +470,8 @@ export class AiRouter<
     /** The maximum number of agent-to-agent calls allowed in a single request to prevent infinite loops. */
     maxCallDepth: number;
   } = {
-    maxCallDepth: 10,
-  };
+      maxCallDepth: 10,
+    };
 
   /**
    * Constructs a new AiAgentKit router.
@@ -539,9 +539,9 @@ export class AiRouter<
     PARTS,
     TOOLS,
     REGISTERED_TOOLS &
-      (TAgents[number] extends AiRouter<any, any, any, any, any, infer R>
-        ? R
-        : {})
+    (TAgents[number] extends AiRouter<any, any, any, any, any, infer R>
+      ? R
+      : {})
   > {
     let prefix: string | RegExp = '/';
     if (typeof agentPath === 'string' || agentPath instanceof RegExp) {
@@ -593,8 +593,8 @@ export class AiRouter<
    */
   use<
     THandler extends
-      | AiMiddleware<KIT_METADATA, ContextState, PARAMS, PARTS, TOOLS>
-      | AiRouter<any, any, any, any, any, any>,
+    | AiMiddleware<KIT_METADATA, ContextState, PARAMS, PARTS, TOOLS>
+    | AiRouter<any, any, any, any, any, any>,
   >(
     mountPathArg: string | RegExp,
     handler: THandler
@@ -605,7 +605,7 @@ export class AiRouter<
     PARTS,
     TOOLS,
     REGISTERED_TOOLS &
-      (THandler extends AiRouter<any, any, any, any, any, infer R> ? R : {})
+    (THandler extends AiRouter<any, any, any, any, any, infer R> ? R : {})
   > {
     if (mountPathArg instanceof RegExp && handler instanceof AiRouter) {
       throw new AiKitError(
@@ -805,15 +805,15 @@ export class AiRouter<
     path: string | RegExp,
     optionsOrFactory:
       | {
-          schema: TOOL_PARAMS;
-          description?: string;
-        }
+        schema: TOOL_PARAMS;
+        description?: string;
+      }
       | AiToolFactory<
-          TOOL_METADATA,
-          PARTS,
-          TOOL_TOOLS,
-          ContextState & TOOL_STATE
-        >,
+        TOOL_METADATA,
+        PARTS,
+        TOOL_TOOLS,
+        ContextState & TOOL_STATE
+      >,
     handler?: AiToolHandler<
       TOOL_METADATA,
       PARTS,
@@ -828,8 +828,8 @@ export class AiRouter<
   > {
     this.logger?.warn(
       `[DEPRECATION WARNING] router.tool() is deprecated and will be removed in a future version. ` +
-        `Please migrate to the agent-as-tools pattern: ` +
-        `router.agent('${path}', async (ctx) => {...}).actAsTool('${path}', {...})`
+      `Please migrate to the agent-as-tools pattern: ` +
+      `router.agent('${path}', async (ctx) => {...}).actAsTool('${path}', {...})`
     );
     this.logger?.log(`[AiAgentKit][tool] Registering tool at path:`, path);
     if (this.stack.some((l) => l.isTool && l.path === path)) {
@@ -847,8 +847,7 @@ export class AiRouter<
         _next
       ) => {
         this.logger?.log(
-          `[Tool Middleware] Executing factory for path "${path}". Messages in context: ${
-            ctx.request.messages?.length ?? 'undefined'
+          `[Tool Middleware] Executing factory for path "${path}". Messages in context: ${ctx.request.messages?.length ?? 'undefined'
           }`
         );
         // Factory-based tool called directly.
@@ -902,8 +901,7 @@ export class AiRouter<
         hasDynamicParams: isDynamicPath,
       });
       this.logger?.log(
-        `Tool registered: path=${path}, type=factory${
-          isDynamicPath ? ' (dynamic)' : ''
+        `Tool registered: path=${path}, type=factory${isDynamicPath ? ' (dynamic)' : ''
         }`
       );
       return this as any;
@@ -966,8 +964,7 @@ export class AiRouter<
         paramNames: dynamicParamInfo?.paramNames,
       });
       this.logger?.log(
-        `Tool registered: path=${path}, type=static${
-          isDynamicPath ? ' (dynamic)' : ''
+        `Tool registered: path=${path}, type=static${isDynamicPath ? ' (dynamic)' : ''
         }`
       );
       return this as any;
@@ -1174,9 +1171,9 @@ export class AiRouter<
     // If no logger is available, return a no-op logger
     if (!effectiveLogger) {
       return {
-        log: () => {},
-        warn: () => {},
-        error: () => {},
+        log: () => { },
+        warn: () => { },
+        error: () => { },
       };
     }
 
@@ -1310,8 +1307,7 @@ export class AiRouter<
 
       const layerDescriptions = layersToRun.map(
         (l) =>
-          `${l.path.toString()} (${
-            l.isTool ? 'tool' : l.isAgent ? 'agent' : 'middleware'
+          `${l.path.toString()} (${l.isTool ? 'tool' : l.isAgent ? 'agent' : 'middleware'
           })`
       );
       ctx.logger.log(
@@ -1623,16 +1619,16 @@ export class AiRouter<
         finalMessages = finalMessages.map((m) =>
           m.id === thisMessageId
             ? {
-                ...m,
-                metadata: {
-                  ...(m.metadata ?? {}),
-                  ...(message.metadata ?? {}),
-                },
-                parts: clubParts([
-                  ...(m.parts ?? []),
-                  ...(message.parts ?? []),
-                ]),
-              }
+              ...m,
+              metadata: {
+                ...(m.metadata ?? {}),
+                ...(message.metadata ?? {}),
+              },
+              parts: clubParts([
+                ...(m.parts ?? []),
+                ...(message.parts ?? []),
+              ]),
+            }
             : m
         );
       } else {
@@ -1753,7 +1749,7 @@ class NextHandler<
   ): Promise<{ ok: true; data: any } | { ok: false; error: Error }> {
     this.ctx.logger.warn(
       `[DEPRECATION WARNING] ctx.next.callTool() is deprecated and will be removed in a future version. ` +
-        `Please use ctx.next.callAgent() instead to call agents that are exposed as tools.`
+      `Please use ctx.next.callAgent() instead to call agents that are exposed as tools.`
     );
     this.onExecutionStart();
     try {
@@ -1804,7 +1800,7 @@ class NextHandler<
   ): Tool<z.infer<SCHEMA>, any> {
     this.ctx.logger.warn(
       `[DEPRECATION WARNING] ctx.next.attachTool() is deprecated and will be removed in a future version. ` +
-        `Please use ctx.next.agentAsTool() instead to attach agents as tools.`
+      `Please use ctx.next.agentAsTool() instead to attach agents as tools.`
     );
     const parentPath = this.ctx.executionContext.currentPath || '/';
     const resolvedPath = (this.router as any)._resolvePath(
@@ -1850,50 +1846,67 @@ class NextHandler<
 
   agentAsTool<INPUT extends JSONValue | unknown | never = any, OUTPUT = any>(
     agentPath: string,
-    toolDefinition?: AgentTool<INPUT, OUTPUT>
+    schemaControl?: Record<string, any> & { disableAllInputs?: boolean }
   ) {
     const parentPath = this.ctx.executionContext.currentPath || '/';
     const resolvedPath = (this.router as any)._resolvePath(
       parentPath,
       agentPath
     );
-    let preDefined;
-    const pathsToTry = [resolvedPath];
-    // If the agentPath starts with '/', it's an absolute path from root, so also try it directly
-    if (agentPath.startsWith('/')) {
-      pathsToTry.unshift(agentPath);
-    }
-    for (const pathToTry of pathsToTry) {
-      for (const [key, value] of (this.router as any).actAsToolDefinitions) {
-        if (typeof key === 'string') {
-          // Check for exact match first
-          if (key === pathToTry) {
-            preDefined = value;
-            break;
-          }
-          // Then check for dynamic path parameters
-          if (extractPathParams(key, pathToTry) !== null) {
-            preDefined = value;
-            break;
-          }
-        }
-        // Basic RegExp match
-        if (key instanceof RegExp && key.test(pathToTry)) {
-          preDefined = value;
-          break;
-        }
-      }
-      if (preDefined) break;
-    }
 
-    const definition = toolDefinition || preDefined;
+    const definition = this.getToolDefinition(agentPath);
+
     if (!definition) {
       this.ctx.logger.error(
         `[agentAsTool] No definition found for agent at resolved path: ${resolvedPath}`
       );
       throw new AgentDefinitionMissingError(resolvedPath);
     }
+
+    const originalSchema = definition.inputSchema as ZodObject<any> | undefined;
+    let finalSchema = originalSchema;
+    const fixedParams: Record<string, any> = {};
+
+    if (schemaControl) {
+      if (schemaControl.disableAllInputs) {
+        finalSchema = z.object({});
+      } else if (originalSchema) {
+        let isPickMode = false;
+        for (const key in schemaControl) {
+          if (schemaControl[key] === true) {
+            isPickMode = true;
+            break;
+          }
+        }
+
+        if (isPickMode) {
+          const pickShape: Record<string, true> = {};
+          for (const key in schemaControl) {
+            if (schemaControl[key] === true) {
+              pickShape[key] = true;
+            } else {
+              fixedParams[key] = schemaControl[key];
+            }
+          }
+          finalSchema = originalSchema.pick(pickShape);
+        } else {
+          // Omit mode
+          const omitShape: Record<string, true> = {};
+          for (const key in schemaControl) {
+            if (key !== 'disableAllInputs') {
+              fixedParams[key] = schemaControl[key];
+              omitShape[key] = true;
+            }
+          }
+          finalSchema = originalSchema.omit(omitShape);
+        }
+      }
+    }
+
     const { id, metadata, ...restDefinition } = definition;
+
+    (restDefinition as { inputSchema?: unknown }).inputSchema = finalSchema;
+
     return {
       [id]: {
         ...restDefinition,
@@ -1902,16 +1915,23 @@ class NextHandler<
           toolKey: id,
           name: restDefinition.name,
           description: restDefinition.description,
-          absolutePath: restDefinition.path,
+          absolutePath: resolvedPath,
         },
         execute: (params: any, options: any) => {
+          const finalParams = { ...params, ...fixedParams };
+
           const executeInternal = async () => {
-            const result = await this.callAgent(agentPath, params, options);
+            const result = await this.callAgent(
+              agentPath,
+              finalParams,
+              options
+            );
             if (!result.ok) {
               throw result.error;
             }
             return result.data;
           };
+
           const newPromise = this.router.toolExecutionPromise.then(
             executeInternal,
             executeInternal
@@ -1923,11 +1943,11 @@ class NextHandler<
     };
   }
 
-  getToolDefinition(agentPath: string | RegExp) {
+  getToolDefinition(agentPath: string | RegExp): AgentTool<any, any> | undefined {
     const parentPath = this.ctx.executionContext.currentPath || '/';
     const resolvedPath = (this.router as any)._resolvePath(
       parentPath,
-      agentPath
+      agentPath.toString()
     );
     let preDefined;
     const pathsToTry = [resolvedPath];
@@ -1963,7 +1983,7 @@ class NextHandler<
       this.ctx.logger.error(
         `[agentAsTool] No definition found for agent at resolved path: ${resolvedPath}`
       );
-      throw new AgentDefinitionMissingError(resolvedPath);
+      return undefined;
     }
     const { metadata, ...restDefinition } = definition;
     return {
@@ -1973,7 +1993,7 @@ class NextHandler<
         toolKey: restDefinition.id,
         name: restDefinition.name,
         description: restDefinition.description,
-        absolutePath: restDefinition.path,
+        absolutePath: resolvedPath,
       },
     } as AgentTool<any, any>;
   }

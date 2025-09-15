@@ -688,9 +688,48 @@ interface NextHandler<Metadata, Parts, Tools, State> {
   callAgent(path: string, params?: Record<string, any>): Promise<Result>;
   callTool(path: string, params: any): Promise<Result>;
   attachTool(path: string): Tool<any, any>; // Use to expose a standard .tool() to an LLM.
-  agentAsTool(path: string, definition?: Tool<any, any>): Tool<any, any>; // Use to expose another .agent() as a tool to an LLM.
+  agentAsTool(
+    path: string,
+    options?: Record<string, any> & { disableAllInputs?: boolean }
+  ): Tool<any, any>; // Use to expose another .agent() as a tool to an LLM.
 }
 ```
+
+### Using Agents as Tools with Controlled Schema
+
+The `next.agentAsTool()` method allows you to expose an agent as a tool to an LLM with fine-grained control over the input schema that the LLM sees. This is useful for simplifying the tool for the LLM, fixing certain parameters, or disabling all inputs.
+
+#### Examples of `agentAsTool`
+
+1.  **Only expose certain inputs to the LLM:**
+
+    If an agent has an input schema with `query` and `otherParameter`, you can expose only the `query` field to the LLM.
+
+    ```typescript
+    const researchTool = ctx.next.agentAsTool('/research', {
+      query: true, // Only 'query' will be in the schema for the LLM
+    });
+    ```
+
+2.  **Fix a parameter value:**
+
+    You can hide a parameter from the LLM and provide a fixed value for it when the agent is executed.
+
+    ```typescript
+    const specializedResearchTool = ctx.next.agentAsTool('/research', {
+      query: 'web development', // 'query' is not in the LLM's schema; it's always 'web development'
+    });
+    ```
+
+3.  **Disable all inputs:**
+
+    You can expose the agent as a tool that takes no inputs from the LLM.
+
+    ```typescript
+    const parameterlessTool = ctx.next.agentAsTool('/some-agent', {
+      disableAllInputs: true,
+    });
+    ```
 
 ## Error Types
 

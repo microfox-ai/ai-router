@@ -62,21 +62,58 @@ async function addGitignoreEntries(targetDir: string) {
   }
 }
 
-export async function scaffoldProject(templateName: string, config: Config) {
+export async function scaffoldProject(
+  templateName: string,
+  config: Config,
+  local: boolean = false
+) {
   const spinner = ora('Scaffolding project files...').start();
   const tmpDir = path.join(process.cwd(), '.tmp');
+  let templateDir: string;
+  let cleanupTmpDir = false;
 
   try {
-    // 1. Download and extract template
-    spinner.text = 'Downloading template...';
-    await fs.ensureDir(tmpDir);
-    await downloadTemplate(templateName, tmpDir);
-    await tar.x({
-      file: path.join(tmpDir, 'template.tar.gz'),
-      cwd: tmpDir,
-    });
+    if (local) {
+      const templatePath = path.resolve(process.cwd(), templateName);
+      if (!(await fs.pathExists(templatePath))) {
+        throw new Error(`Local template not found at: ${templatePath}`);
+      }
 
-    const templateDir = tmpDir;
+      const stats = await fs.stat(templatePath);
+      if (stats.isDirectory()) {
+        spinner.text = 'Using local template directory...';
+        templateDir = templatePath;
+      } else if (
+        stats.isFile() &&
+        (templateName.endsWith('.tar.gz') || templateName.endsWith('.tar'))
+      ) {
+        spinner.text = 'Extracting local template...';
+        await fs.ensureDir(tmpDir);
+        cleanupTmpDir = true;
+        templateDir = tmpDir;
+
+        await fs.copy(templatePath, path.join(tmpDir, 'template.tar.gz'));
+        await tar.x({
+          file: path.join(tmpDir, 'template.tar.gz'),
+          cwd: tmpDir,
+        });
+      } else {
+        throw new Error(
+          'Local template must be a directory or a .tar.gz/.tar archive.'
+        );
+      }
+    } else {
+      // 1. Download and extract template
+      spinner.text = 'Downloading template...';
+      await fs.ensureDir(tmpDir);
+      cleanupTmpDir = true;
+      templateDir = tmpDir;
+      await downloadTemplate(templateName, tmpDir);
+      await tar.x({
+        file: path.join(tmpDir, 'template.tar.gz'),
+        cwd: tmpDir,
+      });
+    }
 
     // 2. Install dependencies
     const packageJsonPath = path.join(templateDir, 'package.json');
@@ -127,6 +164,8 @@ export async function scaffoldProject(templateName: string, config: Config) {
     spinner.fail(chalk.red('Failed to scaffold project.'));
     console.error(error);
   } finally {
-    await fs.remove(tmpDir);
+    if (cleanupTmpDir) {
+      await fs.remove(tmpDir);
+    }
   }
 }

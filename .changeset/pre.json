@@ -9,6 +9,8 @@
     "@microfox/ai-studio-react": "1.0.2-beta.0"
   },
   "changesets": [
-    "honest-emus-trade"
+    "honest-emus-trade",
+    "modern-shirts-switch",
+    "ten-pandas-judge"
   ]
 }

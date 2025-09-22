@@ -89,15 +89,21 @@ export async function saveContactsToRag(contacts: Contact[]) {
       upstashUrl: process.env.UPSTASH_VECTOR_REST_URL,
       upstashToken: process.env.UPSTASH_VECTOR_REST_TOKEN,
     });
-    
+
     const consistentContacts = contacts.map(ensureEmailConsistency);
 
     const ragData = consistentContacts.map((contact) => {
-      const doc = `Source: ${
-        contact.source
-      }\nName: ${contact.name || 'N/A'}\nEmails: ${
-        contact.emails?.join(', ') || 'N/A'
-      }\nSocials: ${JSON.stringify(contact.socials) || 'N/A'}`;
+      let doc = `--- ${contact.name || 'Unknown Person'}'s Information ---`;
+
+      if (contact.persona) {
+        const persona = contact.persona
+        doc += `--- Identity ---\nName: ${persona.name || 'N/A'}\nProfession: ${persona.profession || 'N/A'}\nAge: ${persona.age || 'N/A'}\nLocation: ${persona.location || 'N/A'}\nSummary: ${persona.summary || 'N/A'}\nInterests: ${persona.interests?.join(', ') || 'N/A'}\n\n`;
+      }
+
+      doc += `--- Contact ---\nName: ${contact.name || 'N/A'}\nEmails: ${contact.emails?.join(', ') || 'N/A'
+        }\nSocials: ${JSON.stringify(contact.socials) || 'N/A'}\nSource: ${contact.source
+        }`;
+
       return {
         id: (contact as any)._id?.toString() || new ObjectId().toString(),
         doc,
@@ -125,7 +131,7 @@ export async function getContacts() {
 
   try {
     const contacts = await collection.find({}).toArray();
-    return contacts.map(contact => ({...contact, _id: contact._id.toString()}));
+    return contacts.map(contact => ({ ...contact, _id: contact._id.toString() }));
   } catch (error) {
     console.error('Error fetching contacts from MongoDB:', error);
     return [];
@@ -146,14 +152,14 @@ export async function searchContacts(query: string, topK: number = 10) {
       upstashUrl: process.env.UPSTASH_VECTOR_REST_URL,
       upstashToken: process.env.UPSTASH_VECTOR_REST_TOKEN,
     });
-    
+
     const results = await rag.query({
-        data: query,
-        topK: topK,
-        includeMetadata: true,
+      data: query,
+      topK: topK,
+      includeMetadata: true,
     });
 
-    return results.map((result: any) => ({...result.metadata, score: result.score}));
+    return results.map((result: any) => ({ ...result.metadata, score: result.score }));
 
   } catch (error) {
     console.error('Error searching contacts from RAG:', error);
@@ -167,28 +173,28 @@ export async function getContactById(contactId: string): Promise<Contact | null>
   const COLLECTION_NAME = 'contacts';
 
   if (!process.env.MONGODB_URI) {
-      console.warn('MONGO_URI not set, skipping database fetch.');
-      return null;
+    console.warn('MONGO_URI not set, skipping database fetch.');
+    return null;
   }
-  
+
   let client: MongoClient | null = null;
   try {
-      client = new MongoClient(MONGODB_URI);
-      await client.connect();
-      const db = client.db(DB_NAME);
-      const collection = db.collection(COLLECTION_NAME);
-      const contact = await collection.findOne({ _id: new ObjectId(contactId) });
-      
-      if (contact) {
-          return { ...contact, _id: contact._id.toString() } as unknown as Contact;
-      }
-      return null;
+    client = new MongoClient(MONGODB_URI);
+    await client.connect();
+    const db = client.db(DB_NAME);
+    const collection = db.collection(COLLECTION_NAME);
+    const contact = await collection.findOne({ _id: new ObjectId(contactId) });
+
+    if (contact) {
+      return { ...contact, _id: contact._id.toString() } as unknown as Contact;
+    }
+    return null;
   } catch (error) {
-      console.error('Error fetching contact by ID:', error);
-      return null;
+    console.error('Error fetching contact by ID:', error);
+    return null;
   } finally {
-      if (client) {
-          await client.close();
-      }
+    if (client) {
+      await client.close();
+    }
   }
 }

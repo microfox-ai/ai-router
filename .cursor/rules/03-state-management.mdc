@@ -1,8 +1,9 @@
 ---
-glob: "**/app/ai/**/*.ts"
-description: "Best practices for state management in `ai-router`, covering `ctx.state`, token optimization, and safe parallelism."
+glob: '**/app/ai/**/*.ts'
+description: 'Best practices for state management in `ai-router`, covering `ctx.state`, token optimization, and safe parallelism.'
 alwaysApply: true
 ---
+
 # 03: State Management & Advanced Patterns
 
 `ctx.state` is a powerful tool for sharing data between agents, but it must be used with care to avoid bugs and maintain a clean architecture.
@@ -14,30 +15,44 @@ alwaysApply: true
 There are three distinct ways to execute an agent, and each has a different implication for how you should handle return values and state.
 
 1.  **`ctx.next.callAgent()` (Internal Call)**
-    *   **Description**: This is for server-side, inter-agent communication. One agent calls another.
-    *   **Return Value**: Can return large, complex data objects. Since the data never leaves the server, there are no token costs.
-    *   **Pathing**: Supports nested paths (`'/sub-agent'`) but **not** backtracking (`'../'`). For root-based paths from deeply nested agents, use the `'@'` alias (e.g., `'@/main-agent/worker'`).
+    - **Description**: This is for server-side, inter-agent communication. One agent calls another.
+    - **Return Value**: Can return large, complex data objects. Since the data never leaves the server, there are no token costs.
+    - **Pathing**: Supports nested paths (`'/sub-agent'`) but **not** backtracking (`'../'`). For root-based paths from deeply nested agents, use the `'@'` alias (e.g., `'@/main-agent/worker'`).
 
 2.  **`ctx.next.agentAsTool()` (Exposing to AI)**
-    *   **Description**: This exposes an agent as a "tool" that the main orchestrating AI can choose to call.
-    *   **Return Value**: **MUST** be minimal. The entire output is serialized to JSON and sent back to the AI, which consumes a large number of tokens. The best practice is to save the rich output to `ctx.state` and return only a simple status object (e.g., `{ status: 'Completed' }`).
+    - **Description**: This exposes an agent as a "tool" that the main orchestrating AI can choose to call.
+    - **Return Value**: **MUST** be minimal. The entire output is serialized to JSON and sent back to the AI, which consumes a large number of tokens. The best practice is to save the rich output to `ctx.state` and return only a simple status object (e.g., `{ status: 'Completed' }`).
 
-3.  **HTTP API Call**
-    *   **Description**: Every agent is also a standard API endpoint.
-    *   **Return Value**: Must return all the data the client needs, as the client does not have access to the server-side `ctx.state`.
+3.  **HTTP API Call (GET Request)**
+    - **Description**: Every agent is also a standard API endpoint that can be called via a GET request. The URL structure is `/api/studio/chat/agent/{your-agent-path}`. All input parameters must be passed as URL query parameters.
+    - **Return Value**: Must return all the data the client needs, as the client does not have access to the server-side `ctx.state`.
+    - **Example**:
+
+      ```typescript
+      const contactId = '123';
+      const urls = ['https://example.com', 'https://another.com'];
+      const response = await fetch(
+        `/api/studio/chat/agent/extract/deep-persona?contactId=${contactId}&urls=${urls.join(',')}`,
+      );
+
+      const result = await response.json();
+
+      const agentResponse = result[0]?.parts[0]?.output;
+      console.log(agentResponse);
+      ```
 
 ---
 
 ## The Golden Rules of State Management
 
-1.  **State is for Sharing and Cost Reduction**: The primary purpose of `ctx.state` is to allow a sequence of agents to share rich data *on the server* without passing it back to the AI. This is a critical pattern for reducing token costs.
+1.  **State is for Sharing and Cost Reduction**: The primary purpose of `ctx.state` is to allow a sequence of agents to share rich data _on the server_ without passing it back to the AI. This is a critical pattern for reducing token costs.
 
 2.  **The Orchestrator Owns the Master State**: The main orchestrator (typically in `/app/ai/index.ts`) is responsible for initializing and managing the "master" state for the entire user session.
 
-3.  **Design State for Parallelism**: This is the most critical rule. When you call multiple agents in parallel, they will all share the *same* `ctx.state` object. Your state must be designed to be "additive" to prevent race conditions.
-    *   **Use `Set` for unique lists**: If multiple parallel workers are adding to a list of visited URLs, use a `Set`. Multiple workers can safely call `ctx.state.visitedUrls.add(url)` without overwriting each other.
-    *   **Use arrays for results**: If workers are adding results to a list, they can safely `push` to the same array.
-    *   **Avoid simple properties**: Do not have parallel workers trying to update the same simple property (e.g., `ctx.state.status = 'in-progress'`). This will lead to race conditions.
+3.  **Design State for Parallelism**: This is the most critical rule. When you call multiple agents in parallel, they will all share the _same_ `ctx.state` object. Your state must be designed to be "additive" to prevent race conditions.
+    - **Use `Set` for unique lists**: If multiple parallel workers are adding to a list of visited URLs, use a `Set`. Multiple workers can safely call `ctx.state.visitedUrls.add(url)` without overwriting each other.
+    - **Use arrays for results**: If workers are adding results to a list, they can safely `push` to the same array.
+    - **Avoid simple properties**: Do not have parallel workers trying to update the same simple property (e.g., `ctx.state.status = 'in-progress'`). This will lead to race conditions.
 
 4.  **Isolate When Necessary**: If a worker agent needs to manage its own internal state during a complex, multi-step operation (like a recursive search), it should use local variables, not `ctx.state`. It should then return a self-contained result that the orchestrator can safely merge back into the master state.
 
@@ -48,13 +63,18 @@ There are three distinct ways to execute an agent, and each has a different impl
 ```typescript
 // In the Orchestrator
 ctx.state.visitedUrls = new Set<string>(); // Use a Set for safe parallel adds
-const promises = urls.map(url => ctx.next.callAgent('/worker', { url, masterVisitedUrls: Array.from(ctx.state.visitedUrls) }));
+const promises = urls.map((url) =>
+  ctx.next.callAgent('/worker', {
+    url,
+    masterVisitedUrls: Array.from(ctx.state.visitedUrls),
+  }),
+);
 const results = await Promise.all(promises);
 
 for (const result of results) {
   if (result.ok) {
     // Safely merge results
-    result.data.visitedUrls.forEach(url => ctx.state.visitedUrls.add(url));
+    result.data.visitedUrls.forEach((url) => ctx.state.visitedUrls.add(url));
   }
 }
 ```

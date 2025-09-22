@@ -1,0 +1,33 @@
+---
+glob: "**/app/ai/**/*.{ts,tsx}"
+description: "Core architectural patterns of the `ai-router` framework, including Orchestrators, Workers, and the dual nature of agents as tools and APIs."
+alwaysApply: true
+---
+# 01: Core Architecture & Philosophy
+
+This document outlines the core architectural patterns of the `ai-router` framework. Understanding these principles is essential for building robust and scalable AI agents.
+
+## Core Philosophy: A Framework for Composition
+
+`ai-router` is not just a tool; it's a framework for composing complex AI workflows from smaller, reusable components. The core architectural pattern is the separation of concerns between **Orchestrators** and **Workers**.
+
+-   **Orchestrator Agents (`/app/ai/index.ts`)**: An orchestrator is the "brain" of a complex operation. It understands the user's high-level goal and is responsible for breaking it down into a sequence of tasks. It manages the master state of the operation and delegates tasks to specialized worker agents.
+
+-   **Worker Agents (`/app/ai/agents/**/*.ts`)**: Workers are specialized tools that perform a single, well-defined task (e.g., scraping a URL, parsing HTML, calling an external API). They are the building blocks of your AI system.
+
+---
+
+## The Dual Nature of Agents: Tools and APIs
+
+A key feature of `ai-router` is that every agent can serve two purposes:
+
+1.  **As an Internal Tool**: Agents can be called by other agents using `ctx.next.callAgent()`. This is the primary way that orchestrators delegate tasks to workers. When used this way, agents can return large amounts of data without incurring significant token costs, as the data is passed directly between agents on the server.
+
+2.  **As a Standalone API/Tool**: Agents can also be exposed to the main orchestrator (or even to the outside world) as standalone tools using the `.actAsTool()` method. When an agent is used this way, its `outputSchema` should be carefully designed to be as concise as possible. Returning large amounts of data from a tool call can be very expensive, as the entire output is serialized and sent back to the orchestrating AI.
+
+**Example Scenario: A Web Search Agent**
+Imagine an orchestrator agent that performs web research.
+
+-   It might have two worker agents: `fastSearch.ts` and `deepSearch.ts`. These workers are the internal tools that call the Brave Search API and return a rich set of results.
+-   The orchestrator (`braveResearch/index.ts`) calls these workers using `ctx.next.callAgent()`. It takes their detailed output and saves it to `ctx.state.researchData`.
+-   Crucially, when it's done, it only returns a simple `{ status: 'Research Completed!' }` message to the main AI that called it. This is a critical optimization that saves a massive amount of tokens.

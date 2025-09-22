@@ -61,6 +61,14 @@ export function ContactsTable() {
         setIsPersonaModalOpen(true);
     }
     
+    const refreshData = () => {
+        if (search) {
+            handleSearch();
+        } else {
+            getContacts().then(setContacts);
+        }
+    }
+
     const handleSearch = async () => {
         if (!search) {
             getContacts().then(setContacts);
@@ -96,7 +104,7 @@ export function ContactsTable() {
                 />
                 <Button onClick={handleSearch}>Search</Button>
             </div>
-            <DataTable columns={columns(openPersonaModal)} data={tableData} />
+            <DataTable columns={columns(openPersonaModal, refreshData)} data={tableData} />
             <PersonaModal 
                 contact={selectedContact}
                 isOpen={isPersonaModalOpen}

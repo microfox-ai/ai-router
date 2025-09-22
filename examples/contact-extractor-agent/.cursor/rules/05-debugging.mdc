@@ -1,5 +1,5 @@
 ---
-glob: "**/examples/contact-extractor-agent/**/*.{ts,tsx,json}"
+glob: "**/ai/**/*.{ts,tsx,json}"
 description: "A playbook for debugging common `ai-router` issues, including AI/schema errors, state management problems, and Next.js environment issues."
 alwaysApply: true
 ---

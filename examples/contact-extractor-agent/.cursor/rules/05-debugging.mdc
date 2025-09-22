@@ -1,0 +1,71 @@
+---
+glob: "**/examples/contact-extractor-agent/**/*.{ts,tsx,json}"
+description: "A playbook for debugging common `ai-router` issues, including AI/schema errors, state management problems, and Next.js environment issues."
+alwaysApply: true
+---
+# 05: Debugging Playbook
+
+This document provides a playbook for debugging common issues encountered when developing with `ai-router`.
+
+---
+
+## AI & Schema Errors
+
+*   **Error**: `AI_NoObjectGeneratedError` or Zod validation errors (e.g., `Invalid input: expected object, received array`).
+    *   **Cause**: This is almost always a **prompt engineering problem**. The AI is returning data in a shape that doesn't match your Zod schema.
+    *   **Solution**:
+        1.  Make your prompt more explicit. If you want a `contact` object, the prompt must clearly instruct the AI to "extract the contact information."
+        2.  Add a `system` prompt that defines the AI's role and tells it to be meticulous about schemas.
+        3.  If the issue persists, simplify your schema. Sometimes, asking for a complex nested object is less reliable than asking for a flatter structure.
+
+*   **Error**: The AI is "hallucinating" or inventing data (e.g., creating fake URLs).
+    *   **Cause**: The prompt is not specific enough and lacks clear constraints.
+    *   **Solution**: Add a **"Critical Rule"** section to your prompt with explicit negative constraints.
+        ```
+        # Critical Rule
+        You MUST only select URLs from the "Links" sections provided in the content below. Do not create, modify, guess, or assume any URLs. Your job is to select from the existing list, not to invent.
+        ```
+
+---
+
+## State & Logic Errors
+
+*   **Error**: Data is getting mixed up between different parallel runs; results are inconsistent.
+    *   **Cause**: You have a **state contamination** or **race condition** problem. You are likely calling stateful worker agents in parallel with a shared `ctx`.
+    *   **Solution**: Adhere to the Orchestrator/Worker pattern for parallelism. The orchestrator manages the master state. The workers it calls in parallel **must be stateless**. They should receive all data as input parameters and return a self-contained result. The orchestrator is then responsible for safely merging the results back into its master state.
+
+*   **Error**: High token usage is causing high costs or slow performance.
+    *   **Cause**: You are likely returning too much data from a tool call that is being passed to the main orchestrating AI.
+    *   **Solution**: Remember the dual nature of agents. Use `ctx.state` to share large amounts of data between agents *on the server*. The final tool call that returns to the AI should have a minimal `outputSchema` and only return a simple status update (e.g., `{ status: 'Completed' }`).
+
+---
+
+## Environment & Server-Side Errors (Next.js)
+
+*   **Error**: Build fails with errors related to server-side packages like `puppeteer` or `jsdom`.
+    *   **Cause**: Next.js, by default, tries to bundle all packages for the client-side, which fails for packages that rely on Node.js APIs.
+    *   **Solution**: Add the problematic package to the `serverExternalPackages` array in your `next.config.ts` file. This tells Next.js to leave it out of the client bundle.
+        ```javascript
+        // next.config.ts
+        const nextConfig: NextConfig = {
+          serverExternalPackages: [
+            'puppeteer',
+            'puppeteer-extra',
+            'puppeteer-extra-plugin-stealth',
+          ],
+        };
+        ```
+
+*   **Error**: You need to use a server-side-only package or function within an agent that is called from the client.
+    *   **Cause**: The `ai-router` files are often executed on both the client and the server.
+    *   **Solution**: Create a separate "wrapper" file for your server-side logic and mark it with the `'use server'` directive. Then, import and call this server-side function from your agent. This ensures that the code will only ever execute on the server.
+        ```typescript
+        // /helpers/your-server-helper.ts
+        'use server'
+        
+        import { JSDOM } from 'jsdom';
+        
+        export async function performHeavyServerTask(html: string) {
+            return new JSDOM(html);
+        }
+        ```

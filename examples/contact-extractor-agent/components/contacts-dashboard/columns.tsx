@@ -12,25 +12,25 @@ import {
     TooltipTrigger,
 } from "@/components/ui/tooltip"
 
-async function analyzePersona(contactId: string, urls: string[]) {
+async function analyzePersona(contactId: string, urls: string[]): Promise<Contact> {
     // This will be a call to our agent.
-    // We need to create an API route for this.
-    const response = await fetch('/api/contacts/analyze-persona', {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ contactId, urls }),
-    });
+    const response = await fetch(`/api/studio/chat/agent/extract/deep-persona?contactId=${contactId}&urls=${urls.join(',')}`);
     if (!response.ok) {
         throw new Error('Failed to analyze persona');
     }
-    return response.json();
+    const result = await response.json();
+
+    if (result?.error) {
+        throw new Error(result.error);
+    }
+
+    return result[0]?.parts[0]?.output?.contact;
 }
 
 
 export const columns = (
-    openPersonaModal: (contact: Contact) => void
+    openPersonaModal: (contact: Contact) => void,
+    refreshData: () => void
 ): ColumnDef<Contact & { score?: number }>[] => [
   {
     accessorKey: "name",
@@ -106,16 +106,17 @@ export const columns = (
       const handleAnalyze = async () => {
           if (!contact._id) return;
           const urls = Object.values(contact.socials || {}).filter(Boolean) as string[];
-          if(contact.source) urls.push(contact.source);
+        //   if(contact.source) urls.push(contact.source);
           if (urls.length === 0) {
               alert("No URLs found for this contact to analyze.");
               return;
           }
           setIsLoading(true);
           try {
-              await analyzePersona(contact._id, urls);
+              const updatedContact = await analyzePersona(contact._id, urls);
               alert('Persona analysis complete!');
-              // Here you might want to refresh the data in the table
+              refreshData();
+              openPersonaModal(updatedContact);
           } catch (error) {
               console.error(error);
               alert('Failed to analyze persona.');

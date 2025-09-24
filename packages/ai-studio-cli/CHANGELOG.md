@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.0-beta.1
+
+### Minor Changes
+
+- 58300f5: Deletion of Tools & Zod Issues fixed
+
 ## 1.0.4-beta.0
 
 ### Patch Changes

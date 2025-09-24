@@ -1,5 +1,11 @@
 # @microfox/ai-router
 
+## 2.1.0-beta.3
+
+### Minor Changes
+
+- 58300f5: Deletion of Tools & Zod Issues fixed
+
 ## 2.0.1-beta.2
 
 ### Patch Changes

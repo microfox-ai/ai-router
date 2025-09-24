@@ -134,29 +134,6 @@ export class AgentNotFoundError extends AiKitError {
   }
 }
 
-/**
- * @deprecated This error class is deprecated and will be removed in a future version.
- * Use agent-as-tools pattern instead.
- */
-export class ToolNotFoundError extends AiKitError {
-  constructor(path: string) {
-    super(`[AiAgentKit] Tool not found at path: ${path}`);
-    this.name = 'ToolNotFoundError';
-  }
-}
-
-/**
- * @deprecated This error class is deprecated and will be removed in a future version.
- * Use agent-as-tools pattern instead.
- */
-export class ToolValidationError extends AiKitError {
-  constructor(path: string, validationError: z.ZodError) {
-    const message = `[AiAgentKit] Tool call validation failed for path: ${path}: ${validationError.message}`;
-    super(message);
-    this.name = 'ToolValidationError';
-  }
-}
-
 export class MaxCallDepthExceededError extends AiKitError {
   constructor(maxDepth: number) {
     super(`[AiAgentKit] Agent call depth limit (${maxDepth}) exceeded.`);
@@ -326,39 +303,6 @@ export type AiHandler<
   ctx: AiContext<METADATA, ContextState, PARAMS, PARTS, TOOLS>
 ) => Promise<any>;
 
-/**
- * @deprecated Use agent-as-tools pattern instead. This type will be removed in a future version.
- * Create agents and use `.actAsTool()` to expose them as tools.
- */
-export type AiToolHandler<
-  METADATA extends Record<string, any> = Record<string, any>,
-  ContextState extends Record<string, any> = Record<string, any>,
-  PARAMS extends Record<string, any> = Record<string, any>,
-  PARTS extends UIDataTypes = UIDataTypes,
-  TOOLS extends UITools = UITools,
-> =
-  | ((
-    ctx: AiContext<METADATA, ContextState, PARAMS, PARTS, TOOLS>,
-    params: PARAMS
-  ) => Promise<any>)
-  | ((
-    ctx: AiContext<METADATA, ContextState, PARAMS, PARTS, TOOLS>
-  ) => Tool<any, any>);
-
-/**
- * @deprecated Use agent-as-tools pattern instead. This type will be removed in a future version.
- * Create agents and use `.actAsTool()` to expose them as tools.
- */
-export type AiToolFactory<
-  METADATA extends Record<string, any> = Record<string, any>,
-  ContextState extends Record<string, any> = Record<string, any>,
-  PARAMS extends Record<string, any> = Record<string, any>,
-  PARTS extends UIDataTypes = UIDataTypes,
-  TOOLS extends UITools = UITools,
-> = (
-  ctx: AiContext<METADATA, ContextState, PARAMS, PARTS, TOOLS>
-) => Tool<any, any>;
-
 /** A function that acts as middleware, processing a request and optionally passing control to the next handler. */
 export type AiMiddleware<
   METADATA extends Record<string, any> = Record<string, any>,
@@ -390,18 +334,6 @@ type Layer<
 > = {
   path: string | RegExp;
   handler: AiMiddleware<METADATA, ContextState, PARAMS, PARTS, TOOLS>;
-  isTool: boolean;
-  toolOptions?:
-  | {
-    type: 'static';
-    schema: ZodObject<any>;
-    description?: string;
-    handler: AiToolHandler<METADATA, ContextState, PARAMS, PARTS, TOOLS>;
-  }
-  | {
-    type: 'factory';
-    factory: AiToolFactory<METADATA, ContextState, PARAMS, PARTS, TOOLS>;
-  };
   isAgent: boolean;
   // Dynamic parameter support
   hasDynamicParams?: boolean;
@@ -463,15 +395,14 @@ export class AiRouter<
     new Map();
   private logger?: AiLogger = undefined;
   private _store: Store = new MemoryStore();
-  public toolExecutionPromise: Promise<any> = Promise.resolve();
 
   /** Configuration options for the router instance. */
   public options: {
     /** The maximum number of agent-to-agent calls allowed in a single request to prevent infinite loops. */
     maxCallDepth: number;
   } = {
-      maxCallDepth: 10,
-    };
+    maxCallDepth: 10,
+  };
 
   /**
    * Constructs a new AiAgentKit router.
@@ -539,9 +470,9 @@ export class AiRouter<
     PARTS,
     TOOLS,
     REGISTERED_TOOLS &
-    (TAgents[number] extends AiRouter<any, any, any, any, any, infer R>
-      ? R
-      : {})
+      (TAgents[number] extends AiRouter<any, any, any, any, any, infer R>
+        ? R
+        : {})
   > {
     let prefix: string | RegExp = '/';
     if (typeof agentPath === 'string' || agentPath instanceof RegExp) {
@@ -552,30 +483,16 @@ export class AiRouter<
 
     for (const handler of agents) {
       if (typeof handler !== 'function') {
-        // Check if it's an AiAgentKit instance for mounting
+        // Check if it's an AiRouter instance for mounting
         if (handler instanceof AiRouter && typeof prefix === 'string') {
-          const stackToMount = handler.getStackWithPrefix(prefix);
-          this.stack.push(...(stackToMount as any));
-          this.logger?.log(
-            `Router mounted: path=${prefix}, layers=${stackToMount.length}`
-          );
-          // Also mount actAsTool definitions from the sub-router
-          const mountPath = prefix.toString();
-          handler.actAsToolDefinitions.forEach((value, key) => {
-            const keyPath = key.toString();
-            const relativeKeyPath = keyPath.startsWith('/')
-              ? keyPath.substring(1)
-              : keyPath;
-            const newKey = path.posix.join(mountPath, relativeKeyPath);
-            this.actAsToolDefinitions.set(newKey, value);
-          });
+          // Use the new use method for mounting routers
+          this.use(prefix, handler);
         }
         continue;
       }
       this.stack.push({
         path: prefix,
         handler: handler as any,
-        isTool: false,
         isAgent: true, // Mark as an agent
       });
       this.logger?.log(`Agent registered: path=${prefix}`);
@@ -593,8 +510,8 @@ export class AiRouter<
    */
   use<
     THandler extends
-    | AiMiddleware<KIT_METADATA, ContextState, PARAMS, PARTS, TOOLS>
-    | AiRouter<any, any, any, any, any, any>,
+      | AiMiddleware<KIT_METADATA, ContextState, PARAMS, PARTS, TOOLS>
+      | AiRouter<any, any, any, any, any, any>,
   >(
     mountPathArg: string | RegExp,
     handler: THandler
@@ -605,7 +522,7 @@ export class AiRouter<
     PARTS,
     TOOLS,
     REGISTERED_TOOLS &
-    (THandler extends AiRouter<any, any, any, any, any, infer R> ? R : {})
+      (THandler extends AiRouter<any, any, any, any, any, infer R> ? R : {})
   > {
     if (mountPathArg instanceof RegExp && handler instanceof AiRouter) {
       throw new AiKitError(
@@ -640,7 +557,6 @@ export class AiRouter<
       this.stack.push({
         path: mountPathArg,
         handler: handler,
-        isTool: false,
         isAgent: false, // Middleware is not a terminal agent
       });
     }
@@ -655,7 +571,10 @@ export class AiRouter<
    */
   actAsTool<
     const TPath extends string | RegExp,
-    const TTool extends AgentTool<any, any>,
+    const TTool extends AgentTool<
+      z.infer<TTool['inputSchema']>,
+      z.infer<TTool['outputSchema']>
+    >,
   >(
     path: TPath,
     options: TTool
@@ -727,326 +646,23 @@ export class AiRouter<
   }
 
   /**
-   * @deprecated Use agent-as-tools pattern instead. Create an agent and use `.actAsTool()` to expose it as a tool.
-   * This method will be removed in a future version.
-   *
-   * Example migration:
-   * ```typescript
-   * // Old way (deprecated):
-   * router.tool('/calculator', { schema: z.object({...}) }, async (ctx, params) => {...});
-   *
-   * // New way (recommended):
-   * router.agent('/calculator', async (ctx) => {...})
-   *   .actAsTool('/calculator', { id: 'calculator', name: 'Calculator', ... });
-   * ```
-   */
-  // Overload for factory-based tools
-  tool<
-    TOOL_METADATA extends Record<string, any> = Record<string, any>,
-    TOOL_TOOLS extends UITools = UITools,
-    TOOL_STATE extends Record<string, any> = Record<string, any>,
-  >(
-    path: string | RegExp,
-    factory: AiToolFactory<
-      TOOL_METADATA,
-      PARTS,
-      TOOL_TOOLS,
-      ContextState & TOOL_STATE
-    >
-  ): AiRouter<
-    KIT_METADATA | TOOL_METADATA,
-    PARTS,
-    TOOLS & TOOL_TOOLS,
-    ContextState & TOOL_STATE
-  >;
-  /**
-   * @deprecated Use agent-as-tools pattern instead. Create an agent and use `.actAsTool()` to expose it as a tool.
-   * This method will be removed in a future version.
-   */
-  // Overload for static tools
-  tool<
-    TOOL_METADATA extends Record<string, any> = Record<string, any>,
-    TOOL_TOOLS extends UITools = UITools,
-    TOOL_STATE extends Record<string, any> = Record<string, any>,
-    TOOL_PARAMS extends ZodObject<any> = ZodObject<any>,
-  >(
-    path: string | RegExp,
-    options: {
-      schema: TOOL_PARAMS;
-      description?: string;
-    },
-    handler: (
-      ctx: AiContext<
-        TOOL_METADATA,
-        ContextState & TOOL_STATE,
-        z.infer<TOOL_PARAMS>,
-        PARTS,
-        TOOL_TOOLS
-      >,
-      params: z.infer<TOOL_PARAMS>
-    ) => Promise<any>
-  ): AiRouter<
-    KIT_METADATA | TOOL_METADATA,
-    PARTS,
-    TOOLS & TOOL_TOOLS,
-    ContextState & TOOL_STATE
-  >;
-  /**
-   * @deprecated Use agent-as-tools pattern instead. Create an agent and use `.actAsTool()` to expose it as a tool.
-   * This method will be removed in a future version.
-   */
-  // Implementation
-  tool<
-    TOOL_METADATA extends Record<string, any> = Record<string, any>,
-    TOOL_TOOLS extends UITools = UITools,
-    TOOL_STATE extends Record<string, any> = Record<string, any>,
-    TOOL_PARAMS extends ZodObject<any> = ZodObject<any>,
-  >(
-    path: string | RegExp,
-    optionsOrFactory:
-      | {
-        schema: TOOL_PARAMS;
-        description?: string;
-      }
-      | AiToolFactory<
-        TOOL_METADATA,
-        PARTS,
-        TOOL_TOOLS,
-        ContextState & TOOL_STATE
-      >,
-    handler?: AiToolHandler<
-      TOOL_METADATA,
-      PARTS,
-      TOOL_TOOLS,
-      ContextState & TOOL_STATE
-    >
-  ): AiRouter<
-    KIT_METADATA | TOOL_METADATA,
-    PARTS,
-    TOOLS & TOOL_TOOLS,
-    ContextState & TOOL_STATE
-  > {
-    this.logger?.warn(
-      `[DEPRECATION WARNING] router.tool() is deprecated and will be removed in a future version. ` +
-      `Please migrate to the agent-as-tools pattern: ` +
-      `router.agent('${path}', async (ctx) => {...}).actAsTool('${path}', {...})`
-    );
-    this.logger?.log(`[AiAgentKit][tool] Registering tool at path:`, path);
-    if (this.stack.some((l) => l.isTool && l.path === path)) {
-      this.logger?.error(
-        `[AiAgentKit][tool] Tool already registered for path: ${path}`
-      );
-      throw new AiKitError(`A tool is already registered for path: ${path}`);
-    }
-    if (typeof optionsOrFactory === 'function' && !handler) {
-      const factory = optionsOrFactory as AiToolFactory<any, any, any, any>;
-      const isDynamicPath = typeof path === 'string' && hasDynamicParams(path);
-
-      const toolMiddleware: AiMiddleware<any, any, any, any, any> = async (
-        ctx,
-        _next
-      ) => {
-        this.logger?.log(
-          `[Tool Middleware] Executing factory for path "${path}". Messages in context: ${ctx.request.messages?.length ?? 'undefined'
-          }`
-        );
-        // Factory-based tool called directly.
-        const toolObject = factory(ctx);
-
-        if (!toolObject.execute) {
-          throw new AiKitError(
-            `[AiAgentKit] Tool from factory at path ${path} does not have an execute method.`
-          );
-        }
-
-        // Validate parameters using the tool's schema
-        const schema = toolObject.inputSchema as ZodObject<any> | undefined;
-        if (!schema) {
-          this.logger?.warn(
-            `[AiAgentKit][tool] Factory-based tool at path ${path} has no inputSchema. Executing without params.`
-          );
-          return toolObject.execute({} as any, {} as ToolCallOptions);
-        }
-
-        const parsedParams = schema.safeParse(ctx.request.params);
-
-        if (!parsedParams.success) {
-          this.logger?.error(
-            `[AiAgentKit][tool] Tool call validation failed for path: ${path}:`,
-            parsedParams.error.message
-          );
-          throw new ToolValidationError(path.toString(), parsedParams.error);
-        }
-
-        // Execute the tool with validated parameters.
-        // We pass empty options as this is a direct internal call.
-        return toolObject.execute(parsedParams.data, {
-          messages: convertToModelMessages(ctx.request.messages ?? []),
-          toolCallId:
-            'tool-' +
-            (path.toString()?.split('/').pop() ?? 'direct-call') +
-            '-' +
-            generateId(),
-        });
-      };
-      this.stack.push({
-        path,
-        handler: toolMiddleware,
-        isTool: true,
-        toolOptions: {
-          type: 'factory',
-          factory,
-        },
-        isAgent: false,
-        hasDynamicParams: isDynamicPath,
-      });
-      this.logger?.log(
-        `Tool registered: path=${path}, type=factory${isDynamicPath ? ' (dynamic)' : ''
-        }`
-      );
-      return this as any;
-    }
-    if (typeof optionsOrFactory === 'object' && handler) {
-      const options = optionsOrFactory as {
-        schema: ZodObject<any>;
-        description?: string;
-      };
-      const isDynamicPath = typeof path === 'string' && hasDynamicParams(path);
-      const dynamicParamInfo = isDynamicPath
-        ? parsePathPattern(path as string)
-        : null;
-      const toolMiddleware: AiMiddleware<
-        TOOL_METADATA,
-        ContextState & TOOL_STATE,
-        z.infer<TOOL_PARAMS>,
-        PARTS,
-        TOOL_TOOLS
-      > = async (ctx, _next) => {
-        if (isDynamicPath && typeof path === 'string') {
-          const pathParams = extractPathParams(path, ctx.request.path || '');
-          this.logger?.log(
-            `[AiAgentKit][tool] Extracted dynamic path params:`,
-            pathParams
-          );
-          if (pathParams) {
-            ctx.request.params = {
-              ...ctx.request.params,
-              ...pathParams,
-            } as z.infer<TOOL_PARAMS>;
-          }
-        }
-        const parsedParams = options.schema.safeParse(ctx.request.params);
-        if (!parsedParams.success) {
-          this.logger?.error(
-            `[AiAgentKit][tool] Tool call validation failed for path: ${path}:`,
-            parsedParams.error.message
-          );
-          throw new ToolValidationError(path.toString(), parsedParams.error);
-        }
-        const staticHandler = handler as (
-          ctx: AiContext<any, any, any, any, any>,
-          params: Record<string, any>
-        ) => Promise<any>;
-        return staticHandler(ctx, parsedParams.data);
-      };
-      this.stack.push({
-        path,
-        handler: toolMiddleware as any,
-        isTool: true,
-        toolOptions: {
-          type: 'static',
-          schema: options.schema,
-          description: options.description,
-          handler: handler as any,
-        },
-        isAgent: false,
-        hasDynamicParams: isDynamicPath,
-        paramNames: dynamicParamInfo?.paramNames,
-      });
-      this.logger?.log(
-        `Tool registered: path=${path}, type=static${isDynamicPath ? ' (dynamic)' : ''
-        }`
-      );
-      return this as any;
-    }
-    this.logger?.error(
-      `[AiAgentKit][tool] Invalid arguments for tool registration at path: ${path}`
-    );
-    throw new AiKitError(
-      `Invalid arguments for tool registration at path: ${path}`
-    );
-  }
-
-  /**
-   * Returns the internal stack of layers. Primarily used for manual router composition.
-   * @deprecated Prefer using `.use()` for router composition.
-   */
-  getStack() {
-    return this.stack;
-  }
-
-  /**
-   * Returns the internal stack with a path prefix applied to each layer.
-   * @param prefix The prefix to add to each path.
-   * @deprecated Prefer using `.use()` for router composition.
-   */
-  getStackWithPrefix(prefix: string) {
-    return this.stack.map((layer) => {
-      let newPath: string | RegExp;
-      if (layer.path instanceof RegExp) {
-        // This is a simplistic way to combine regex and might need refinement
-        newPath = new RegExp(prefix.replace(/\\/g, '\\\\') + layer.path.source);
-      } else {
-        const layerPathStr = layer.path.toString();
-        // Prevent layer paths starting with '/' from being treated as absolute by join
-        const relativeLayerPath = layerPathStr.startsWith('/')
-          ? layerPathStr.substring(1)
-          : layerPathStr;
-        newPath = path.posix.join(prefix, relativeLayerPath);
-      }
-
-      return {
-        ...layer,
-        path: newPath,
-      };
-    });
-  }
-
-  /**
-   * Outputs all registered paths, and the tool definitions, middlewares, and agents registered on each path.
+   * Outputs all registered paths, and the middlewares and agents registered on each path.
    * @returns A map of paths to their registered handlers.
    */
   registry(): {
-    map: Record<string, { middlewares: any[]; tools: any[]; agents: any[] }>;
+    map: Record<string, { middlewares: any[]; agents: any[] }>;
     tools: REGISTERED_TOOLS;
   } {
-    const registryMap: Record<
-      string,
-      { middlewares: any[]; tools: any[]; agents: any[] }
-    > = {};
+    const registryMap: Record<string, { middlewares: any[]; agents: any[] }> =
+      {};
 
     for (const layer of this.stack) {
       const pathKey = layer.path.toString();
       if (!registryMap[pathKey]) {
-        registryMap[pathKey] = { middlewares: [], tools: [], agents: [] };
+        registryMap[pathKey] = { middlewares: [], agents: [] };
       }
 
-      if (layer.isTool) {
-        let toolInfo: any = { type: layer.toolOptions?.type };
-        if (layer.toolOptions?.type === 'static') {
-          toolInfo = {
-            ...toolInfo,
-            schema: layer.toolOptions.schema,
-            description: layer.toolOptions.description,
-          };
-        } else if (layer.toolOptions?.type === 'factory') {
-          toolInfo = {
-            ...toolInfo,
-            factory: layer.toolOptions.factory.toString(),
-          };
-        }
-        registryMap[pathKey].tools.push(toolInfo);
-      } else if (layer.isAgent) {
+      if (layer.isAgent) {
         const agentInfo: any = {
           handler: layer.handler.name || 'anonymous',
         };
@@ -1171,9 +787,9 @@ export class AiRouter<
     // If no logger is available, return a no-op logger
     if (!effectiveLogger) {
       return {
-        log: () => { },
-        warn: () => { },
-        error: () => { },
+        log: () => {},
+        warn: () => {},
+        error: () => {},
       };
     }
 
@@ -1214,7 +830,7 @@ export class AiRouter<
     }
 
     // Agents/tools are more specific than middleware.
-    if (layer.isAgent || layer.isTool) {
+    if (layer.isAgent) {
       score += 1;
     }
 
@@ -1267,22 +883,10 @@ export class AiRouter<
           if (isInternalCall) {
             // --- Internal Call Logic ---
             // For internal calls, we only consider exact matches for all layer types.
-            if (layer.isTool && layer.hasDynamicParams) {
-              shouldRun = extractPathParams(layerPath, normalizedPath) !== null;
-            } else {
-              shouldRun = isExactMatch;
-            }
+            shouldRun = isExactMatch;
           } else {
             // --- External Call Logic ---
-            if (layer.isTool) {
-              // Tools are matched exactly or via dynamic path parameters.
-              if (layer.hasDynamicParams) {
-                shouldRun =
-                  extractPathParams(layerPath, normalizedPath) !== null;
-              } else {
-                shouldRun = isExactMatch;
-              }
-            } else if (layer.isAgent) {
+            if (layer.isAgent) {
               // Agents are only matched exactly.
               shouldRun = isExactMatch;
             } else {
@@ -1294,7 +898,7 @@ export class AiRouter<
 
         if (shouldRun) {
           ctx.logger.log(
-            `[AiAgentKit][_execute] Layer MATCH: path=${normalizedPath}, layer.path=${layer.path}, isTool=${layer.isTool}, isAgent=${layer.isAgent}, isInternal=${isInternalCall}`
+            `[AiAgentKit][_execute] Layer MATCH: path=${normalizedPath}, layer.path=${layer.path}, isAgent=${layer.isAgent}, isInternal=${isInternalCall}`
           );
         }
         return shouldRun;
@@ -1306,16 +910,13 @@ export class AiRouter<
       );
 
       const layerDescriptions = layersToRun.map(
-        (l) =>
-          `${l.path.toString()} (${l.isTool ? 'tool' : l.isAgent ? 'agent' : 'middleware'
-          })`
+        (l) => `${l.path.toString()} (${l.isAgent ? 'agent' : 'middleware'})`
       );
       ctx.logger.log(
         `Found ${layersToRun.length} layers to run: [${layerDescriptions.join(
           ', '
         )}]`
       );
-      const hasTool = layersToRun.some((l) => l.isTool);
       const hasAgent = layersToRun.some((l) => l.isAgent);
 
       if (!layersToRun.length) {
@@ -1337,11 +938,7 @@ export class AiRouter<
         const layerPath =
           typeof layer.path === 'string' ? layer.path : layer.path.toString();
 
-        const layerType = layer.isTool
-          ? 'tool'
-          : layer.isAgent
-            ? 'agent'
-            : 'middleware';
+        const layerType = layer.isAgent ? 'agent' : 'middleware';
         ctx.logger.log(`-> Running ${layerType}: ${layerPath}`);
 
         try {
@@ -1619,16 +1216,16 @@ export class AiRouter<
         finalMessages = finalMessages.map((m) =>
           m.id === thisMessageId
             ? {
-              ...m,
-              metadata: {
-                ...(m.metadata ?? {}),
-                ...(message.metadata ?? {}),
-              },
-              parts: clubParts([
-                ...(m.parts ?? []),
-                ...(message.parts ?? []),
-              ]),
-            }
+                ...m,
+                metadata: {
+                  ...(m.metadata ?? {}),
+                  ...(message.metadata ?? {}),
+                },
+                parts: clubParts([
+                  ...(m.parts ?? []),
+                  ...(message.parts ?? []),
+                ]),
+              }
             : m
         );
       } else {
@@ -1729,121 +1326,6 @@ class NextHandler<
     }
   }
 
-  /**
-   * @deprecated Use agent-as-tools pattern instead. Use `ctx.next.callAgent()` to call agents that are exposed as tools.
-   * This method will be removed in a future version.
-   *
-   * Example migration:
-   * ```typescript
-   * // Old way (deprecated):
-   * const result = await ctx.next.callTool('/calculator', { a: 5, b: 3 });
-   *
-   * // New way (recommended):
-   * const result = await ctx.next.callAgent('/calculator', { a: 5, b: 3 });
-   * ```
-   */
-  async callTool<T extends z.ZodObject<any>>(
-    toolPath: string,
-    params: z.infer<T>,
-    options?: ToolCallOptions
-  ): Promise<{ ok: true; data: any } | { ok: false; error: Error }> {
-    this.ctx.logger.warn(
-      `[DEPRECATION WARNING] ctx.next.callTool() is deprecated and will be removed in a future version. ` +
-      `Please use ctx.next.callAgent() instead to call agents that are exposed as tools.`
-    );
-    this.onExecutionStart();
-    try {
-      const parentPath = this.ctx.executionContext.currentPath || '/';
-      const resolvedPath = (this.router as any)._resolvePath(
-        parentPath,
-        toolPath
-      );
-
-      this.ctx.logger.log(`Calling tool: resolvedPath='${resolvedPath}'`);
-
-      const subContext = (this.router as any)._createSubContext(this.ctx, {
-        type: 'tool',
-        path: resolvedPath,
-        params: params ?? ({} as PARAMS),
-        messages: this.ctx.request.messages,
-      });
-      const data = await (this.router as any)._execute(
-        resolvedPath,
-        subContext,
-        true
-      );
-      return { ok: true, data };
-    } catch (error: any) {
-      this.ctx.logger.error(`[callTool] Error:`, error);
-      return { ok: false, error };
-    } finally {
-      this.onExecutionEnd();
-    }
-  }
-
-  /**
-   * @deprecated Use agent-as-tools pattern instead. Use `ctx.next.agentAsTool()` to attach agents as tools.
-   * This method will be removed in a future version.
-   *
-   * Example migration:
-   * ```typescript
-   * // Old way (deprecated):
-   * const tool = ctx.next.attachTool('/calculator');
-   *
-   * // New way (recommended):
-   * const tool = ctx.next.agentAsTool('/calculator');
-   * ```
-   */
-  attachTool<SCHEMA extends z.ZodObject<any>>(
-    toolPath: string,
-    _tool?: Omit<Tool<z.infer<SCHEMA>, any>, 'description'>
-  ): Tool<z.infer<SCHEMA>, any> {
-    this.ctx.logger.warn(
-      `[DEPRECATION WARNING] ctx.next.attachTool() is deprecated and will be removed in a future version. ` +
-      `Please use ctx.next.agentAsTool() instead to attach agents as tools.`
-    );
-    const parentPath = this.ctx.executionContext.currentPath || '/';
-    const resolvedPath = (this.router as any)._resolvePath(
-      parentPath,
-      toolPath
-    );
-    this.ctx.logger.log(`Attaching tool: resolvedPath='${resolvedPath}'`);
-
-    const layer = (this.router as any).stack.find((l: any) => {
-      if (!l.isTool) return false;
-      if (l.path === resolvedPath) return true;
-      if (l.hasDynamicParams && typeof l.path === 'string') {
-        return extractPathParams(l.path, resolvedPath) !== null;
-      }
-      return false;
-    });
-    if (!layer || !layer.toolOptions) {
-      this.ctx.logger.error(
-        `[attachTool] Tool not found at resolved path: ${resolvedPath}`
-      );
-      throw new ToolNotFoundError(resolvedPath);
-    }
-    if (layer.toolOptions.type === 'factory') {
-      return layer.toolOptions.factory(this.ctx);
-    }
-    const { description, schema } = layer.toolOptions;
-    return {
-      description,
-      inputSchema: schema,
-      ...(_tool ?? {}),
-      execute: async (params: z.infer<SCHEMA>, options: ToolCallOptions) => {
-        if (_tool?.execute) {
-          return await _tool.execute?.(params as any, options);
-        }
-        const result = await this.callTool(toolPath, params, options);
-        if (!result.ok) {
-          throw result.error;
-        }
-        return result.data;
-      },
-    } as unknown as Tool<z.infer<SCHEMA>, any>;
-  }
-
   agentAsTool<INPUT extends JSONValue | unknown | never = any, OUTPUT = any>(
     agentPath: string,
     schemaControl?: Record<string, any> & { disableAllInputs?: boolean }
@@ -1917,33 +1399,20 @@ class NextHandler<
           description: restDefinition.description,
           absolutePath: resolvedPath,
         },
-        execute: (params: any, options: any) => {
-          const finalParams = { ...params, ...fixedParams };
-
-          const executeInternal = async () => {
-            const result = await this.callAgent(
-              agentPath,
-              finalParams,
-              options
-            );
-            if (!result.ok) {
-              throw result.error;
-            }
-            return result.data;
-          };
-
-          const newPromise = this.router.toolExecutionPromise.then(
-            executeInternal,
-            executeInternal
-          );
-          this.router.toolExecutionPromise = newPromise;
-          return newPromise;
+        execute: async (params: any, options: any) => {
+          const result = await this.callAgent(agentPath, params, options);
+          if (!result.ok) {
+            throw result.error;
+          }
+          return result.data;
         },
       } as Tool<INPUT, OUTPUT>,
     };
   }
 
-  getToolDefinition(agentPath: string | RegExp): AgentTool<any, any> | undefined {
+  getToolDefinition(
+    agentPath: string | RegExp
+  ): AgentTool<any, any> | undefined {
     const parentPath = this.ctx.executionContext.currentPath || '/';
     const resolvedPath = (this.router as any)._resolvePath(
       parentPath,
@@ -1998,3 +1467,28 @@ class NextHandler<
     } as AgentTool<any, any>;
   }
 }
+
+/** Deprecated execute style for L1402
+ * execute: (params: any, options: any) => {
+          const finalParams = { ...params, ...fixedParams };
+
+          const executeInternal = async () => {
+            const result = await this.callAgent(
+              agentPath,
+              finalParams,
+              options
+            );
+            if (!result.ok) {
+              throw result.error;
+            }
+            return result.data;
+          };
+
+          const newPromise = this.router.toolExecutionPromise.then(
+            executeInternal,
+            executeInternal
+          );
+          this.router.toolExecutionPromise = newPromise;
+          return newPromise;
+ * 
+ */

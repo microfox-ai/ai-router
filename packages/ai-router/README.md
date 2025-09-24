@@ -254,24 +254,17 @@ router.agent('/path', async (ctx) => {
 });
 ```
 
-### Tools
+### Agent-as-Tools
 
-Tools are functions that can be called by agents or other tools. They support both static and factory-based definitions.
+Agents can be exposed as tools for LLM integration using the `.actAsTool()` method. This provides better type safety and seamless integration with AI SDK functions.
 
 ```typescript
-// Static tool
-router.tool(
-  '/calculator',
-  {
-    schema: z.object({
-      a: z.number(),
-      b: z.number(),
-      operation: z.enum(['add', 'subtract', 'multiply', 'divide']),
-    }),
-    description: 'Performs basic arithmetic operations',
-  },
-  async (ctx, params) => {
-    const { a, b, operation } = params;
+// Create a calculator agent
+const calculatorAgent = new AiRouter();
+
+calculatorAgent
+  .agent('/', async (ctx) => {
+    const { a, b, operation } = ctx.request.params;
     let result;
 
     switch (operation) {
@@ -289,20 +282,30 @@ router.tool(
         break;
     }
 
-    return result;
-  }
-);
-
-// Factory-based tool
-router.tool('/dynamic-tool', (ctx) => {
-  return {
-    description: 'A dynamic tool',
-    inputSchema: z.object({ message: z.string() }),
-    execute: async (params) => {
-      return `Processed: ${params.message}`;
+    return { result };
+  })
+  .actAsTool('/', {
+    id: 'calculator',
+    name: 'Calculator',
+    description: 'Performs basic arithmetic operations',
+    inputSchema: z.object({
+      a: z.number().describe('First number'),
+      b: z.number().describe('Second number'),
+      operation: z
+        .enum(['add', 'subtract', 'multiply', 'divide'])
+        .describe('Operation to perform'),
+    }),
+    outputSchema: z.object({
+      result: z.number().describe('The calculation result'),
+    }),
+    metadata: {
+      icon: '🧮',
+      category: 'math',
     },
-  };
-});
+  });
+
+// Mount the agent
+router.agent('/calculator', calculatorAgent);
 ```
 
 ### Middleware
@@ -399,21 +402,40 @@ router.agent('/users/:userId/profile', async (ctx) => {
   });
 });
 
-router.tool(
-  '/posts/:postId/comments/:commentId',
-  {
-    schema: z.object({
-      action: z.enum(['read', 'update', 'delete']),
-    }),
-    description: 'Manage post comments',
-  },
-  async (ctx, params) => {
-    const { postId, commentId } = ctx.request.params;
-    const { action } = params;
+// Create a comment management agent
+const commentAgent = new AiRouter();
 
-    return `Performing ${action} on comment ${commentId} of post ${postId}`;
-  }
-);
+commentAgent
+  .agent('/:commentId', async (ctx) => {
+    const { postId, commentId } = ctx.request.params;
+    const { action } = ctx.request.params;
+
+    return {
+      message: `Performing ${action} on comment ${commentId} of post ${postId}`,
+      postId,
+      commentId,
+      action,
+    };
+  })
+  .actAsTool('/:commentId', {
+    id: 'comment-manager',
+    name: 'Comment Manager',
+    description: 'Manage post comments',
+    inputSchema: z.object({
+      action: z
+        .enum(['read', 'update', 'delete'])
+        .describe('Action to perform'),
+    }),
+    outputSchema: z.object({
+      message: z.string().describe('Result message'),
+      postId: z.string().describe('Post ID'),
+      commentId: z.string().describe('Comment ID'),
+      action: z.string().describe('Action performed'),
+    }),
+  });
+
+// Mount the agent with dynamic path
+router.agent('/posts/:postId/comments', commentAgent);
 ```
 
 ### State Management
@@ -686,8 +708,6 @@ The `next` object provides methods for agent-to-agent communication:
 ```typescript
 interface NextHandler<Metadata, Parts, Tools, State> {
   callAgent(path: string, params?: Record<string, any>): Promise<Result>;
-  callTool(path: string, params: any): Promise<Result>;
-  attachTool(path: string): Tool<any, any>; // Use to expose a standard .tool() to an LLM.
   agentAsTool(
     path: string,
     options?: Record<string, any> & { disableAllInputs?: boolean }
@@ -736,8 +756,6 @@ The `next.agentAsTool()` method allows you to expose an agent as a tool to an LL
 The router provides several error types for different scenarios:
 
 - `AgentNotFoundError`: No agent found for the requested path
-- `ToolNotFoundError`: No tool found for the requested path
-- `ToolValidationError`: Tool parameter validation failed
 - `MaxCallDepthExceededError`: Agent call depth limit exceeded
 - `AgentDefinitionMissingError`: Agent used as tool without definition
 
@@ -802,20 +820,37 @@ api.use('*', async (ctx, next) => {
 });
 
 // A specific tool for searching users, which is better for the LLM to use
-api.tool(
-  '/search/users',
-  {
-    schema: z.object({
+// Create a user search agent
+const userSearchAgent = new AiRouter();
+
+userSearchAgent
+  .agent('/', async (ctx) => {
+    const { query } = ctx.request.params;
+    // In a real app, you would have database logic here
+    // const users = await db.searchUsers(query);
+    const users = [{ id: '123', name: 'John Doe' }];
+    return {
+      users,
+      query,
+      count: users.length,
+    };
+  })
+  .actAsTool('/', {
+    id: 'user-search',
+    name: 'User Search',
+    description: 'Searches for users based on a query',
+    inputSchema: z.object({
       query: z.string().describe('The search query for users'),
     }),
-    description: 'Searches for users based on a query.',
-  },
-  async (ctx, params) => {
-    // In a real app, you would have database logic here
-    // return await db.searchUsers(params.query);
-    return { users: [{ id: '123', name: 'John Doe' }] };
-  }
-);
+    outputSchema: z.object({
+      users: z.array(z.object({ id: z.string(), name: z.string() })),
+      query: z.string(),
+      count: z.number(),
+    }),
+  });
+
+// Mount the user search agent
+api.agent('/search/users', userSearchAgent);
 
 // AI-powered search
 api.agent('/search', async (ctx) => {
@@ -825,11 +860,11 @@ api.agent('/search', async (ctx) => {
     model: openai('gpt-4'),
     prompt: `Fulfill this search request: ${query}`,
     tools: {
-      userSearch: ctx.next.attachTool('/search/users'),
+      userSearch: ctx.next.agentAsTool('/search/users'),
     },
   });
 
-  ctx.response.write({ type: 'text', text });
+  return { response: text };
 });
 ```
 

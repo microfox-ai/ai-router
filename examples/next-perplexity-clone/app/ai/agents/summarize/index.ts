@@ -94,10 +94,10 @@ export const summarizeAgent = aiRouter
           'The intention of the summarisation - What to summarize, look for, extract, etc.',
         ),
       //summaryStyle: z.string().describe('The style of the summary - What format to use, what to include, what to exclude, etc.'),
-    }),
+    }) as any,
     outputSchema: z.object({
       status: z.string().describe('The status of the summary'),
-    }),
+    }) as any,
     metadata: {
       icon: '🔍',
       title: 'Summarizer',

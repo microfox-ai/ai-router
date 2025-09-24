@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.1
+
+### Patch Changes
+
+- a05002d: Changes from PR #31: beta
+
 ## 1.1.0
 
 ### Minor Changes

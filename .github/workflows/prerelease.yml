@@ -30,6 +30,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
+          registry-url: 'https://registry.npmjs.org'
 
       - name: Install Dependencies
         run: npm i
@@ -46,8 +47,13 @@ jobs:
           TAG=${BRANCH_NAME#pre/}
           echo "tag=$TAG" >> $GITHUB_OUTPUT
 
-      - name: Enter Pre-release Mode
-        run: npx changeset pre enter ${{ steps.get_tag.outputs.tag }}
+      - name: Enter Pre-release Mode (if not already in it)
+        run: |
+          if [ -f .changeset/pre.json ]; then
+            echo "Already in pre-release mode."
+          else
+            npx changeset pre enter ${{ steps.get_tag.outputs.tag }}
+          fi
         env:
           GITHUB_TOKEN: ${{ secrets.ORG_PAT || secrets.GITHUB_TOKEN }}
 
@@ -67,7 +73,7 @@ jobs:
           fi
 
       - name: Publish to npm
-        run: npx changeset publish --tag ${{ steps.get_tag.outputs.tag }}
+        run: npx changeset publish
         env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN_ELEVATED }}
           GITHUB_TOKEN: ${{ secrets.ORG_PAT || secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN_ELEVATED }}

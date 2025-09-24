@@ -1328,50 +1328,67 @@ class NextHandler<
 
   agentAsTool<INPUT extends JSONValue | unknown | never = any, OUTPUT = any>(
     agentPath: string,
-    toolDefinition?: AgentTool<INPUT, OUTPUT>
+    schemaControl?: Record<string, any> & { disableAllInputs?: boolean }
   ) {
     const parentPath = this.ctx.executionContext.currentPath || '/';
     const resolvedPath = (this.router as any)._resolvePath(
       parentPath,
       agentPath
     );
-    let preDefined;
-    const pathsToTry = [resolvedPath];
-    // If the agentPath starts with '/', it's an absolute path from root, so also try it directly
-    if (agentPath.startsWith('/')) {
-      pathsToTry.unshift(agentPath);
-    }
-    for (const pathToTry of pathsToTry) {
-      for (const [key, value] of (this.router as any).actAsToolDefinitions) {
-        if (typeof key === 'string') {
-          // Check for exact match first
-          if (key === pathToTry) {
-            preDefined = value;
-            break;
-          }
-          // Then check for dynamic path parameters
-          if (extractPathParams(key, pathToTry) !== null) {
-            preDefined = value;
-            break;
-          }
-        }
-        // Basic RegExp match
-        if (key instanceof RegExp && key.test(pathToTry)) {
-          preDefined = value;
-          break;
-        }
-      }
-      if (preDefined) break;
-    }
 
-    const definition = toolDefinition || preDefined;
+    const definition = this.getToolDefinition(agentPath);
+
     if (!definition) {
       this.ctx.logger.error(
         `[agentAsTool] No definition found for agent at resolved path: ${resolvedPath}`
       );
       throw new AgentDefinitionMissingError(resolvedPath);
     }
+
+    const originalSchema = definition.inputSchema as ZodObject<any> | undefined;
+    let finalSchema = originalSchema;
+    const fixedParams: Record<string, any> = {};
+
+    if (schemaControl) {
+      if (schemaControl.disableAllInputs) {
+        finalSchema = z.object({});
+      } else if (originalSchema) {
+        let isPickMode = false;
+        for (const key in schemaControl) {
+          if (schemaControl[key] === true) {
+            isPickMode = true;
+            break;
+          }
+        }
+
+        if (isPickMode) {
+          const pickShape: Record<string, true> = {};
+          for (const key in schemaControl) {
+            if (schemaControl[key] === true) {
+              pickShape[key] = true;
+            } else {
+              fixedParams[key] = schemaControl[key];
+            }
+          }
+          finalSchema = originalSchema.pick(pickShape);
+        } else {
+          // Omit mode
+          const omitShape: Record<string, true> = {};
+          for (const key in schemaControl) {
+            if (key !== 'disableAllInputs') {
+              fixedParams[key] = schemaControl[key];
+              omitShape[key] = true;
+            }
+          }
+          finalSchema = originalSchema.omit(omitShape);
+        }
+      }
+    }
+
     const { id, metadata, ...restDefinition } = definition;
+
+    (restDefinition as { inputSchema?: unknown }).inputSchema = finalSchema;
+
     return {
       [id]: {
         ...restDefinition,
@@ -1380,7 +1397,7 @@ class NextHandler<
           toolKey: id,
           name: restDefinition.name,
           description: restDefinition.description,
-          absolutePath: restDefinition.path,
+          absolutePath: resolvedPath,
         },
         execute: async (params: any, options: any) => {
           const result = await this.callAgent(agentPath, params, options);
@@ -1393,11 +1410,13 @@ class NextHandler<
     };
   }
 
-  getToolDefinition(agentPath: string | RegExp) {
+  getToolDefinition(
+    agentPath: string | RegExp
+  ): AgentTool<any, any> | undefined {
     const parentPath = this.ctx.executionContext.currentPath || '/';
     const resolvedPath = (this.router as any)._resolvePath(
       parentPath,
-      agentPath
+      agentPath.toString()
     );
     let preDefined;
     const pathsToTry = [resolvedPath];
@@ -1433,7 +1452,7 @@ class NextHandler<
       this.ctx.logger.error(
         `[agentAsTool] No definition found for agent at resolved path: ${resolvedPath}`
       );
-      throw new AgentDefinitionMissingError(resolvedPath);
+      return undefined;
     }
     const { metadata, ...restDefinition } = definition;
     return {
@@ -1443,8 +1462,33 @@ class NextHandler<
         toolKey: restDefinition.id,
         name: restDefinition.name,
         description: restDefinition.description,
-        absolutePath: restDefinition.path,
+        absolutePath: resolvedPath,
       },
     } as AgentTool<any, any>;
   }
 }
+
+/** Deprecated execute style for L1402
+ * execute: (params: any, options: any) => {
+          const finalParams = { ...params, ...fixedParams };
+
+          const executeInternal = async () => {
+            const result = await this.callAgent(
+              agentPath,
+              finalParams,
+              options
+            );
+            if (!result.ok) {
+              throw result.error;
+            }
+            return result.data;
+          };
+
+          const newPromise = this.router.toolExecutionPromise.then(
+            executeInternal,
+            executeInternal
+          );
+          this.router.toolExecutionPromise = newPromise;
+          return newPromise;
+ * 
+ */

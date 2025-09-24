@@ -1,11 +1,16 @@
 {
-  "mode": "exit",
+  "mode": "pre",
   "tag": "beta",
   "initialVersions": {
-    "@microfox/ai-router": "2.0.0",
+    "next-perplexity-clone": "0.1.2-beta.0",
+    "@microfox/ai-router": "2.0.1-beta.0",
     "@microfox/ai-studio": "1.0.0",
     "@microfox/ai-studio-cli": "1.0.3",
-    "@microfox/ai-studio-react": "1.0.1"
+    "@microfox/ai-studio-react": "1.0.2-beta.0"
   },
-  "changesets": []
+  "changesets": [
+    "honest-emus-trade",
+    "modern-shirts-switch",
+    "ten-pandas-judge"
+  ]
 }

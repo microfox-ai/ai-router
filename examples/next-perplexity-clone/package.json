@@ -1,6 +1,6 @@
 {
   "name": "next-perplexity-clone",
-  "version": "0.1.1",
+  "version": "0.1.2-beta.0",
   "private": true,
   "scripts": {
     "dev": "next dev",

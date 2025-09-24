@@ -1,5 +1,23 @@
 # @microfox/ai-router
 
+## 2.0.1-beta.2
+
+### Patch Changes
+
+- 2a62227: added filter options to agentAsTool
+
+## 2.0.1-beta.1
+
+### Patch Changes
+
+- 07d4a18: beta release
+
+## 2.0.1-beta.0
+
+### Patch Changes
+
+- 07d4a18: beta release
+
 ## 2.0.0
 
 ### Major Changes

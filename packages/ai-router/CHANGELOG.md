@@ -1,5 +1,16 @@
 # @microfox/ai-router
 
+## 2.1.0
+
+### Minor Changes
+
+- 58300f5: Deletion of Tools & Zod Issues fixed
+
+### Patch Changes
+
+- 07d4a18: beta release
+- 2a62227: added filter options to agentAsTool
+
 ## 2.1.0-beta.3
 
 ### Minor Changes

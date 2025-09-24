@@ -14,7 +14,7 @@ jobs:
       - name: Checkout Repo
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 
+          fetch-depth: 0
 
       - name: Setup Node.js 20.x
         uses: actions/setup-node@v4
@@ -29,7 +29,14 @@ jobs:
         uses: tj-actions/changed-files@v46.0.1
         with:
           files: |
-            examples/**
+            examples/*/**
+          files_ignore: |
+            examples/*/node_modules/**
+            examples/*/dist/**
+            examples/*/build/**
+            examples/*/.turbo/**
+            examples/*/.next/**
+            examples/*/coverage/**
 
       - name: Run pack script for changed examples
         if: steps.changed-examples.outputs.any_changed == 'true'

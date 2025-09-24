@@ -36,6 +36,9 @@
     "async-lock": "^1.4.1",
     "zod": "^4.1.5"
   },
+  "peerDependencies": {
+    "ai": ">=5.0.47"
+  },
   "devDependencies": {
     "@types/node": "^20.14.2",
     "@typescript-eslint/eslint-plugin": "^6.0.0",

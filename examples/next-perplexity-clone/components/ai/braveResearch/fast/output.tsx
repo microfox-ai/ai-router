@@ -27,7 +27,7 @@ export const BraveResults: ComponentType<{
         return null;
     }
 
-    if (output.searchType === 'image') {
+    if (output.searchInput.type === 'image') {
         return <BraveMediaGrid tool={tool} />;
     }
 

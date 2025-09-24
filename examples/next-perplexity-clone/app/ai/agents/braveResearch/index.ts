@@ -24,7 +24,7 @@ export const braveResearchAgent = aiRouter
           .describe('Whether to use deep search which will take more time'),
         count: z.number().describe('The number of results to return'),
         freshness: z.enum(['pd', 'pw', 'pm', 'py']),
-      }),
+      }) as any,
       prompt: 'Generate a query for the brave research',
     });
     console.log('RESEARCH PARAM USAGE', queryObject.usage);
@@ -60,10 +60,10 @@ export const braveResearchAgent = aiRouter
     description: 'Research the web for information with brave search',
     inputSchema: z.object({
       query: z.string().describe('The query to search for'),
-    }),
+    }) as any,
     outputSchema: z.object({
       status: z.string().describe('The status of the research'),
-    }),
+    }) as any,
     metadata: {
       icon: 'https://raw.githubusercontent.com/microfox-ai/microfox/refs/heads/main/logos/brave.svg',
       title: 'Brave Research',

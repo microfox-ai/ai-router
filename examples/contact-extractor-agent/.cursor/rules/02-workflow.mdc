@@ -1,0 +1,116 @@
+---
+glob: "**/app/ai/**/*.ts"
+description: "A step-by-step guide to the `ai-router` development workflow, from defining schemas to creating and integrating agents."
+alwaysApply: true
+---
+# 02: Agent Development Workflow
+
+This document provides a step-by-step guide for building new agents and capabilities within the `ai-router` framework.
+
+---
+
+## The Golden Rules of Agent Development
+
+1.  **Be Explicit, Be Rude with Prompts**: Do not be polite or conversational with the AI. Use strong, imperative language (e.g., "You MUST...", "Do NOT..."). Structure prompts with clear sections (`# Rules`, `# Task`) and use system prompts to define the AI's persona and mission.
+2.  **Never Assume**: The AI will invent information if not strictly forbidden. Always include a rule like: "You MUST only select from the list provided. Do not create, modify, or assume any URLs."
+3.  **Schema is Your Guardrail**: Use Zod schemas to rigorously define the expected output of every AI call. This is your primary defense against data hallucinations.
+
+---
+
+## Step 1: Define Your Schemas (`/helpers/schema.ts`)
+
+Before writing any agent logic, define the data structures you'll be working with.
+-   **Input Schema**: What data does your agent need to do its job?
+-   **Output Schema**: What data will your agent produce?
+-   Use Zod for strong type validation. For recursive or self-referential structures, use `z.lazy()`.
+
+---
+
+## Step 2: Create Your Worker Agents (`/app/ai/agents/your-agent`)
+
+Build your specialized worker agents. Each worker should have a single, well-defined responsibility.
+
+```typescript
+// Example: /app/ai/agents/your-agent/parser.agent.ts
+import { AiRouter } from '@microfox/ai-router';
+// ... other imports
+
+const aiRouter = new AiRouter();
+
+export const parsingAgent = aiRouter.agent('/', async (ctx) => {
+  const { html, url } = ctx.request.params;
+  // ... perform pure, logic-based parsing ...
+  return { emails, socials, otherLinks };
+});
+```
+
+---
+
+## Step 3: Create Your Orchestrator (`/app/ai/agents/your-agent/index.ts`)
+
+Build your orchestrator agent. This agent will define the high-level workflow and call your worker agents using `ctx.next.callAgent()`.
+
+```typescript
+// Example: /app/ai/agents/your-agent/index.ts
+import { AiRouter } from '@microfox/ai-router';
+import { scrapingAgent } from './scraping.agent';
+import { parsingAgent } from './parsing.agent';
+
+const aiRouter = new AiRouter();
+
+export const yourOrchestratorAgent = aiRouter
+  .agent('/scrape', scrapingAgent)
+  .agent('/parse', parsingAgent)
+  .agent('/', async (ctx) => {
+    // ... orchestrator logic ...
+    const scrapeResult = await ctx.next.callAgent('/scrape', { url: '...' });
+    // ...
+    const parseResult = await ctx.next.callAgent('/parse', { html: '...' });
+    // ...
+  });
+```
+
+---
+
+## Step 4: Expose as a Tool (`actAsTool`)
+
+Use `.actAsTool()` to expose your orchestrator as a tool to the main AI. Be thoughtful about the `outputSchema` to minimize token usage.
+
+```typescript
+// In your orchestrator file, e.g., /app/ai/agents/your-agent/index.ts
+export const yourOrchestratorAgent = new AiRouter()
+  // ... agent definitions ...
+  .actAsTool('/', {
+    id: 'yourToolId',
+    name: 'Your Tool Name',
+    description: 'A detailed description of what this tool does.',
+    inputSchema: yourInputSchema, // Defined in schema.ts
+    outputSchema: z.object({ status: z.string() }), // Keep it concise!
+  });
+```
+
+---
+
+## Step 5: Integrate into the Main Router (`/app/ai/index.ts`)
+
+Finally, attach your new agent to the main `aiRouter` and update the main AI's prompts to teach it how and when to use your new tool.
+
+```typescript
+// /app/ai/index.ts
+import { yourOrchestratorAgent } from './agents/your-agent';
+
+const aiRouter = new AiRouter();
+
+const aiMainRouter = aiRouter
+  .agent('/your-agent', yourOrchestratorAgent)
+  // ... other agents
+
+// ... in the main AI agent ...
+const { object: analysis, usage } = await generateObject({
+  model: google('gemini-2.5-pro'),
+  tools: {
+    ...ctx.next.agentAsTool('/your-agent'), // Make the tool available
+  },
+  prompt: `Based on the user's request, decide which tool to use.`,
+});
+```

@@ -19,6 +19,7 @@ export const initCommand = new Command()
     'The template to use for the project.',
     'root'
   )
+  .option('--local', 'Use a local template path.', false)
   .action(async (options) => {
     const projectName = await setupProject();
     let config: Config | null = await loadConfig();
@@ -30,7 +31,7 @@ export const initCommand = new Command()
       writeConfigFile(config);
     }
 
-    await scaffoldProject(options.template, config);
+    await scaffoldProject(options.template, config, options.local);
 
     if (typeof projectName === 'string') {
       console.log(chalk.green('\n🎉 Your project is ready!'));

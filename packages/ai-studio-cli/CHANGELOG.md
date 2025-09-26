@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.1.1
+
+### Patch Changes
+
+- a05002d: Changes from PR #31: beta
+
+## 1.1.0
+
+### Minor Changes
+
+- 58300f5: Deletion of Tools & Zod Issues fixed
+
+### Patch Changes
+
+- 8476f3e: added local templates support for init command
+
+## 1.1.0-beta.1
+
+### Minor Changes
+
+- 58300f5: Deletion of Tools & Zod Issues fixed
+
+## 1.0.4-beta.0
+
+### Patch Changes
+
+- 8476f3e: added local templates support for init command
+
 ## 1.0.3
 
 ### Patch Changes

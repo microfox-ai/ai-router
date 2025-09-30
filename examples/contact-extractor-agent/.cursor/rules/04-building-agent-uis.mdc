@@ -1,0 +1,114 @@
+---
+glob: "**/components/ai/**/*.{ts,tsx}"
+description: "A guide to building type-safe UIs for `ai-router` agents, including the `aiComponentMap`, component structure, and using `AiRouterTools`."
+alwaysApply: true
+---
+# 04: Building Agent UIs
+
+The `ai-router` provides a powerful system for creating type-safe, component-based UIs for your agents.
+
+---
+
+## 1. The `aiComponentMap`
+
+The file `/components/ai/index.tsx` is the central registry for all agent UIs. It exports an `aiComponentMap` object that maps the `id` of a tool (from `.actAsTool()`) to the React component that should render its output.
+
+```typescript
+// /components/ai/index.tsx
+'use client';
+
+import { yourAgentComponentMap } from "./your-agent";
+import { anotherAgentComponentMap } from "./another-agent";
+
+export const aiComponentMap = {
+    tools: {
+        ...yourAgentComponentMap,
+        ...anotherAgentComponentMap,
+    },
+};
+```
+
+---
+
+## 2. UI Component Structure
+
+For each agent, you should create a corresponding directory in `/components/ai`. Inside this directory, an `index.ts` file will define the mapping for that specific agent's components.
+
+A tool's UI can have multiple parts:
+-   `full`: The main component for rendering the tool's output. This is the most common part you will define.
+-   `header_sticky`: A component that can stick to the top of the message UI.
+-   `footer_sticky`: A component that can stick to the bottom of the message UI.
+
+```typescript
+// /components/ai/your-agent/index.ts
+import { YourAgentDashboard } from './Dashboard';
+
+export const yourAgentComponentMap = {
+  yourToolId: { // This ID must match the 'id' in actAsTool
+    full: YourAgentDashboard, // The main UI component
+  },
+};
+```
+
+---
+
+## 3. `actAsTool` Metadata
+
+The `metadata` object in the `.actAsTool()` configuration is how you control the appearance of your tool in the UI *before* it's rendered.
+
+-   `title`: The main title of the tool shown in the UI.
+-   `parentTitle`: If provided, this will group the tool under a category. For example, multiple search tools could have a `parentTitle` of "Web Search".
+-   `icon`: A URL to the icon for the tool.
+
+```typescript
+// In your orchestrator agent, e.g., /app/ai/agents/your-agent/index.ts
+.actAsTool('/', {
+  id: 'yourToolId',
+  // ... other properties
+  metadata: {
+    icon: 'https://.../your-icon.svg',
+    title: 'Your Tool Name',
+    parentTitle: 'Your Category',
+  },
+});
+```
+
+---
+
+## 4. Type-Safe UI Components
+
+To connect your UI components to the backend schemas, the main orchestrator (`/app/ai/index.ts`) must export a generated `AiRouterTools` type. Your UI components can then import this type to get full type safety and autocompletion for the tool's output.
+
+**Step 1: Export the type from the orchestrator.**
+```typescript
+// /app/ai/index.ts
+const aiRouterRegistry = aiMainRouter.registry();
+const aiRouterTools = aiRouterRegistry.tools;
+// This is a magical generated type that understands all your tools
+type AiRouterTools = InferUITools<typeof aiRouterTools>; 
+export { aiRouterTools, type AiRouterTools };
+```
+
+**Step 2: Import the type and use it in your component.**
+```typescript
+// /components/ai/your-agent/Dashboard.tsx
+import { AiRouterTools } from '@/app/ai';
+import { ComponentType } from 'react';
+import { ToolUIPart } from 'ai';
+
+// Use the generated type to create a type-safe prop for your component
+export const YourAgentDashboard: ComponentType<{
+  tool: ToolUIPart<Pick<AiRouterTools, 'yourToolId'>>;
+}> = (props) => {
+  const { tool } = props;
+  
+  // Now, 'tool.output' is fully typed based on your Zod schema!
+  const { status, results } = tool.output;
+  
+  return (
+    <div>
+      {/* ... your rendering logic ... */}
+    </div>
+  );
+};
+```

@@ -17,7 +17,7 @@ import {
 } from 'ai';
 import { StreamWriter } from './helper.js';
 import { UITools } from './types.js';
-import { z, ZodObject, ZodType } from 'zod';
+import { z, ZodAny, ZodObject, ZodType } from 'zod';
 import path from 'path';
 import { Store, MemoryStore } from './store.js';
 
@@ -1345,7 +1345,7 @@ class NextHandler<
       throw new AgentDefinitionMissingError(resolvedPath);
     }
 
-    const originalSchema = definition.inputSchema as ZodObject<any> | undefined;
+    const originalSchema = definition.inputSchema as any;
     let finalSchema = originalSchema;
     const fixedParams: Record<string, any> = {};
 

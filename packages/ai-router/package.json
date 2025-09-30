@@ -22,19 +22,19 @@
     "./package.json": "./package.json",
     ".": {
       "import": "./dist/index.mjs",
-      "require": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js"
     },
     "./fs_store": {
       "import": "./dist/fs_store.mjs",
-      "require": "./dist/fs_store.js",
-      "types": "./dist/fs_store.d.ts"
+      "types": "./dist/fs_store.d.ts",
+      "require": "./dist/fs_store.js"
     }
   },
   "dependencies": {
-    "ai": "^5.0.51",
+    "ai": "^5.0.56",
     "async-lock": "^1.4.1",
-    "zod": "^4.1.5"
+    "zod": "^4.1.11"
   },
   "peerDependencies": {
     "ai": ">=5.0.47"

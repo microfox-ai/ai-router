@@ -1,22 +1,20 @@
 import { google } from '@ai-sdk/google';
 import { AiRouter } from '@microfox/ai-router';
+import { contactExtractorAgent } from './agents/contactExtractorAgent';
+import { contextLimiter } from './middlewares/contextLimiter';
+import { onlyTextParts } from './middlewares/onlyTextParts';
 import {
   convertToModelMessages,
-  InferUITools,
   stepCountIs,
   streamText,
 } from 'ai';
 import dedent from 'dedent';
-import { contactExtractorAgent } from './agents/contactExtractorAgent';
-import { systemAgent } from './agents/system';
-import { contextLimiter } from './middlewares/contextLimiter';
-import { onlyTextParts } from './middlewares/onlyTextParts';
 
 const aiRouter = new AiRouter();
-// aiRouter.setLogger(console);
 
+// Define the main router without loading the static registry.
+// The CLI will use this file as the entry point for building the registry.
 const aiMainRouter = aiRouter
-  .agent('/system', systemAgent)
   .agent('/extract', contactExtractorAgent)
   .use('/', contextLimiter(5))
   .use('/', onlyTextParts(100))
@@ -38,8 +36,7 @@ const aiMainRouter = aiRouter
           props.state.onlyTextMessages || props.request.messages,
         ),
         tools: {
-          // ...props.next.agentAsTool('/system'),
-          ...props.next.agentAsTool('/extract')
+          ...props.next.agentAsTool('/extract'),
         },
         toolChoice: 'auto',
         stopWhen: [
@@ -68,23 +65,10 @@ const aiMainRouter = aiRouter
     } catch (error: any) {
       console.error('Error in main AI router:', error);
       props.response.write({
-        id: 'error-main-router',
-        type: 'error',
+        type: 'data-error',
         data: `An unexpected error occurred in the main router: ${error.message}`,
       });
     }
   });
 
-
-// console.log('--------REGISTRY--------');
-// console.log(aiMainRouter.registry());
-const aiRouterRegistry = aiMainRouter.registry();
-const aiRouterTools = aiRouterRegistry.tools;
-type AiRouterTools = InferUITools<typeof aiRouterTools>;
-// console.log('--------REGISTRY--------');
-
-export { aiMainRouter, aiRouterRegistry };
-
-export { aiRouterTools, type AiRouterTools };
-
-//http://localhost:3000/api/studio/chat/agent/research/brave?query=Herohonda&deep=false&count=3
+export default aiMainRouter;

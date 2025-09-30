@@ -1,4 +1,4 @@
-import { aiMainRouter } from '@/app/ai';
+import aiMainRouter from '@/app/ai';
 import { UIMessage } from 'ai';
 import { NextRequest } from 'next/server';
 

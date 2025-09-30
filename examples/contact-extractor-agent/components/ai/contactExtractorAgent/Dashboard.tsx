@@ -8,7 +8,7 @@ import {
   CardTitle,
 } from '@/components/ui/card';
 import { ContactsView } from './ContactsView';
-import { AiRouterTools } from '@/app/ai';
+import type { AiRouterTools } from '@/app/ai';
 import { ComponentType } from 'react';
 import { ToolUIPart } from 'ai';
 
@@ -16,13 +16,19 @@ export const Dashboard: ComponentType<{
   tool: ToolUIPart<Pick<AiRouterTools, 'contactExtractor'>>;
 }> = (props) => {
   const { tool } = props;
-  const { contacts = [], pagesScraped = 0, usage = { totalTokens: 0 } } = tool.output || {};
+  const {
+    contacts = [],
+    pagesScraped = 0,
+    usage = { totalTokens: 0 },
+  } = tool.output || {};
 
   return (
     <div className="hidden flex-col md:flex">
       <div className="flex-1 space-y-4 p-8 pt-6">
         <div className="flex items-center justify-between space-y-2">
-          <h2 className="text-3xl font-bold tracking-tight">Contact Extraction Results</h2>
+          <h2 className="text-3xl font-bold tracking-tight">
+            Contact Extraction Results
+          </h2>
         </div>
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
           <Card>
@@ -52,7 +58,9 @@ export const Dashboard: ComponentType<{
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold">{usage.totalTokens} tokens</div>
+              <div className="text-2xl font-bold">
+                {usage.totalTokens} tokens
+              </div>
             </CardContent>
           </Card>
         </div>
@@ -72,4 +80,4 @@ export const Dashboard: ComponentType<{
       </div>
     </div>
   );
-}
+};

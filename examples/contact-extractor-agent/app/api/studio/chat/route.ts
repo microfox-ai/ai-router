@@ -1,4 +1,4 @@
-import { aiMainRouter } from '@/app/ai';
+import aiMainRouter from '@/app/ai';
 import { chatRestoreLocal } from '@/app/api/studio/chat/sessions/chatSessionLocal';
 import { chatRestoreUpstash } from '@/app/api/studio/chat/sessions/chatSessionUpstash';
 import { StudioConfig } from '@/microfox.config';

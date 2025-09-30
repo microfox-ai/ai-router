@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "scripts": {
     "pack": "node scripts/pack.mjs",
+    "build": "turbo build",
     "changeset": "changeset",
     "ci:release": "turbo clean && changeset publish",
     "ci:version": "changeset version && npm install"

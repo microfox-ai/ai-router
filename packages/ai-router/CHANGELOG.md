@@ -1,5 +1,11 @@
 # @microfox/ai-router
 
+## 2.1.2
+
+### Patch Changes
+
+- 56b7b6e: Changes from PR #36: middlewar-changes-before-after
+
 ## 2.1.1
 
 ### Patch Changes

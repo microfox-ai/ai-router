@@ -21,8 +21,8 @@ const aiMainRouter = aiRouter
   .agent('/system', systemAgent)
   .agent('/summarize', summarizeAgent)
   .agent('/research', braveResearchAgent)
-  .use('/', contextLimiter(5))
-  .use('/', onlyTextParts(100))
+  .before('/', contextLimiter(5))
+  .before('/', onlyTextParts(100))
   .agent('/', async (props) => {
     // Ai decides what to do based on the last message & user intent.
     props.response.writeMessageMetadata({

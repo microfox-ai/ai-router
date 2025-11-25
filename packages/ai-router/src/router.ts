@@ -335,6 +335,8 @@ type Layer<
   path: string | RegExp;
   handler: AiMiddleware<METADATA, ContextState, PARAMS, PARTS, TOOLS>;
   isAgent: boolean;
+  // Timing for middleware: 'before' runs before agents, 'after' runs after agents
+  timing?: 'before' | 'after';
   // Dynamic parameter support
   hasDynamicParams?: boolean;
   paramNames?: string[];
@@ -485,8 +487,28 @@ export class AiRouter<
       if (typeof handler !== 'function') {
         // Check if it's an AiRouter instance for mounting
         if (handler instanceof AiRouter && typeof prefix === 'string') {
-          // Use the new use method for mounting routers
-          this.use(prefix, handler);
+          // Mount the router's stack directly
+          const router = handler;
+          const mountPath = prefix.toString().replace(/\/$/, ''); // remove trailing slash
+          // Mount routes from the sub-router
+          router.stack.forEach((layer) => {
+            const layerPath = layer.path.toString();
+            // Prevent layer paths starting with '/' from being treated as absolute by join
+            const relativeLayerPath = layerPath.startsWith('/')
+              ? layerPath.substring(1)
+              : layerPath;
+            const newPath = path.posix.join(mountPath, relativeLayerPath);
+            this.stack.push({ ...layer, path: newPath });
+          });
+          // Mount tool definitions from the sub-router
+          router.actAsToolDefinitions.forEach((value, key) => {
+            const keyPath = key.toString();
+            const relativeKeyPath = keyPath.startsWith('/')
+              ? keyPath.substring(1)
+              : keyPath;
+            const newKey = path.posix.join(mountPath, relativeKeyPath);
+            this.actAsToolDefinitions.set(newKey, value);
+          });
         }
         continue;
       }
@@ -502,13 +524,13 @@ export class AiRouter<
   }
 
   /**
-   * Mounts a middleware function or another AiAgentKit router at a specific path.
-   * This is the primary method for composing routers and applying cross-cutting middleware.
+   * Registers middleware that runs BEFORE agent execution for a specific path prefix, regex pattern, or wildcard.
+   * The middleware can modify the context and must call `next()` to pass control to the next handler.
    *
-   * @param path The path prefix to mount the handler on.
+   * @param mountPathArg The path prefix, regex pattern, or "*" for wildcard matching.
    * @param handler The middleware function or AiAgentKit router instance to mount.
    */
-  use<
+  before<
     THandler extends
       | AiMiddleware<KIT_METADATA, ContextState, PARAMS, PARTS, TOOLS>
       | AiRouter<any, any, any, any, any, any>,
@@ -558,6 +580,70 @@ export class AiRouter<
         path: mountPathArg,
         handler: handler,
         isAgent: false, // Middleware is not a terminal agent
+        timing: 'before', // Mark as before middleware
+      });
+    }
+    return this as any;
+  }
+
+  /**
+   * Registers middleware that runs AFTER agent execution for a specific path prefix, regex pattern, or wildcard.
+   * The middleware can modify the context and must call `next()` to pass control to the next handler.
+   *
+   * @param mountPathArg The path prefix, regex pattern, or "*" for wildcard matching.
+   * @param handler The middleware function or AiAgentKit router instance to mount.
+   */
+  after<
+    THandler extends
+      | AiMiddleware<KIT_METADATA, ContextState, PARAMS, PARTS, TOOLS>
+      | AiRouter<any, any, any, any, any, any>,
+  >(
+    mountPathArg: string | RegExp,
+    handler: THandler
+  ): AiRouter<
+    KIT_METADATA,
+    ContextState,
+    PARAMS,
+    PARTS,
+    TOOLS,
+    REGISTERED_TOOLS &
+      (THandler extends AiRouter<any, any, any, any, any, infer R> ? R : {})
+  > {
+    if (mountPathArg instanceof RegExp && handler instanceof AiRouter) {
+      throw new AiKitError(
+        '[AiAgentKit] Mounting a router on a RegExp path is not supported.'
+      );
+    }
+
+    if (handler instanceof AiRouter) {
+      const router = handler;
+      const mountPath = mountPathArg.toString().replace(/\/$/, ''); // remove trailing slash
+      // Mount routes from the sub-router
+      router.stack.forEach((layer) => {
+        const layerPath = layer.path.toString();
+        // Prevent layer paths starting with '/' from being treated as absolute by join
+        const relativeLayerPath = layerPath.startsWith('/')
+          ? layerPath.substring(1)
+          : layerPath;
+        const newPath = path.posix.join(mountPath, relativeLayerPath);
+        this.stack.push({ ...layer, path: newPath });
+      });
+      // Mount tool definitions from the sub-router
+      router.actAsToolDefinitions.forEach((value, key) => {
+        const keyPath = key.toString();
+        const relativeKeyPath = keyPath.startsWith('/')
+          ? keyPath.substring(1)
+          : keyPath;
+        const newKey = path.posix.join(mountPath, relativeKeyPath);
+        this.actAsToolDefinitions.set(newKey, value);
+      });
+    } else {
+      // It's a middleware
+      this.stack.push({
+        path: mountPathArg,
+        handler: handler,
+        isAgent: false, // Middleware is not a terminal agent
+        timing: 'after', // Mark as after middleware
       });
     }
     return this as any;
@@ -650,16 +736,18 @@ export class AiRouter<
    * @returns A map of paths to their registered handlers.
    */
   registry(): {
-    map: Record<string, { middlewares: any[]; agents: any[] }>;
+    map: Record<string, { before: any[]; agents: any[]; after: any[] }>;
     tools: REGISTERED_TOOLS;
   } {
-    const registryMap: Record<string, { middlewares: any[]; agents: any[] }> =
-      {};
+    const registryMap: Record<
+      string,
+      { before: any[]; agents: any[]; after: any[] }
+    > = {};
 
     for (const layer of this.stack) {
       const pathKey = layer.path.toString();
       if (!registryMap[pathKey]) {
-        registryMap[pathKey] = { middlewares: [], agents: [] };
+        registryMap[pathKey] = { before: [], agents: [], after: [] };
       }
 
       if (layer.isAgent) {
@@ -674,9 +762,18 @@ export class AiRouter<
         }
         registryMap[pathKey].agents.push(agentInfo);
       } else {
-        registryMap[pathKey].middlewares.push({
+        const middlewareInfo: any = {
           handler: layer.handler.name || 'anonymous',
-        });
+          timing: layer.timing || 'middleware',
+        };
+        if (layer.timing === 'before') {
+          registryMap[pathKey].before.push(middlewareInfo);
+        } else if (layer.timing === 'after') {
+          registryMap[pathKey].after.push(middlewareInfo);
+        } else {
+          // Legacy middleware without timing (shouldn't happen with new API, but handle gracefully)
+          registryMap[pathKey].before.push(middlewareInfo);
+        }
       }
     }
 
@@ -904,22 +1001,46 @@ export class AiRouter<
         return shouldRun;
       });
 
-      // Sort layers by specificity (most general first) to ensure correct execution order.
-      layersToRun.sort(
+      // Separate layers into before, agents, and after
+      const beforeLayers = layersToRun.filter(
+        (l) => !l.isAgent && l.timing === 'before'
+      );
+      const agentLayers = layersToRun.filter((l) => l.isAgent);
+      const afterLayers = layersToRun.filter(
+        (l) => !l.isAgent && l.timing === 'after'
+      );
+
+      // Sort each group by specificity (most general first) to ensure correct execution order.
+      beforeLayers.sort(
+        (a, b) => this._getSpecificityScore(a) - this._getSpecificityScore(b)
+      );
+      agentLayers.sort(
+        (a, b) => this._getSpecificityScore(a) - this._getSpecificityScore(b)
+      );
+      afterLayers.sort(
         (a, b) => this._getSpecificityScore(a) - this._getSpecificityScore(b)
       );
 
-      const layerDescriptions = layersToRun.map(
-        (l) => `${l.path.toString()} (${l.isAgent ? 'agent' : 'middleware'})`
-      );
+      // Combine in order: before, agents, after
+      const orderedLayers = [...beforeLayers, ...agentLayers, ...afterLayers];
+
+      const layerDescriptions = orderedLayers.map((l) => {
+        const type = l.isAgent
+          ? 'agent'
+          : l.timing === 'before'
+            ? 'before'
+            : l.timing === 'after'
+              ? 'after'
+              : 'middleware';
+        return `${l.path.toString()} (${type})`;
+      });
       ctx.logger.log(
-        `Found ${layersToRun.length} layers to run: [${layerDescriptions.join(
+        `Found ${orderedLayers.length} layers to run: [${layerDescriptions.join(
           ', '
         )}]`
       );
-      const hasAgent = layersToRun.some((l) => l.isAgent);
 
-      if (!layersToRun.length) {
+      if (!agentLayers.length && !beforeLayers.length && !afterLayers.length) {
         const errorMsg = `No agent or tool found for path: ${normalizedPath}`;
         ctx.logger.error(errorMsg);
         throw new AgentNotFoundError(normalizedPath);
@@ -927,7 +1048,7 @@ export class AiRouter<
 
       // A more robust, explicit dispatcher to avoid promise chain issues.
       const dispatch = async (index: number): Promise<any> => {
-        const layer = layersToRun[index];
+        const layer = orderedLayers[index];
         if (!layer) {
           // End of the chain
           return;
@@ -938,7 +1059,13 @@ export class AiRouter<
         const layerPath =
           typeof layer.path === 'string' ? layer.path : layer.path.toString();
 
-        const layerType = layer.isAgent ? 'agent' : 'middleware';
+        const layerType = layer.isAgent
+          ? 'agent'
+          : layer.timing === 'before'
+            ? 'before'
+            : layer.timing === 'after'
+              ? 'after'
+              : 'middleware';
         ctx.logger.log(`-> Running ${layerType}: ${layerPath}`);
 
         try {

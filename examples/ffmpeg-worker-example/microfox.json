@@ -1,0 +1,17 @@
+{
+  "projectId": "f834db57-f1b9-4536-87c3-82d8a3bd4062",
+  "publish": {
+    "subdomain": "test-2",
+    "agentName": "test-2",
+    "handles": {
+      "agent": "/agent",
+      "openapi": "/docs.json",
+      "public": "/public"
+    }
+  },
+  "deployment": {
+    "apiMode": "staging",
+    "apiVersion": "v2",
+    "ignorePatterns": [".build/**", "package-lock.json"]
+  }
+}

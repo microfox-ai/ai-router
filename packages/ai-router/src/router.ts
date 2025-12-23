@@ -397,6 +397,10 @@ export class AiRouter<
     new Map();
   private logger?: AiLogger = undefined;
   private _store: Store = new MemoryStore();
+  // Workflow registry: Map<workflowId, Map<version, CreatedWorkflow>>
+  private _workflowRegistry: Map<string, Map<string, any>> = new Map();
+  // Workflow storage driver (defaults to memory)
+  private _workflowStorage?: any;
 
   /** Configuration options for the router instance. */
   public options: {
@@ -729,6 +733,241 @@ export class AiRouter<
       throw new AgentDefinitionMissingError(path);
     }
     return definition;
+  }
+
+  /**
+   * Mount a workflow on the router. Automatically registers endpoints:
+   * - POST /path (start workflow)
+   * - GET /path/:id (get status)
+   * - POST /path/:id/signal (send HITL signal)
+   * 
+   * Storage is automatically configured from microfox.config.ts if not provided.
+   */
+  useWorkflow<Input, Output>(
+    path: string,
+    workflow: any, // CreatedWorkflow<Input, Output>
+    options?: {
+      storage?: any; // StorageDriver - optional, auto-detected from config
+      exposeAsTool?: boolean;
+    }
+  ): this {
+    // Lazy import to avoid circular dependencies
+    // These will be imported when useWorkflow is first called
+    let WorkflowEngine: any;
+    let MemoryStorageDriver: any;
+    
+    try {
+      const engineModule = require('./workflow/engine.js');
+      WorkflowEngine = engineModule.WorkflowEngine;
+      const storageModule = require('./workflow/storage/memory.js');
+      MemoryStorageDriver = storageModule.MemoryStorageDriver;
+    } catch (e) {
+      throw new Error(
+        'Workflow runtime not available. Make sure workflow modules are built.'
+      );
+    }
+    
+    // Register workflow in version registry
+    const workflowId = workflow.id;
+    const version = workflow.version || '1.0';
+    
+    if (!this._workflowRegistry.has(workflowId)) {
+      this._workflowRegistry.set(workflowId, new Map());
+    }
+    this._workflowRegistry.get(workflowId)!.set(version, workflow);
+    
+    // Auto-configure storage from config if not provided
+    if (!this._workflowStorage) {
+      if (options?.storage) {
+        this._workflowStorage = options.storage;
+      } else {
+        // Try to auto-detect from config
+        try {
+          // Try to read microfox.config.ts
+          const fs = require('fs');
+          const path = require('path');
+          const configPath = path.join(process.cwd(), 'microfox.config.ts');
+          
+          if (fs.existsSync(configPath)) {
+            // Read and parse config to get database type
+            const configContent = fs.readFileSync(configPath, 'utf-8');
+            const dbTypeMatch = configContent.match(
+              /type:\s*['"](local|supabase|upstash-redis)['"]/
+            );
+            const dbType = dbTypeMatch ? dbTypeMatch[1] : 'local';
+            
+            // For now, always use memory storage
+            // TODO: Implement UpstashRedisStorageDriver when needed
+            if (dbType === 'upstash-redis') {
+              this.logger?.log(
+                '[useWorkflow] Upstash Redis storage not yet implemented, using memory storage'
+              );
+            }
+            this._workflowStorage = new MemoryStorageDriver();
+          } else {
+            // No config file, use memory storage
+            this._workflowStorage = new MemoryStorageDriver();
+          }
+        } catch (error) {
+          // Fallback to memory storage if config read fails
+          this.logger?.log(
+            '[useWorkflow] Could not read config, using memory storage'
+          );
+          this._workflowStorage = new MemoryStorageDriver();
+        }
+      }
+    }
+    
+    const engine = new WorkflowEngine();
+    
+    // Register start endpoint: POST /path
+    this.agent(path, async (ctx) => {
+      const { input } = ctx.request.params;
+      
+      // Validate input
+      const validatedInput = workflow.inputSchema.parse(input);
+      
+      // Create instance
+      const instanceId = await this._workflowStorage.createInstance(
+        workflowId,
+        version,
+        validatedInput
+      );
+      
+      // Execute workflow
+      try {
+        const result = await engine.executeWorkflow(
+          workflow,
+          instanceId,
+          validatedInput,
+          this._workflowStorage
+        );
+        
+        return {
+          instanceId,
+          status: 'completed',
+          result,
+        };
+      } catch (error: any) {
+        if (error.name === 'WorkflowSuspensionError') {
+          // Expected suspension
+          return {
+            instanceId,
+            status: 'suspended',
+          };
+        }
+        throw error;
+      }
+    });
+    
+    // Register status endpoint: GET /path/:id
+    this.agent(`${path}/:id`, async (ctx) => {
+      const instanceId = ctx.request.params.id as string;
+      const instance = await this._workflowStorage.getInstance(instanceId);
+      
+      if (!instance) {
+        throw new Error(`Workflow instance ${instanceId} not found`);
+      }
+      
+      return {
+        status: instance.status,
+        result: instance.result,
+        waitingFor: instance.waitingForEvent,
+        ui: instance.waitingForUI,
+      };
+    });
+    
+    // Register signal endpoint: POST /path/:id/signal
+    this.agent(`${path}/:id/signal`, async (ctx) => {
+      const instanceId = ctx.request.params.id as string;
+      const { eventName, payload, token } = ctx.request.params;
+      
+      await engine.processSignal(
+        instanceId,
+        eventName,
+        payload,
+        this._workflowStorage,
+        token
+      );
+      
+      // Resume workflow
+      const workflowKey = `${workflowId}:${version}`;
+      const registeredWorkflow = this._workflowRegistry
+        .get(workflowId)
+        ?.get(version);
+      
+      if (registeredWorkflow) {
+        try {
+          const result = await engine.resumeWorkflow(
+            registeredWorkflow,
+            instanceId,
+            this._workflowStorage
+          );
+          
+          return {
+            status: 'completed',
+            result,
+          };
+        } catch (error: any) {
+          if (error.name === 'WorkflowSuspensionError') {
+            return {
+              status: 'suspended',
+            };
+          }
+          throw error;
+        }
+      }
+      
+      return { status: 'ok' };
+    });
+    
+    // Optionally expose as tool
+    if (options?.exposeAsTool) {
+      this.actAsTool(path, {
+        id: workflowId,
+        name: workflowId,
+        description: `Workflow: ${workflowId}`,
+        inputSchema: workflow.inputSchema,
+        outputSchema: z.object({
+          instanceId: z.string(),
+          status: z.string(),
+          result: workflow.outputSchema || z.any().optional(),
+        }),
+        execute: async (input: Input) => {
+          const instanceId = await this._workflowStorage.createInstance(
+            workflowId,
+            version,
+            input
+          );
+          
+          try {
+            const result = await engine.executeWorkflow(
+              workflow,
+              instanceId,
+              input,
+              this._workflowStorage
+            );
+            
+            return {
+              instanceId,
+              status: 'completed',
+              result,
+            };
+          } catch (error: any) {
+            if (error.name === 'WorkflowSuspensionError') {
+              return {
+                instanceId,
+                status: 'suspended',
+              };
+            }
+            throw error;
+          }
+        },
+      } as any);
+    }
+    
+    this.logger?.log(`[useWorkflow] Registered workflow: ${workflowId} v${version} at ${path}`);
+    return this;
   }
 
   /**

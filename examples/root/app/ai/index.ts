@@ -17,13 +17,21 @@ import { onlyTextParts } from './middlewares/onlyTextParts';
 const aiRouter = new AiRouter<any, any, any, any>();
 // aiRouter.setLogger(console);
 
+// Import workflows to register them - they register on the shared workflow router
+// We'll mount that router as a sub-router
+import './agents/workflows/research';
+import './agents/workflows/onboarding';
+import { aiRouter as workflowRouter } from './agents/workflows/shared';
+
 const aiMainRouter = aiRouter
   .agent('/system', systemAgent)
   .agent('/summarize', summarizeAgent)
   .agent('/research', braveResearchAgent)
   .agent('/thinker', thinkerAgent)
-  .use('/', contextLimiter(5))
-  .use('/', onlyTextParts(100))
+  // Mount workflow router as sub-router
+  .agent('/workflows', workflowRouter)
+  .agent('/', contextLimiter(5))
+  .agent('/', onlyTextParts(100))
   .agent('/', async (props) => {
     // show a loading indicator
     props.response.writeMessageMetadata({

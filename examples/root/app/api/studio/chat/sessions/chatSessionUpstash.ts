@@ -40,10 +40,7 @@ export const messageStore = new CrudHash<ChatMessage>(
  * @param next - The next middleware or router
  * @returns
  */
-export const chatRestoreUpstash: AiMiddleware<{
-  sessionId: string;
-  loader?: string;
-}> = async (props, next) => {
+export const chatRestoreUpstash: AiMiddleware = async (props, next) => {
   try {
     const { sessionId, messages } = props.request;
     if (!sessionId || sessionId === 'undefined') {

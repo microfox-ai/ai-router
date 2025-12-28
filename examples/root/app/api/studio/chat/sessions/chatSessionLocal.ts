@@ -139,10 +139,7 @@ export const sessionLocalListOut = async () => {
  * @param next - The next middleware or router
  * @returns
  */
-export const chatRestoreLocal: AiMiddleware<{
-  sessionId: string;
-  loader?: string;
-}> = async (props, next) => {
+export const chatRestoreLocal: AiMiddleware = async (props, next) => {
   try {
     const { sessionId, messages } = props.request;
 

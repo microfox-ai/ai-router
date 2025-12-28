@@ -397,6 +397,8 @@ export class AiRouter<
     new Map();
   private logger?: AiLogger = undefined;
   private _store: Store = new MemoryStore();
+  // Workflow registry: Map<workflowId, Map<version, CreatedWorkflow>>
+  private _workflowRegistry: Map<string, Map<string, any>> = new Map();
 
   /** Configuration options for the router instance. */
   public options: {
@@ -509,13 +511,32 @@ export class AiRouter<
             const newKey = path.posix.join(mountPath, relativeKeyPath);
             this.actAsToolDefinitions.set(newKey, value);
           });
+          // Mount workflow registry from the sub-router
+          router._workflowRegistry.forEach((versionMap, workflowId) => {
+            if (!this._workflowRegistry.has(workflowId)) {
+              this._workflowRegistry.set(workflowId, new Map());
+            }
+            versionMap.forEach((workflow, version) => {
+              this._workflowRegistry.get(workflowId)!.set(version, workflow);
+            });
+          });
         }
         continue;
       }
+      // Check if path has dynamic parameters
+      const hasDynamic =
+        typeof prefix === 'string' ? hasDynamicParams(prefix) : false;
+      const paramNames =
+        typeof prefix === 'string' && hasDynamic
+          ? parsePathPattern(prefix).paramNames
+          : undefined;
+
       this.stack.push({
         path: prefix,
         handler: handler as any,
         isAgent: true, // Mark as an agent
+        hasDynamicParams: hasDynamic,
+        paramNames: paramNames,
       });
       this.logger?.log(`Agent registered: path=${prefix}`);
     }
@@ -730,6 +751,334 @@ export class AiRouter<
     }
     return definition;
   }
+
+  /**
+   * Mount a workflow on the router. Automatically registers endpoints:
+   * - POST /path (start workflow)
+   * - POST /path/signal (send HITL signal)
+   * - GET /path/:id (get status)
+   */
+  useWorkflow<Input, Output>(
+    path: string,
+    workflow: any, // CreatedWorkflow<Input, Output>
+    options?: {
+      exposeAsTool?: boolean;
+    }
+  ): this {
+    const workflowId = workflow.id;
+    const version = workflow.version || '1.0';
+    
+    if (!workflow.workflowFn) {
+      throw new Error(
+        '[ai-router][workflow] Workflow must have a `workflowFn` property. ' +
+          'Use `createWorkflow({ ..., workflowFn })` with a `"use workflow"` function.',
+      );
+    }
+    
+    if (!this._workflowRegistry.has(workflowId)) {
+      this._workflowRegistry.set(workflowId, new Map());
+    }
+    this._workflowRegistry.get(workflowId)!.set(version, workflow);
+    
+    let adapterModule: any;
+    try {
+      // Lazy require to avoid hard dependency for consumers that
+      // don't use workflows.
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      adapterModule = require('./workflow/runtimeAdapter.js');
+    } catch (e) {
+      throw new Error(
+        '[ai-router][workflow] Workflow adapter not available. ' +
+          'Make sure `./workflow/runtimeAdapter` is built and that ' +
+          'you are using a version of @microfox/ai-router that ' +
+          'exports workflow support.',
+      );
+    }
+
+    const adapter = adapterModule.defaultWorkflowAdapter as any;
+
+    // Start endpoint: POST /path
+    this.agent(path, async (ctx) => {
+      try {
+        const rawInput =
+          (ctx.request as any).input ?? (ctx.request as any).params?.input;
+        
+        if (!rawInput) {
+          throw new Error('Workflow input is required');
+        }
+
+        const validatedInput = workflow.inputSchema.parse(rawInput);
+
+        const result = await adapter.startWorkflow(
+          workflow,
+          validatedInput,
+        );
+
+        // Write as a tool-style response so that toAwaitResponse clients
+        // receive a non-empty array of messages with parts/output.
+        ctx.response.writeCustomTool({
+          toolName: workflowId,
+          output: {
+            runId: result.instanceId,
+            status: result.status,
+            result: result.result,
+          },
+        });
+      } catch (error: any) {
+        // Always write error to stream so response is never empty
+        ctx.response.writeCustomTool({
+          toolName: workflowId,
+          output: {
+            error: error?.message || String(error),
+            status: 'error',
+          },
+        });
+        throw error; // Re-throw so it's logged
+      }
+    });
+
+    // Signal endpoint: POST /path/signal
+    // Register BEFORE status endpoint to avoid matching /path/signal as /path/:id
+    // Only requires token and payload - no need for instanceId since token identifies the hook
+    this.agent(`${path}/signal`, async (ctx) => {
+      try {
+        // Extract token and payload from request
+        // HTTP POST requests: body is spread directly, so { token: string, payload: {...} } becomes ctx.request.token/payload
+        // Internal calls: might be in ctx.request.input.token/payload, ctx.request.params.token/payload
+        let token: string | undefined;
+        let payload: any;
+        
+        // Check direct properties (HTTP requests send { token: string, payload: {...} } as body)
+        if ((ctx.request as any).token !== undefined) {
+          token = (ctx.request as any).token;
+        }
+        if ((ctx.request as any).payload !== undefined) {
+          payload = (ctx.request as any).payload;
+        } 
+        // Check input.token/payload (for wrapped input)
+        else if ((ctx.request as any).input) {
+          token = token || (ctx.request as any).input?.token;
+          payload = payload || (ctx.request as any).input?.payload;
+        }
+        // Check params.token/payload (for internal calls via params)
+        if ((ctx.request.params as any).token) {
+          token = token || (ctx.request.params as any).token;
+        }
+        if ((ctx.request.params as any).payload) {
+          payload = payload || (ctx.request.params as any).payload;
+        }
+        // If payload not found but input exists and isn't an object with token/payload, use input as payload
+        if (payload === undefined && (ctx.request as any).input !== undefined && (ctx.request as any).input !== null) {
+          const input = (ctx.request as any).input;
+          if (!input.token && !input.payload) {
+            payload = input;
+          }
+        }
+
+        if (!token) {
+          throw new Error(
+            'Hook token is required. Provide it in the request body as { token: string, payload: {...} }. ' +
+            'For deterministic tokens, construct it from workflow input (e.g., "research-approval:${topic}:${email}").',
+          );
+        }
+
+        if (payload === undefined || payload === null) {
+          throw new Error('Signal payload is required');
+        }
+
+        let resumeResult: any;
+
+        // Resume hook with token and payload
+        // The workflow runtime's resumeHook API will find the correct workflow instance using the token
+        // When a hook is resumed, the workflow should continue from where it paused
+        try {
+          resumeResult = await adapter.resumeHook(token, payload);
+        } catch (error: any) {
+          // If hook resume fails, try webhook resume as fallback
+          try {
+            resumeResult = await adapter.resumeWebhook(token, payload);
+          } catch (webhookError: any) {
+            // If both fail, throw the original hook error with helpful message
+            throw new Error(
+              `Failed to resume workflow hook/webhook: ${error?.message || String(error)}. ` +
+              `Make sure the token is correct and the workflow is waiting for a signal.`,
+            );
+          }
+        }
+
+        const output = {
+          status: resumeResult.status || 'resumed',
+          result: resumeResult.result,
+          error: resumeResult.error,
+        };
+
+        ctx.response.writeCustomTool({
+          toolName: workflowId,
+          output,
+        });
+
+        return output;
+      } catch (error: any) {
+        // Always write error to stream so response is never empty
+        const errorOutput = {
+          error: error?.message || String(error),
+          status: 'error',
+        };
+        ctx.response.writeCustomTool({
+          toolName: workflowId,
+          output: errorOutput,
+        });
+        throw error; // Re-throw so it's logged
+      }
+    });
+
+    // Status endpoint: GET /path/:id
+    // Register AFTER signal endpoint to avoid matching /path/signal as /path/:id
+    this.agent(`${path}/:id`, async (ctx) => {
+      try {
+        const instanceId = ctx.request.params.id as string;
+        
+        // Handle "signal" case - forward to signal endpoint logic
+        if (instanceId === 'signal') {
+          // Extract token and payload from request (same as signal endpoint)
+          let token: string | undefined;
+          let payload: any;
+          
+          // Check direct properties (HTTP requests send { token: string, payload: {...} } as body)
+          if ((ctx.request as any).token !== undefined) {
+            token = (ctx.request as any).token;
+          }
+          if ((ctx.request as any).payload !== undefined) {
+            payload = (ctx.request as any).payload;
+          } 
+          // Check input.token/payload (for wrapped input)
+          else if ((ctx.request as any).input) {
+            token = token || (ctx.request as any).input?.token;
+            payload = payload || (ctx.request as any).input?.payload;
+          }
+          // Check params.token/payload (for internal calls via params)
+          if ((ctx.request.params as any).token) {
+            token = token || (ctx.request.params as any).token;
+          }
+          if ((ctx.request.params as any).payload) {
+            payload = payload || (ctx.request.params as any).payload;
+          }
+          // If payload not found but input exists and isn't an object with token/payload, use input as payload
+          if (payload === undefined && (ctx.request as any).input !== undefined && (ctx.request as any).input !== null) {
+            const input = (ctx.request as any).input;
+            if (!input.token && !input.payload) {
+              payload = input;
+            }
+          }
+
+          if (!token) {
+            throw new Error(
+              'Hook token is required. Provide it in the request body as { token: string, payload: {...} }. ' +
+              'For deterministic tokens, construct it from workflow input (e.g., "research-approval:${topic}:${email}").',
+            );
+          }
+
+          if (payload === undefined || payload === null) {
+            throw new Error('Signal payload is required');
+          }
+
+          let resumeResult: any;
+
+          // Resume hook with token and payload
+          try {
+            resumeResult = await adapter.resumeHook(token, payload);
+          } catch (error: any) {
+            // If hook resume fails, try webhook resume as fallback
+            try {
+              resumeResult = await adapter.resumeWebhook(token, payload);
+            } catch (webhookError: any) {
+              // If both fail, throw the original hook error with helpful message
+              throw new Error(
+                `Failed to resume workflow hook/webhook: ${error?.message || String(error)}. ` +
+                `Make sure the token is correct and the workflow is waiting for a signal.`,
+              );
+            }
+          }
+
+          const output = {
+            status: resumeResult.status || 'resumed',
+            result: resumeResult.result,
+            error: resumeResult.error,
+          };
+
+          ctx.response.writeCustomTool({
+            toolName: workflowId,
+            output,
+          });
+
+          return output;
+        }
+        
+        if (!instanceId) {
+          throw new Error('Workflow instance ID is required');
+        }
+
+        const statusResult = await adapter.getWorkflowStatus(
+          workflow,
+          instanceId,
+        );
+
+        const output = {
+          runId: instanceId,
+          status: statusResult.status,
+          result: statusResult.result,
+          error: statusResult.error,
+          hook: statusResult.hook,
+          webhook: statusResult.webhook,
+        };
+
+        ctx.response.writeCustomTool({
+          toolName: workflowId,
+          output,
+        });
+
+        return output;
+      } catch (error: any) {
+        // Always write error to stream so response is never empty
+        const errorOutput = {
+          error: error?.message || String(error),
+          status: 'error',
+        };
+        ctx.response.writeCustomTool({
+          toolName: workflowId,
+          output: errorOutput,
+        });
+        throw error; // Re-throw so it's logged
+      }
+    });
+
+    // Optionally expose as tool
+    if (options?.exposeAsTool) {
+      this.actAsTool(path, {
+        id: workflowId,
+        name: workflowId,
+        description: `Workflow: ${workflowId}`,
+        inputSchema: workflow.inputSchema,
+        outputSchema: z.object({
+          runId: z.string(),
+          status: z.string(),
+          result: workflow.outputSchema || z.any().optional(),
+        }),
+        execute: async (input: Input) => {
+          const result = await adapter.startWorkflow(workflow, input);
+          return {
+            runId: result.instanceId,
+            status: result.status,
+            result: result.result,
+          };
+        },
+      } as any);
+    }
+    
+    this.logger?.log(`[useWorkflow] Registered workflow: ${workflowId} v${version} at ${path}`);
+    return this;
+  }
+
 
   /**
    * Outputs all registered paths, and the middlewares and agents registered on each path.
@@ -977,14 +1326,28 @@ export class AiRouter<
 
           const isExactMatch = normalizedPath === normalizedLayerPath;
 
-          if (isInternalCall) {
+          // Check for dynamic parameters in the layer path
+          const hasDynamic = hasDynamicParams(normalizedLayerPath);
+          
+          if (hasDynamic) {
+            // Use extractPathParams to check if the path matches the pattern
+            const extractedParams = extractPathParams(normalizedLayerPath, normalizedPath);
+            if (extractedParams !== null) {
+              shouldRun = true;
+              // Merge extracted params into ctx.request.params
+              ctx.request.params = {
+                ...ctx.request.params,
+                ...extractedParams,
+              };
+            }
+          } else if (isInternalCall) {
             // --- Internal Call Logic ---
             // For internal calls, we only consider exact matches for all layer types.
             shouldRun = isExactMatch;
           } else {
             // --- External Call Logic ---
             if (layer.isAgent) {
-              // Agents are only matched exactly.
+              // Agents are only matched exactly (or by dynamic params, handled above).
               shouldRun = isExactMatch;
             } else {
               // Middlewares are matched by prefix.
@@ -1592,6 +1955,101 @@ class NextHandler<
         absolutePath: resolvedPath,
       },
     } as AgentTool<any, any>;
+  }
+
+  /**
+   * Start a workflow and return immediately with the runId.
+   * Workflows are long-running and status polling should be handled client-side
+   * via the status endpoint (GET /path/:id).
+   */
+  async callWorkflow(
+    workflowPath: string,
+    input: any,
+    options?: {
+      streamToUI?: boolean;
+    }
+  ): Promise<
+    | { ok: true; data: { runId: string; status: string; result?: any } }
+    | { ok: false; error: Error }
+  > {
+    this.onExecutionStart();
+    try {
+      const parentPath = this.ctx.executionContext.currentPath || '/';
+      const resolvedPath = (this.router as any)._resolvePath(
+        parentPath,
+        workflowPath
+      );
+
+      this.ctx.logger.log(`Calling workflow: resolvedPath='${resolvedPath}'`);
+
+      // Find the workflow in the registry
+      let workflow: any = null;
+      for (const [workflowId, versionMap] of (this.router as any)._workflowRegistry) {
+        for (const [version, wf] of versionMap) {
+          // Check if the path matches (could be exact match or we need to check registered paths)
+          // In practice, workflows are registered at specific paths via useWorkflow
+          if (resolvedPath.includes(workflowId) || resolvedPath === workflowId) {
+            workflow = wf;
+            break;
+          }
+        }
+        if (workflow) break;
+      }
+
+      if (!workflow) {
+        // Try to call it as an agent (workflows are registered as agents)
+        // This will call the start endpoint
+        const agentResult = await this.callAgent(resolvedPath, input, options);
+        if (!agentResult.ok) {
+          return agentResult;
+        }
+
+        // Extract runId from the response
+        const output = agentResult.data;
+        const runId = (output as any).runId || (output as any).instanceId;
+
+        if (!runId) {
+          throw new Error('Workflow start did not return a runId');
+        }
+
+        return {
+          ok: true,
+          data: {
+            runId,
+            status: (output as any).status || 'started',
+            result: (output as any).result,
+          },
+        };
+      }
+
+      // If we found the workflow directly, start it via adapter
+      let adapterModule: any;
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        adapterModule = require('./workflow/runtimeAdapter.js');
+      } catch (e) {
+        throw new Error(
+          '[ai-router][workflow] Workflow adapter not available.',
+        );
+      }
+
+      const adapter = adapterModule.defaultWorkflowAdapter as any;
+      const result = await adapter.startWorkflow(workflow, input);
+
+      return {
+        ok: true,
+        data: {
+          runId: result.instanceId,
+          status: result.status,
+          result: result.result,
+        },
+      };
+    } catch (error: any) {
+      this.ctx.logger.error(`[callWorkflow] Error:`, error);
+      return { ok: false, error };
+    } finally {
+      this.onExecutionEnd();
+    }
   }
 }
 

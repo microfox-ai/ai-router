@@ -1,0 +1,51 @@
+{
+  "name": "@microfox/ai-worker-cli",
+  "version": "0.1.0",
+  "description": "CLI tooling for deploying ai-router background workers",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "type": "module",
+  "bin": {
+    "ai-bg": "./dist/index.js",
+    "ai-worker": "./dist/index.js"
+  },
+  "files": [
+    "dist/**/*",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "build:watch": "tsup --watch",
+    "clean": "rm -rf dist",
+    "dev": "tsup --watch",
+    "prepare": "npm run build",
+    "lint": "eslint . --ext .ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@microfox/ai-worker": "*",
+    "@aws-sdk/client-sqs": "^3.700.0",
+    "chalk": "^5.3.0",
+    "commander": "^12.0.0",
+    "esbuild": "^0.25.10",
+    "glob": "^10.3.10",
+    "js-yaml": "^4.1.0",
+    "ora": "^8.0.1"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^20.11.24",
+    "tsup": "^8.0.2",
+    "typescript": "^5.3.3"
+  },
+  "peerDependencies": {
+    "serverless": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

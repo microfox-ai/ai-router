@@ -30,6 +30,11 @@
       "import": "./dist/workflow.mjs",
       "require": "./dist/workflow.js"
     },
+    "./workflow/orchestrate": {
+      "types": "./dist/workflow/orchestrate.d.ts",
+      "import": "./dist/workflow/orchestrate.mjs",
+      "require": "./dist/workflow/orchestrate.js"
+    },
     "./fs_store": {
       "types": "./dist/fs_store.d.ts",
       "import": "./dist/fs_store.mjs",

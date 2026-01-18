@@ -16,15 +16,18 @@ export const systemAgent = aiRouter
     inputSchema: z.object({}),
     execute: async () => ({ result: new Date().toLocaleDateString() }),
     metadata: {
-      hideUI: true,
+      hideUI: false, // Set to false so return value is written to stream for workflow steps
     },
   })
   .agent('/current_time', async (ctx) => {
     const { format } = ctx.request.params;
+    ctx.response.write({ type: 'data-start', data: 'Getting current time...' });
+    const currentTime = new Date().toLocaleTimeString('en-US', {
+      hour12: format === '12h',
+    })
+    ctx.response.write({ type: 'data-end', data: `${currentTime}` });
     return {
-      result: new Date().toLocaleTimeString('en-US', {
-        hour12: format === '12h',
-      }),
+      result: currentTime,
     };
   })
   .actAsTool('/current_time', {

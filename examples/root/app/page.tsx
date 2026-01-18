@@ -45,11 +45,16 @@ export default function Homepage() {
 
         {/* Action Buttons */}
         <div className="flex flex-col sm:flex-row gap-4 justify-center mb-12">
-
           <Button asChild size="lg">
             <Link href="/studio">
               <Zap className="w-4 h-4 mr-2" />
               Try it in Chat Studio
+            </Link>
+          </Button>
+          <Button asChild size="lg" variant="outline">
+            <Link href="/workflows">
+              <PyramidIcon className="w-4 h-4 mr-2" />
+              Test Workflows
             </Link>
           </Button>
         </div>

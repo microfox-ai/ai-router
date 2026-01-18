@@ -12,6 +12,87 @@ export * from './handler.js';
 export * from './config.js';
 
 /**
+ * Schedule event configuration for a worker.
+ * Supports both simple rate/cron strings and full configuration objects.
+ * 
+ * @example Simple rate/cron
+ * ```typescript
+ * schedule: 'rate(2 hours)'
+ * // or
+ * schedule: 'cron(0 12 * * ? *)'
+ * ```
+ * 
+ * @example Full configuration
+ * ```typescript
+ * schedule: {
+ *   rate: 'rate(10 minutes)',
+ *   enabled: true,
+ *   input: { key1: 'value1' }
+ * }
+ * ```
+ * 
+ * @example Multiple schedules
+ * ```typescript
+ * schedule: [
+ *   'rate(2 hours)',
+ *   { rate: 'cron(0 12 * * ? *)', enabled: false }
+ * ]
+ * ```
+ */
+export interface ScheduleEventConfig {
+  /**
+   * Schedule rate using either rate() or cron() syntax.
+   * Can be a string or array of strings for multiple schedules.
+   * 
+   * @example 'rate(2 hours)' or 'cron(0 12 * * ? *)'
+   * @example ['cron(0 0/4 ? * MON-FRI *)', 'cron(0 2 ? * SAT-SUN *)']
+   */
+  rate: string | string[];
+  /**
+   * Whether the schedule is enabled (default: true).
+   */
+  enabled?: boolean;
+  /**
+   * Input payload to pass to the function.
+   */
+  input?: Record<string, any>;
+  /**
+   * JSONPath expression to select part of the event data as input.
+   */
+  inputPath?: string;
+  /**
+   * Input transformer configuration for custom input mapping.
+   */
+  inputTransformer?: {
+    inputPathsMap?: Record<string, string>;
+    inputTemplate?: string;
+  };
+  /**
+   * Name of the schedule event.
+   */
+  name?: string;
+  /**
+   * Description of the schedule event.
+   */
+  description?: string;
+  /**
+   * Method to use: 'eventBus' (default) or 'scheduler'.
+   * Use 'scheduler' for higher limits (1M events vs 300).
+   */
+  method?: 'eventBus' | 'scheduler';
+  /**
+   * Timezone for the schedule (only used with method: 'scheduler').
+   * @example 'America/New_York'
+   */
+  timezone?: string;
+}
+
+export type ScheduleConfig = 
+  | string 
+  | ScheduleEventConfig 
+  | (string | ScheduleEventConfig)[];
+
+/**
  * Configuration for a worker's Lambda function deployment.
  * 
  * **Best Practice**: Export this as a separate const from your worker file:
@@ -20,6 +101,7 @@ export * from './config.js';
  *   timeout: 900,
  *   memorySize: 2048,
  *   layers: ['arn:aws:lambda:${aws:region}:${aws:accountId}:layer:ffmpeg:1'],
+ *   schedule: 'rate(2 hours)',
  * };
  * ```
  * 
@@ -44,6 +126,34 @@ export interface WorkerConfig {
    *   layers: ['arn:aws:lambda:${aws:region}:${aws:accountId}:layer:ffmpeg:1']
    */
   layers?: string[];
+  /**
+   * Schedule events configuration for this worker.
+   * Allows multiple schedule events to be attached to the same function.
+   * 
+   * @example Simple rate
+   * ```typescript
+   * schedule: 'rate(2 hours)'
+   * ```
+   * 
+   * @example Multiple schedules
+   * ```typescript
+   * schedule: [
+   *   'rate(2 hours)',
+   *   { rate: 'cron(0 12 * * ? *)', enabled: true, input: { key: 'value' } }
+   * ]
+   * ```
+   * 
+   * @example Using scheduler method with timezone
+   * ```typescript
+   * schedule: {
+   *   method: 'scheduler',
+   *   rate: 'cron(0 0/4 ? * MON-FRI *)',
+   *   timezone: 'America/New_York',
+   *   input: { key1: 'value1' }
+   * }
+   * ```
+   */
+  schedule?: ScheduleConfig;
 }
 
 export interface WorkerAgentConfig<INPUT_SCHEMA extends ZodType<any>, OUTPUT> {

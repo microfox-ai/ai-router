@@ -81,7 +81,7 @@
     "tailwind-merge": "^3.3.1",
     "unified": "^11.0.5",
     "vaul": "^1.1.2",
-    "workflow": "^4.0.1-beta.35",
+    "workflow": "^4.0.1-beta.41",
     "zod": "^4.1.11"
   },
   "devDependencies": {

@@ -17,7 +17,7 @@ import { onlyTextParts } from './middlewares/onlyTextParts';
 const aiRouter = new AiRouter(undefined, undefined);
 // aiRouter.setLogger(console);
 
-import { aiWorkflowRouter as workflowRouter } from './agents/workflows/shared';
+// import { aiWorkflowRouter as workflowRouter } from './agents/workflows/shared';
 
 const aiMainRouter = aiRouter
   .agent('/system', systemAgent)
@@ -25,7 +25,7 @@ const aiMainRouter = aiRouter
   .agent('/research', braveResearchAgent)
   .agent('/thinker', thinkerAgent)
   // Mount workflow router as sub-router
-  .agent('/workflows', workflowRouter)
+  // .agent('/workflows', workflowRouter)
   .before('/', contextLimiter(5))
   .before('/', onlyTextParts(100))
   .agent('/', async (props: any) => {

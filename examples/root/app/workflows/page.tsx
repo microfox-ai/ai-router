@@ -20,6 +20,43 @@ export default function WorkflowsPage() {
       </div>
 
       <div className="grid md:grid-cols-2 gap-6">
+        {/* Orchestration Workflow */}
+        <Card>
+          <CardHeader>
+            <div className="flex items-center justify-between">
+              <CardTitle className="flex items-center gap-2">
+                <Workflow className="w-5 h-5" />
+                Orchestration Workflow
+              </CardTitle>
+              <Badge variant="secondary">New</Badge>
+            </div>
+            <CardDescription>
+              Multi-agent orchestration with sequential steps, sleep, and HITL hooks
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="space-y-2">
+              <p className="text-sm text-muted-foreground">
+                <strong>Steps:</strong>
+              </p>
+              <ul className="text-sm space-y-1 list-disc list-inside text-muted-foreground">
+                <li>Call agent (get current date)</li>
+                <li>Sleep for 2 seconds</li>
+                <li>Wait for approval (HITL)</li>
+                <li>Call agent again (get date after approval)</li>
+              </ul>
+            </div>
+            <div className="flex gap-2">
+              <Button asChild>
+                <Link href="/workflows/orchestrate">
+                  <Zap className="w-4 h-4 mr-2" />
+                  Test Orchestration
+                </Link>
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+
         {/* Research Workflow */}
         <Card>
           <CardHeader>

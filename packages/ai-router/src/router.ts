@@ -398,7 +398,7 @@ export class AiRouter<
   private logger?: AiLogger = undefined;
   private _store: Store = new MemoryStore();
   // Workflow registry: Map<workflowId, Map<version, CreatedWorkflow>>
-  private _workflowRegistry: Map<string, Map<string, any>> = new Map();
+  // private _workflowRegistry: Map<string, Map<string, any>> = new Map();
 
   /** Configuration options for the router instance. */
   public options: {
@@ -512,14 +512,14 @@ export class AiRouter<
             this.actAsToolDefinitions.set(newKey, value);
           });
           // Mount workflow registry from the sub-router
-          router._workflowRegistry.forEach((versionMap, workflowId) => {
-            if (!this._workflowRegistry.has(workflowId)) {
-              this._workflowRegistry.set(workflowId, new Map());
-            }
-            versionMap.forEach((workflow, version) => {
-              this._workflowRegistry.get(workflowId)!.set(version, workflow);
-            });
-          });
+          // router._workflowRegistry.forEach((versionMap, workflowId) => {
+          //   if (!this._workflowRegistry.has(workflowId)) {
+          //     this._workflowRegistry.set(workflowId, new Map());
+          //   }
+          //   versionMap.forEach((workflow, version) => {
+          //     this._workflowRegistry.get(workflowId)!.set(version, workflow);
+          //   });
+          // });
         }
         continue;
       }
@@ -758,6 +758,7 @@ export class AiRouter<
    * - POST /path/signal (send HITL signal)
    * - GET /path/:id (get status)
    */
+  /* COMMENTED OUT - Workflows now handled via API routes
   useWorkflow<Input, Output>(
     path: string,
     workflow: any, // CreatedWorkflow<Input, Output>
@@ -1078,6 +1079,7 @@ export class AiRouter<
     this.logger?.log(`[useWorkflow] Registered workflow: ${workflowId} v${version} at ${path}`);
     return this;
   }
+  */
 
 
   /**
@@ -1958,7 +1960,7 @@ class NextHandler<
   }
 
   /**
-   * Start a workflow and return immediately with the runId.
+   * Start a workflow via API route and return immediately with the runId.
    * Workflows are long-running and status polling should be handled client-side
    * via the status endpoint (GET /path/:id).
    */
@@ -1967,6 +1969,8 @@ class NextHandler<
     input: any,
     options?: {
       streamToUI?: boolean;
+      baseUrl?: string;
+      messages?: any[];
     }
   ): Promise<
     | { ok: true; data: { runId: string; status: string; result?: any } }
@@ -1982,70 +1986,133 @@ class NextHandler<
 
       this.ctx.logger.log(`Calling workflow: resolvedPath='${resolvedPath}'`);
 
-      // Find the workflow in the registry
-      let workflow: any = null;
-      for (const [workflowId, versionMap] of (this.router as any)._workflowRegistry) {
-        for (const [version, wf] of versionMap) {
-          // Check if the path matches (could be exact match or we need to check registered paths)
-          // In practice, workflows are registered at specific paths via useWorkflow
-          if (resolvedPath.includes(workflowId) || resolvedPath === workflowId) {
-            workflow = wf;
-            break;
-          }
-        }
-        if (workflow) break;
-      }
+      // Construct the workflow API URL
+      // Default to /api/studio/workflow/agent if baseUrl not provided
+      const baseUrl = options?.baseUrl || '';
+      const workflowApiPath = baseUrl 
+        ? `${baseUrl}/api/studio/workflow/agent${resolvedPath.startsWith('/') ? resolvedPath : '/' + resolvedPath}`
+        : `/api/studio/workflow/agent${resolvedPath.startsWith('/') ? resolvedPath : '/' + resolvedPath}`;
 
-      if (!workflow) {
-        // Try to call it as an agent (workflows are registered as agents)
-        // This will call the start endpoint
-        const agentResult = await this.callAgent(resolvedPath, input, options);
-        if (!agentResult.ok) {
-          return agentResult;
-        }
+      // Make HTTP POST request to the workflow API route
+      const response = await fetch(workflowApiPath, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          input,
+          messages: options?.messages || this.ctx.request.messages || [],
+        }),
+      });
 
-        // Extract runId from the response
-        const output = agentResult.data;
-        const runId = (output as any).runId || (output as any).instanceId;
-
-        if (!runId) {
-          throw new Error('Workflow start did not return a runId');
-        }
-
-        return {
-          ok: true,
-          data: {
-            runId,
-            status: (output as any).status || 'started',
-            result: (output as any).result,
-          },
-        };
-      }
-
-      // If we found the workflow directly, start it via adapter
-      let adapterModule: any;
-      try {
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        adapterModule = require('./workflow/runtimeAdapter.js');
-      } catch (e) {
+      if (!response.ok) {
+        const errorText = await response.text();
         throw new Error(
-          '[ai-router][workflow] Workflow adapter not available.',
+          `Workflow API call failed: ${response.status} ${response.statusText}. ${errorText}`
         );
       }
 
-      const adapter = adapterModule.defaultWorkflowAdapter as any;
-      const result = await adapter.startWorkflow(workflow, input);
+      const result = await response.json();
+
+      if (result.error) {
+        throw new Error(result.error);
+      }
+
+      if (options?.streamToUI) {
+        this.ctx.response.writeCustomTool({
+          toolName: resolvedPath,
+          output: result,
+        });
+      }
 
       return {
         ok: true,
         data: {
-          runId: result.instanceId,
+          runId: result.runId,
           status: result.status,
           result: result.result,
         },
       };
     } catch (error: any) {
       this.ctx.logger.error(`[callWorkflow] Error:`, error);
+      return { ok: false, error };
+    } finally {
+      this.onExecutionEnd();
+    }
+  }
+
+  /**
+   * Orchestrate multiple agents with steps, hooks, conditions, and data flow.
+   * Returns immediately with runId for tracking progress.
+   * 
+   * @param config - Orchestration configuration with steps, hooks, conditions, etc.
+   * @param options - Optional configuration for baseUrl, messages, and streaming
+   * @returns Promise with runId and status, or error
+   */
+  async orchestrate(
+    config: any, // OrchestrationConfig from workflow/orchestrate
+    options?: {
+      streamToUI?: boolean;
+      baseUrl?: string;
+      messages?: any[];
+    }
+  ): Promise<
+    | { ok: true; data: { runId: string; status: string; result?: any } }
+    | { ok: false; error: Error }
+  > {
+    this.onExecutionStart();
+    try {
+      this.ctx.logger.log(`Orchestrating workflow with ${config.steps?.length || 0} steps`);
+
+      // Construct the orchestration API URL
+      const baseUrl = options?.baseUrl || '';
+      const orchestrateApiPath = baseUrl 
+        ? `${baseUrl}/api/studio/workflow/orchestrate`
+        : `/api/studio/workflow/orchestrate`;
+
+      // Make HTTP POST request to the orchestration API route
+      const response = await fetch(orchestrateApiPath, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          config,
+          messages: options?.messages || this.ctx.request.messages || [],
+          input: config.input,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(
+          `Orchestration API call failed: ${response.status} ${response.statusText}. ${errorText}`
+        );
+      }
+
+      const result = await response.json();
+
+      if (result.error) {
+        throw new Error(result.error);
+      }
+
+      if (options?.streamToUI) {
+        this.ctx.response.writeCustomTool({
+          toolName: 'orchestrate',
+          output: result,
+        });
+      }
+
+      return {
+        ok: true,
+        data: {
+          runId: result.runId,
+          status: result.status,
+          result: result.result,
+        },
+      };
+    } catch (error: any) {
+      this.ctx.logger.error(`[orchestrate] Error:`, error);
       return { ok: false, error };
     } finally {
       this.onExecutionEnd();

@@ -297,6 +297,7 @@ interface WorkerInfo {
     timeout?: number;
     memorySize?: number;
     layers?: string[];
+    schedule?: any; // Schedule config: string, object, or array of either
   };
 }
 
@@ -1057,6 +1058,94 @@ function loadEnvVars(envPath: string = '.env'): Record<string, string> {
 }
 
 /**
+ * Converts schedule configuration to serverless.yml schedule event format.
+ * Supports simple strings, configuration objects, and arrays of both.
+ */
+function processScheduleEvents(scheduleConfig: any): any[] {
+  if (!scheduleConfig) {
+    return [];
+  }
+
+  const events: any[] = [];
+
+  // Normalize to array
+  const schedules = Array.isArray(scheduleConfig) ? scheduleConfig : [scheduleConfig];
+
+  for (const schedule of schedules) {
+    // Simple string format: 'rate(2 hours)' or 'cron(0 12 * * ? *)'
+    if (typeof schedule === 'string') {
+      events.push({
+        schedule: schedule,
+      });
+      continue;
+    }
+
+    // Full configuration object
+    if (typeof schedule === 'object' && schedule !== null) {
+      const scheduleEvent: any = { schedule: {} };
+
+      // Handle rate - can be string or array of strings
+      if (schedule.rate) {
+        if (Array.isArray(schedule.rate)) {
+          // Multiple rate expressions
+          scheduleEvent.schedule.rate = schedule.rate;
+        } else {
+          // Single rate expression
+          scheduleEvent.schedule.rate = schedule.rate;
+        }
+      } else {
+        // If no rate specified but we have a schedule object, skip it
+        continue;
+      }
+
+      // Optional fields
+      if (schedule.enabled !== undefined) {
+        scheduleEvent.schedule.enabled = schedule.enabled;
+      }
+      if (schedule.input !== undefined) {
+        scheduleEvent.schedule.input = schedule.input;
+      }
+      if (schedule.inputPath !== undefined) {
+        scheduleEvent.schedule.inputPath = schedule.inputPath;
+      }
+      if (schedule.inputTransformer !== undefined) {
+        scheduleEvent.schedule.inputTransformer = schedule.inputTransformer;
+      }
+      if (schedule.name !== undefined) {
+        scheduleEvent.schedule.name = schedule.name;
+      }
+      if (schedule.description !== undefined) {
+        scheduleEvent.schedule.description = schedule.description;
+      }
+      if (schedule.method !== undefined) {
+        scheduleEvent.schedule.method = schedule.method;
+      }
+      if (schedule.timezone !== undefined) {
+        scheduleEvent.schedule.timezone = schedule.timezone;
+      }
+
+      // If schedule object only has rate (or is minimal), we can simplify it
+      // Serverless Framework accepts both { schedule: 'rate(...)' } and { schedule: { rate: 'rate(...)' } }
+      if (Object.keys(scheduleEvent.schedule).length === 1 && scheduleEvent.schedule.rate) {
+        // Simplify to string format if it's just a single rate
+        if (typeof scheduleEvent.schedule.rate === 'string') {
+          events.push({
+            schedule: scheduleEvent.schedule.rate,
+          });
+        } else {
+          // Keep object format for arrays
+          events.push(scheduleEvent);
+        }
+      } else {
+        events.push(scheduleEvent);
+      }
+    }
+  }
+
+  return events;
+}
+
+/**
  * Generates serverless.yml configuration.
  */
 function generateServerlessConfig(
@@ -1128,19 +1217,28 @@ function generateServerlessConfig(
   for (const worker of workers) {
     const functionName = `worker${worker.id.replace(/[^a-zA-Z0-9]/g, '')}`;
 
+    // Start with SQS event (default)
+    const events: any[] = [
+      {
+        sqs: {
+          arn: { 'Fn::GetAtt': [`WorkerQueue${worker.id.replace(/[^a-zA-Z0-9]/g, '')}${stage}`, 'Arn'] },
+          batchSize: 1,
+        },
+      },
+    ];
+
+    // Add schedule events if configured
+    if (worker.workerConfig?.schedule) {
+      const scheduleEvents = processScheduleEvents(worker.workerConfig.schedule);
+      events.push(...scheduleEvents);
+    }
+
     functions[functionName] = {
       // IMPORTANT: Keep AWS handler string to exactly one dot: "<modulePath>.handler"
       handler: `${worker.handlerPath}.handler`,
       timeout: worker.workerConfig?.timeout || 300,
       memorySize: worker.workerConfig?.memorySize || 512,
-      events: [
-        {
-          sqs: {
-            arn: { 'Fn::GetAtt': [`WorkerQueue${worker.id.replace(/[^a-zA-Z0-9]/g, '')}${stage}`, 'Arn'] },
-            batchSize: 1,
-          },
-        },
-      ],
+      events,
     };
 
     if (worker.workerConfig?.layers?.length) {
@@ -1508,10 +1606,13 @@ async function build(args: any) {
 
               // Use Function constructor to parse the object (safer than eval)
               const configObj = new Function('return ' + configStr)();
-              if (configObj && (configObj.layers || configObj.timeout || configObj.memorySize)) {
+              if (configObj && (configObj.layers || configObj.timeout || configObj.memorySize || configObj.schedule)) {
                 worker.workerConfig = configObj;
                 if (configObj.layers?.length) {
                   console.log(chalk.gray(`  ✓ ${worker.id}: found ${configObj.layers.length} layer(s) from source file`));
+                }
+                if (configObj.schedule) {
+                  console.log(chalk.gray(`  ✓ ${worker.id}: found schedule configuration`));
                 }
               }
             }

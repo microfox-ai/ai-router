@@ -7,8 +7,8 @@
   "types": "./dist/index.d.ts",
   "type": "module",
   "bin": {
-    "ai-bg": "./dist/index.js",
-    "ai-worker": "./dist/index.js"
+    "ai-bg": "dist/index.js",
+    "ai-worker": "dist/index.js"
   },
   "files": [
     "dist/**/*",

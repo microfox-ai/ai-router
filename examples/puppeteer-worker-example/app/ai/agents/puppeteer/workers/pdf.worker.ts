@@ -43,6 +43,20 @@ type Output = z.infer<typeof OutputSchema>;
 export const workerConfig: WorkerConfig = {
   timeout: 300, // 5 minutes
   memorySize: 1024, // 1GB
+//   schedule: [{
+//     method: 'scheduler',
+//     rate: ['cron(0 0/4 ? * MON-FRI *)'],
+//     timezone: 'America/New_York',
+//     input: { key1: 'value1' }
+//   },
+//   {
+//     rate: 'rate(10 minutes)',
+//     enabled: true,
+//     input: { key1: 'value1', key2: 'value2' }
+//   },
+//   'rate(2 hours)',
+//   { rate: 'cron(0 12 * * ? *)', enabled: false }
+// ]
 };
 
 export const pdfWorker = createWorker<typeof InputSchema, Output>({

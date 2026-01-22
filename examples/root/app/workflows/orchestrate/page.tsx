@@ -9,6 +9,8 @@ import { Badge } from '@/components/ui/badge';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Textarea } from '@/components/ui/textarea';
 import { Loader2, CheckCircle2, XCircle, Clock, Play, Pause } from 'lucide-react';
+import { createWorkflowClient } from '@microfox/ai-router/workflow';
+import type { OrchestrationConfig } from '@microfox/ai-router';
 
 export default function OrchestrateWorkflowPage() {
   const [topic, setTopic] = useState('');
@@ -33,14 +35,16 @@ export default function OrchestrateWorkflowPage() {
     setRunId(null);
 
     try {
+      const client = createWorkflowClient();
+
       // Create orchestration config
-      const config = {
+      const config: OrchestrationConfig = {
         steps: [
           {
             type: 'agent' as const,
             agent: '/system/current_date',
             id: 'date',
-            input: { format: 'iso', timezone: 'UTC' },
+            input: {},
           },
           {
             type: 'sleep' as const,
@@ -55,7 +59,7 @@ export default function OrchestrateWorkflowPage() {
             type: 'agent' as const,
             agent: '/system/current_date',
             id: 'dateAfterApproval',
-            input: { format: 'iso', timezone: 'UTC' },
+            input: {},
           },
         ],
         input: {
@@ -64,33 +68,16 @@ export default function OrchestrateWorkflowPage() {
         },
       };
 
-      const response = await fetch('/api/studio/workflow/orchestrate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ config }),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Failed to start workflow: ${errorText}`);
-      }
-
-      const data = await response.json();
-
-      if (data.error) {
-        setError(data.error);
-        setStatus('error');
-        return;
-      }
-
+      const data = await client.startOrchestration(config);
       if (data.runId) {
         setRunId(data.runId);
         setStatus(data.status);
 
         // Poll for status if not completed
-        if (data.status !== 'completed' && data.status !== 'failed' && data.status !== 'error') {
+        if (data.status !== 'completed' && data.status !== 'failed') {
           console.log('Polling status for runId:', data.runId);
-          setHookToken(`orchestrate-approval:${userId}:${topic}`)
+          // For Vercel, token is deterministic; for Upstash it will be returned by status.
+          setHookToken(`orchestrate-approval:${userId}:${topic}`);
           pollStatus(data.runId);
         }
       } else {
@@ -105,11 +92,11 @@ export default function OrchestrateWorkflowPage() {
   };
 
   const pollStatus = async (id: string) => {
+    const client = createWorkflowClient();
     const interval = setInterval(async () => {
       try {
-        const response = await fetch(`/api/studio/workflow/status?runId=${id}`);
-        if (response.ok) {
-          const data = await response.json();
+        // Use orchestrate endpoint for status
+        const data = await client.getWorkflowStatus('/orchestrate', id);
 
           if (data.error) {
             setError(data.error);
@@ -139,7 +126,6 @@ export default function OrchestrateWorkflowPage() {
               clearInterval(interval);
             }
           }
-        }
       } catch (err) {
         console.error('Failed to poll status', err);
         clearInterval(interval);
@@ -157,19 +143,12 @@ export default function OrchestrateWorkflowPage() {
     }
 
     try {
-      const response = await fetch('/api/studio/workflow/signal', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          token: hookToken,
-          payload: { decision, timestamp: new Date().toISOString() },
-        }),
+      const client = createWorkflowClient();
+      // Use orchestrate endpoint for signals
+      await client.sendSignal('/orchestrate', hookToken, {
+        decision,
+        timestamp: new Date().toISOString(),
       });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Failed to signal: ${errorText}`);
-      }
 
       // Continue polling
       if (runId) {

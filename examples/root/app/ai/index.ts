@@ -22,7 +22,7 @@ const aiRouter = new AiRouter(undefined, undefined);
 const aiMainRouter = aiRouter
   .agent('/system', systemAgent)
   .agent('/summarize', summarizeAgent)
-  .agent('/research', braveResearchAgent)
+  .agent('/braveResearch', braveResearchAgent)
   .agent('/thinker', thinkerAgent)
   // Mount workflow router as sub-router
   // .agent('/workflows', workflowRouter)
@@ -48,7 +48,7 @@ const aiMainRouter = aiRouter
         // attach the agents you need
         ...props.next.agentAsTool('/thinker'),
         ...props.next.agentAsTool('/summarize'),
-        ...props.next.agentAsTool('/research'),
+        ...props.next.agentAsTool('/braveResearch'),
       },
       toolChoice: 'auto',
       // stop conditions

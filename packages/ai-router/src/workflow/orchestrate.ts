@@ -7,6 +7,7 @@ export interface OrchestrationContext {
   previous: any;                    // Previous step output
   all: any[];                       // All step outputs in order
   runId?: string;                   // Current workflow runId (for token generation)
+  errors?: Array<{ step: number | string; error: any }>; // Errors collected during execution (if continueOnError)
 }
 
 // Agent step (await or fire-and-forget)
@@ -46,13 +47,33 @@ export interface ParallelStep {
   steps: OrchestrationStep[];       // Steps to run in parallel
 }
 
+// Worker step (call a background worker)
+export interface WorkerStep {
+  type: 'worker';
+  worker: string;                   // Worker ID
+  input?: any | ((ctx: OrchestrationContext) => any);  // Input mapping (static or function)
+  await?: boolean;                  // true = blocking (wait for result), false = fire-and-forget (default: false)
+  id?: string;                      // Step ID for referencing output
+}
+
+// Workflow step (call another workflow)
+export interface WorkflowStep {
+  type: 'workflow';
+  workflow: string;                // Workflow ID or path
+  input?: any | ((ctx: OrchestrationContext) => any);  // Input mapping (static or function)
+  await?: boolean;                 // true = blocking (wait for result), false = fire-and-forget (default: true)
+  id?: string;                     // Step ID for referencing output
+}
+
 // Union type for all step types
 export type OrchestrationStep = 
   | AgentStep
   | HookStep
   | SleepStep
   | ConditionStep
-  | ParallelStep;
+  | ParallelStep
+  | WorkerStep
+  | WorkflowStep;
 
 // Main orchestration config
 export interface OrchestrationConfig {
@@ -60,6 +81,9 @@ export interface OrchestrationConfig {
   baseUrl?: string;                 // Base URL for agent calls
   messages?: any[];                 // Initial messages
   input?: any;                      // Initial input (available in context.input)
+  hookTimeout?: string;             // Default hook timeout (e.g., '7d', default: '7d')
+  continueOnError?: boolean;        // Continue execution on step error (default: false, fail-fast)
+  timeout?: string;                 // Global timeout for entire orchestration (e.g., '30m')
 }
 
 // Builder pattern for fluent API
@@ -110,6 +134,36 @@ export class OrchestrationBuilder {
   
   parallel(steps: OrchestrationStep[]): this {
     this.steps.push({ type: 'parallel', steps });
+    return this;
+  }
+  
+  worker(
+    workerId: string,
+    input?: any | ((ctx: OrchestrationContext) => any),
+    options?: { await?: boolean; id?: string }
+  ): this {
+    this.steps.push({
+      type: 'worker',
+      worker: workerId,
+      input,
+      await: options?.await ?? false, // Default to fire-and-forget
+      id: options?.id,
+    });
+    return this;
+  }
+  
+  workflow(
+    workflowId: string,
+    input?: any | ((ctx: OrchestrationContext) => any),
+    options?: { await?: boolean; id?: string }
+  ): this {
+    this.steps.push({
+      type: 'workflow',
+      workflow: workflowId,
+      input,
+      await: options?.await ?? true, // Default to blocking
+      id: options?.id,
+    });
     return this;
   }
   

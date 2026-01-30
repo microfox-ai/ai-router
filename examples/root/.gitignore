@@ -43,3 +43,7 @@ next-env.d.ts
 # AI Studio
 .chat
 .studio
+.serverless-workers
+
+# DEBUG_WORKER: workflow step-order debug files
+.workflows

@@ -1,6 +1,6 @@
 {
   "name": "@microfox/ai-workflow",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Workflow + orchestration primitives for Microfox (runtime-agnostic contracts and Next.js client helpers).",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
@@ -67,4 +67,3 @@
     "orchestration"
   ]
 }
-

@@ -1,7 +1,7 @@
-import { withWorkflow } from "workflow/next"; 
-import type { NextConfig } from "next";
+import type { NextConfig } from 'next';
+import { withWorkflow } from 'workflow/next';
 
-const nextConfig: NextConfig = {
+const baseConfig: NextConfig = {
   /* config options here */
   // Mark workflow-related packages as server-only external packages
   // This prevents Next.js from trying to bundle them for the client
@@ -48,4 +48,7 @@ const nextConfig: NextConfig = {
   },
 };
 
-export default withWorkflow(nextConfig); 
+// Always wrap with withWorkflow (Vercel workflows only)
+const nextConfig = withWorkflow(baseConfig);
+
+export default nextConfig;

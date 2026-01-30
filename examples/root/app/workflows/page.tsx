@@ -140,6 +140,42 @@ export default function WorkflowsPage() {
             </div>
           </CardContent>
         </Card>
+
+        {/* Worker Proof Workflow */}
+        <Card>
+          <CardHeader>
+            <div className="flex items-center justify-between">
+              <CardTitle className="flex items-center gap-2">
+                <Workflow className="w-5 h-5" />
+                Worker Proof (Sequential + Parallel)
+              </CardTitle>
+              <Badge variant="secondary">Proof</Badge>
+            </div>
+            <CardDescription>
+              Await workers sequentially and in parallel, then HITL, then return a timeline proof object.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="space-y-2">
+              <p className="text-sm text-muted-foreground">
+                <strong>What you’ll see:</strong>
+              </p>
+              <ul className="text-sm space-y-1 list-disc list-inside text-muted-foreground">
+                <li>Sequential worker timestamps (seq-2 starts after seq-1 ends)</li>
+                <li>Parallel worker overlap (par-A & par-B overlap)</li>
+                <li>Workflow pauses on a HITL gate before producing proof</li>
+              </ul>
+            </div>
+            <div className="flex gap-2">
+              <Button asChild>
+                <Link href="/workflows/worker-proof">
+                  <Zap className="w-4 h-4 mr-2" />
+                  Run Worker Proof
+                </Link>
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
       </div>
 
       <Card className="mt-8">

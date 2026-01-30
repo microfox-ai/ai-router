@@ -39,12 +39,16 @@ export async function POST(req: NextRequest) {
     : agentFullPath;
 
   const searchParams = req.nextUrl.searchParams;
-  const params: any = {};
+  const paramsFromQuery: any = {};
   searchParams.entries().forEach(([key, value]) => {
-    params[key] = value;
+    paramsFromQuery[key] = value;
   });
+  // Use body.params when provided (e.g. orchestration sends { input, params }); otherwise query only.
+  const params =
+    typeof body?.params === 'object' && body.params !== null
+      ? { ...body.params, ...paramsFromQuery }
+      : paramsFromQuery;
 
-  const { messages, ...restOfBody } = body;
   const lastMessage = body.messages?.[body.messages.length - 1] as UIMessage<{
     revalidatePath?: string;
   }>;

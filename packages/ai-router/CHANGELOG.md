@@ -1,5 +1,11 @@
 # @microfox/ai-router
 
+## 2.1.3
+
+### Patch Changes
+
+- 4d3a677: Triggered by issue #46: release @microfox/ai-router patch
+
 ## 2.1.2
 
 ### Patch Changes

@@ -25,16 +25,6 @@
       "import": "./dist/index.mjs",
       "require": "./dist/index.js"
     },
-    "./workflow": {
-      "types": "./dist/workflow.d.ts",
-      "import": "./dist/workflow.mjs",
-      "require": "./dist/workflow.js"
-    },
-    "./workflow/orchestrate": {
-      "types": "./dist/workflow/orchestrate.d.ts",
-      "import": "./dist/workflow/orchestrate.mjs",
-      "require": "./dist/workflow/orchestrate.js"
-    },
     "./fs_store": {
       "types": "./dist/fs_store.d.ts",
       "import": "./dist/fs_store.mjs",
@@ -47,8 +37,7 @@
     "zod": "^4.1.5"
   },
   "peerDependencies": {
-    "ai": ">=5.0.47",
-    "workflow": "^4.0.1-beta.35"
+    "ai": ">=5.0.47"
   },
   "devDependencies": {
     "@types/node": "^20.14.2",

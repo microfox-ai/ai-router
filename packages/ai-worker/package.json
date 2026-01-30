@@ -42,6 +42,7 @@
     }
   },
   "dependencies": {
+    "mongodb": "^6.12.0",
     "zod": "^4.1.5"
   },
   "peerDependencies": {

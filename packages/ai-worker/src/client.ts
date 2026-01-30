@@ -12,7 +12,7 @@ import type { ZodType, z } from 'zod';
 export interface DispatchOptions {
   /**
    * Optional webhook callback URL to notify when the job finishes.
-   * If omitted, no webhook will be sent.
+   * Only called when provided. Default: no webhook (use job store / MongoDB only).
    */
   webhookUrl?: string;
   /**
@@ -135,7 +135,7 @@ export async function dispatch<INPUT_SCHEMA extends ZodType<any>>(
   // Serialize context (only safe, JSON-compatible parts)
   const serializedContext = ctx ? serializeContext(ctx) : {};
 
-  // Create message body
+  // Job updates use MongoDB only; never pass jobStoreUrl/origin URL.
   const messageBody = {
     workerId,
     jobId,

@@ -298,6 +298,12 @@ interface WorkerInfo {
     memorySize?: number;
     layers?: string[];
     schedule?: any; // Schedule config: string, object, or array of either
+    sqs?: {
+      maxReceiveCount?: number;
+      messageRetentionPeriod?: number;
+      visibilityTimeout?: number;
+      deadLetterMessageRetentionPeriod?: number;
+    };
   };
 }
 
@@ -313,6 +319,7 @@ interface ServerlessConfig {
     runtime: string;
     region: string;
     stage: string;
+    versionFunctions?: boolean;
     environment: Record<string, string | Record<string, any>> | string;
     iam: {
       role: {
@@ -449,23 +456,31 @@ async function generateHandlers(workers: WorkerInfo[], outputDir: string): Promi
     // Normalize slashes for Windows
     relativeImportPath = relativeImportPath.split(path.sep).join('/');
 
-    // Try to detect export name from file content
+    // Detect export: "export default createWorker" vs "export const X = createWorker"
     const fileContent = fs.readFileSync(worker.filePath, 'utf-8');
+    const defaultExport = /export\s+default\s+createWorker/.test(fileContent);
     const exportMatch = fileContent.match(/export\s+(const|let)\s+(\w+)\s*=\s*createWorker/);
     const exportName = exportMatch ? exportMatch[2] : 'worker';
 
     // 1. Create a temporary TS entrypoint
     const tempEntryFile = handlerFile.replace('.js', '.temp.ts');
 
+    const workerRef = defaultExport
+      ? 'workerModule.default'
+      : `workerModule.${exportName}`;
+
     // Try to import workerConfig (new pattern) - it might not exist (old pattern)
     const tempEntryContent = `
 import { createLambdaHandler } from '@microfox/ai-worker/handler';
 import * as workerModule from '${relativeImportPath}';
-const { ${exportName} } = workerModule;
 
-export const handler = createLambdaHandler(${exportName}.handler, ${exportName}.outputSchema);
-// Export workerConfig - prefer exported workerConfig (new pattern) or fall back to worker.workerConfig (old pattern)
-export const exportedWorkerConfig = workerModule.workerConfig || ${exportName}.workerConfig;
+const workerAgent = ${workerRef};
+if (!workerAgent || typeof workerAgent.handler !== 'function') {
+  throw new Error('Worker module must export a createWorker result (default or named) with .handler');
+}
+
+export const handler = createLambdaHandler(workerAgent.handler, workerAgent.outputSchema);
+export const exportedWorkerConfig = workerModule.workerConfig || workerAgent?.workerConfig;
 `;
     fs.writeFileSync(tempEntryFile, tempEntryContent);
 
@@ -1189,14 +1204,46 @@ function generateServerlessConfig(
   for (const worker of workers) {
     const queueName = `WorkerQueue${worker.id.replace(/[^a-zA-Z0-9]/g, '')}`;
     const queueLogicalId = `${queueName}${stage}`;
+    const dlqLogicalId = `${queueName}DLQ${stage}`;
+
+    const sqsCfg = worker.workerConfig?.sqs;
+    const retention =
+      typeof sqsCfg?.messageRetentionPeriod === 'number'
+        ? sqsCfg.messageRetentionPeriod
+        : 1209600; // 14 days
+    const dlqRetention =
+      typeof sqsCfg?.deadLetterMessageRetentionPeriod === 'number'
+        ? sqsCfg.deadLetterMessageRetentionPeriod
+        : retention;
+    const visibilityTimeout =
+      typeof sqsCfg?.visibilityTimeout === 'number'
+        ? sqsCfg.visibilityTimeout
+        : (worker.workerConfig?.timeout || 300) + 60; // Add buffer
+    const maxReceiveCountRaw =
+      typeof sqsCfg?.maxReceiveCount === 'number' ? sqsCfg.maxReceiveCount : 1;
+    // SQS does not support 0; treat <=0 as 1.
+    const maxReceiveCount = Math.max(1, Math.floor(maxReceiveCountRaw));
+
+    // DLQ (always create so we can support "no retries" mode safely)
+    resources.Resources[dlqLogicalId] = {
+      Type: 'AWS::SQS::Queue',
+      Properties: {
+        QueueName: `\${self:service}-${worker.id}-dlq-\${opt:stage, env:ENVIRONMENT, '${stage}'}`,
+        MessageRetentionPeriod: dlqRetention,
+      },
+    };
 
     resources.Resources[queueLogicalId] = {
       Type: 'AWS::SQS::Queue',
       Properties: {
         // Use ${self:service} to avoid hardcoding service name
         QueueName: `\${self:service}-${worker.id}-\${opt:stage, env:ENVIRONMENT, '${stage}'}`,
-        VisibilityTimeout: (worker.workerConfig?.timeout || 300) + 60, // Add buffer
-        MessageRetentionPeriod: 1209600, // 14 days
+        VisibilityTimeout: visibilityTimeout,
+        MessageRetentionPeriod: retention,
+        RedrivePolicy: {
+          deadLetterTargetArn: { 'Fn::GetAtt': [dlqLogicalId, 'Arn'] },
+          maxReceiveCount,
+        },
       },
     };
 
@@ -1290,7 +1337,7 @@ function generateServerlessConfig(
 
   // Filter env vars - only include safe ones (exclude secrets that should be in AWS Secrets Manager)
   const safeEnvVars: Record<string, string> = {};
-  const allowedPrefixes = ['OPENAI_', 'ANTHROPIC_', 'DATABASE_', 'REDIS_', 'WORKERS_'];
+  const allowedPrefixes = ['OPENAI_', 'ANTHROPIC_', 'DATABASE_', 'MONGODB_', 'REDIS_', 'WORKERS_'];
 
   // AWS_ prefix is reserved by Lambda, do not include it in environment variables
   // https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars.html
@@ -1339,6 +1386,7 @@ function generateServerlessConfig(
       name: 'aws',
       runtime: 'nodejs20.x',
       region,
+      versionFunctions: false,
       // Use ENVIRONMENT from env.json to drive the actual deployed stage (Microfox defaults to prod).
       stage: `\${env:ENVIRONMENT, '${stage}'}`,
       environment: '\${file(env.json)}',
@@ -1545,7 +1593,7 @@ async function build(args: any) {
     }
   }
 
-  let serviceName = `ai-router-workers-${stage}`;
+  let serviceName = (args['service-name'] as string | undefined)?.trim() || `ai-router-workers-${stage}`;
 
   // Check for microfox.json to customize service name
   const microfoxJsonPath = path.join(process.cwd(), 'microfox.json');
@@ -1553,7 +1601,10 @@ async function build(args: any) {
     try {
       const microfoxConfig = JSON.parse(fs.readFileSync(microfoxJsonPath, 'utf-8'));
       if (microfoxConfig.projectId) {
-        serviceName = getServiceNameFromProjectId(microfoxConfig.projectId);
+        // Only override if user did not explicitly provide a service name
+        if (!(args['service-name'] as string | undefined)?.trim()) {
+          serviceName = getServiceNameFromProjectId(microfoxConfig.projectId);
+        }
         console.log(chalk.blue(`ℹ️  Using service name from microfox.json: ${serviceName}`));
       }
     } catch (error) {
@@ -1645,7 +1696,7 @@ async function build(args: any) {
     STAGE: envStage,
     NODE_ENV: envStage,
   };
-  const allowedPrefixes = ['OPENAI_', 'ANTHROPIC_', 'DATABASE_', 'REDIS_', 'WORKERS_'];
+  const allowedPrefixes = ['OPENAI_', 'ANTHROPIC_', 'DATABASE_', 'MONGODB_', 'REDIS_', 'WORKERS_'];
 
   for (const [key, value] of Object.entries(envVars)) {
     // AWS_ prefix is reserved by Lambda, do not include it in environment variables
@@ -1748,6 +1799,7 @@ export const pushCommand = new Command()
   .option('-s, --stage <stage>', 'Deployment stage', 'prod')
   .option('-r, --region <region>', 'AWS region', 'us-east-1')
   .option('--ai-path <path>', 'Path to AI directory containing workers', 'app/ai')
+  .option('--service-name <name>', 'Override serverless service name (defaults to ai-router-workers-<stage>)')
   .option('--skip-deploy', 'Skip deployment, only build', false)
   .option('--skip-install', 'Skip npm install in serverless directory', false)
   .action(async (options) => {

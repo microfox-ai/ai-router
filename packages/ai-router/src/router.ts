@@ -1959,168 +1959,9 @@ class NextHandler<
     } as AgentTool<any, any>;
   }
 
-  /**
-   * Start a workflow via API route and return immediately with the runId.
-   * Workflows are long-running and status polling should be handled client-side
-   * via the status endpoint (GET /path/:id).
-   */
-  async callWorkflow(
-    workflowPath: string,
-    input: any,
-    options?: {
-      streamToUI?: boolean;
-      baseUrl?: string;
-      messages?: any[];
-    }
-  ): Promise<
-    | { ok: true; data: { runId: string; status: string; result?: any } }
-    | { ok: false; error: Error }
-  > {
-    this.onExecutionStart();
-    try {
-      const parentPath = this.ctx.executionContext.currentPath || '/';
-      const resolvedPath = (this.router as any)._resolvePath(
-        parentPath,
-        workflowPath
-      );
 
-      this.ctx.logger.log(`Calling workflow: resolvedPath='${resolvedPath}'`);
-
-      // Construct the workflow API URL
-      // Default to /api/studio/workflow/agent if baseUrl not provided
-      const baseUrl = options?.baseUrl || '';
-      const workflowApiPath = baseUrl 
-        ? `${baseUrl}/api/studio/workflow/agent${resolvedPath.startsWith('/') ? resolvedPath : '/' + resolvedPath}`
-        : `/api/studio/workflow/agent${resolvedPath.startsWith('/') ? resolvedPath : '/' + resolvedPath}`;
-
-      // Make HTTP POST request to the workflow API route
-      const response = await fetch(workflowApiPath, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          input,
-          messages: options?.messages || this.ctx.request.messages || [],
-        }),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(
-          `Workflow API call failed: ${response.status} ${response.statusText}. ${errorText}`
-        );
-      }
-
-      const result = await response.json();
-
-      if (result.error) {
-        throw new Error(result.error);
-      }
-
-      if (options?.streamToUI) {
-        this.ctx.response.writeCustomTool({
-          toolName: resolvedPath,
-          output: result,
-        });
-      }
-
-      return {
-        ok: true,
-        data: {
-          runId: result.runId,
-          status: result.status,
-          result: result.result,
-        },
-      };
-    } catch (error: any) {
-      this.ctx.logger.error(`[callWorkflow] Error:`, error);
-      return { ok: false, error };
-    } finally {
-      this.onExecutionEnd();
-    }
-  }
-
-  /**
-   * Orchestrate multiple agents with steps, hooks, conditions, and data flow.
-   * Returns immediately with runId for tracking progress.
-   * 
-   * @param config - Orchestration configuration with steps, hooks, conditions, etc.
-   * @param options - Optional configuration for baseUrl, messages, and streaming
-   * @returns Promise with runId and status, or error
-   */
-  async orchestrate(
-    config: any, // OrchestrationConfig from workflow/orchestrate
-    options?: {
-      streamToUI?: boolean;
-      baseUrl?: string;
-      messages?: any[];
-    }
-  ): Promise<
-    | { ok: true; data: { runId: string; status: string; result?: any } }
-    | { ok: false; error: Error }
-  > {
-    this.onExecutionStart();
-    try {
-      this.ctx.logger.log(`Orchestrating workflow with ${config.steps?.length || 0} steps`);
-
-      // Construct the orchestration API URL
-      const baseUrl = options?.baseUrl || '';
-      const orchestrateApiPath = baseUrl 
-        ? `${baseUrl}/api/studio/workflow/orchestrate`
-        : `/api/studio/workflow/orchestrate`;
-
-      // Make HTTP POST request to the orchestration API route
-      const response = await fetch(orchestrateApiPath, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          config,
-          messages: options?.messages || this.ctx.request.messages || [],
-          input: config.input,
-        }),
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(
-          `Orchestration API call failed: ${response.status} ${response.statusText}. ${errorText}`
-        );
-      }
-
-      const result = await response.json();
-
-      if (result.error) {
-        throw new Error(result.error);
-      }
-
-      if (options?.streamToUI) {
-        this.ctx.response.writeCustomTool({
-          toolName: 'orchestrate',
-          output: result,
-        });
-      }
-
-      return {
-        ok: true,
-        data: {
-          runId: result.runId,
-          status: result.status,
-          result: result.result,
-        },
-      };
-    } catch (error: any) {
-      this.ctx.logger.error(`[orchestrate] Error:`, error);
-      return { ok: false, error };
-    } finally {
-      this.onExecutionEnd();
-    }
-  }
-}
-
-/** Deprecated execute style for L1402
+/** 
+ * Deprecated execute style for L1402
  * execute: (params: any, options: any) => {
           const finalParams = { ...params, ...fixedParams };
 
@@ -2142,5 +1983,7 @@ class NextHandler<
           );
           this.router.toolExecutionPromise = newPromise;
           return newPromise;
- * 
+ *
  */
+
+}

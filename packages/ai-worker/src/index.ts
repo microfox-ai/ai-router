@@ -4,7 +4,7 @@
  */
 
 import { dispatch, dispatchLocal, type DispatchOptions, type DispatchResult } from './client.js';
-import { createLambdaHandler, type WorkerHandler } from './handler.js';
+import { createLambdaHandler, type WorkerHandler, type JobStore } from './handler.js';
 import type { ZodType, z } from 'zod';
 
 export * from './client.js';
@@ -154,6 +154,36 @@ export interface WorkerConfig {
    * ```
    */
   schedule?: ScheduleConfig;
+
+  /**
+   * SQS queue settings for this worker (used by @microfox/ai-worker-cli when generating serverless.yml).
+   *
+   * Notes:
+   * - To effectively disable retries, set `maxReceiveCount: 1` (requires DLQ; the CLI will create one).
+   * - SQS does not support `maxReceiveCount: 0`.
+   * - `messageRetentionPeriod` is in seconds (max 1209600 = 14 days).
+   */
+  sqs?: {
+    /**
+     * How many receives before sending to DLQ.
+     * Use 1 to avoid retries.
+     */
+    maxReceiveCount?: number;
+    /**
+     * How long messages are retained in the main queue (seconds).
+     */
+    messageRetentionPeriod?: number;
+    /**
+     * Visibility timeout for the main queue (seconds).
+     * If not set, CLI defaults to (worker timeout + 60s).
+     */
+    visibilityTimeout?: number;
+    /**
+     * DLQ message retention period (seconds).
+     * Defaults to `messageRetentionPeriod` (or 14 days).
+     */
+    deadLetterMessageRetentionPeriod?: number;
+  };
 }
 
 export interface WorkerAgentConfig<INPUT_SCHEMA extends ZodType<any>, OUTPUT> {
@@ -233,20 +263,281 @@ export function createWorker<INPUT_SCHEMA extends ZodType<any>, OUTPUT>(
         // Local mode: run handler immediately
         // Parse input to apply defaults and get the final parsed type
         const parsedInput = inputSchema.parse(input);
-        try {
-          const output = await dispatchLocal(handler, parsedInput, {
-            jobId: options.jobId || `local-${Date.now()}`,
-            workerId: id,
-          });
+        const localJobId = options.jobId || `local-${Date.now()}`;
+        
+        // Try to get direct job store access in local mode (same process as Next.js app)
+        // This allows direct DB updates without needing HTTP/webhook URLs
+        let directJobStore: {
+          updateJob: (jobId: string, data: any) => Promise<void>;
+          setJob?: (jobId: string, data: any) => Promise<void>;
+        } | null = null;
 
-          // Still send webhook if provided (useful for testing webhook flow)
+        // Path constants for job store imports
+        const nextJsPathAlias = '@/app/api/workflows/stores/jobStore';
+        const explicitPath = process.env.WORKER_JOB_STORE_MODULE_PATH;
+
+        // Reliable approach: try Next.js path alias first, then explicit env var
+        // The @/ alias works at runtime in Next.js context
+        const resolveJobStore = async () => {
+          // Option 1: Try Next.js path alias (works in Next.js runtime context)
+          try {
+            const module = await import(nextJsPathAlias);
+            if (module?.updateJob) {
+              return { updateJob: module.updateJob, setJob: module.setJob };
+            }
+          } catch {
+            // Path alias not available (not in Next.js context or alias not configured)
+          }
+
+          // Option 2: Use explicit env var if provided (for custom setups)
+          if (explicitPath) {
+            try {
+              const module = await import(explicitPath).catch(() => {
+                // eslint-disable-next-line @typescript-eslint/no-require-imports
+                return require(explicitPath);
+              });
+              if (module?.updateJob) {
+                return { updateJob: module.updateJob, setJob: module.setJob };
+              }
+            } catch {
+              // Explicit path failed
+            }
+          }
+
+          return null;
+        };
+
+        directJobStore = await resolveJobStore();
+        if (directJobStore) {
+          console.log('[Worker] Using direct job store in local mode (no HTTP needed)');
+        }
+
+        // Derive job store URL from webhook URL or environment (fallback for HTTP mode)
+        let jobStoreUrl: string | undefined;
+        if (options.webhookUrl) {
+          try {
+            const webhookUrlObj = new URL(options.webhookUrl);
+            jobStoreUrl = webhookUrlObj.pathname.replace(/\/webhook$/, '');
+            jobStoreUrl = `${webhookUrlObj.origin}${jobStoreUrl}`;
+          } catch {
+            // Invalid URL, skip job store URL
+          }
+        }
+        jobStoreUrl = jobStoreUrl || process.env.WORKER_JOB_STORE_URL;
+
+        // Create job store interface for local mode
+        // Prefer direct DB access, fallback to HTTP calls if needed
+        const createLocalJobStore = (
+          directStore: typeof directJobStore,
+          httpUrl?: string
+        ): JobStore | undefined => {
+          // If we have direct job store access, use it (no HTTP needed)
+          if (directStore) {
+            return {
+              update: async (update) => {
+                try {
+                  // Build update payload
+                  const updatePayload: any = {};
+                  
+                  if (update.status !== undefined) {
+                    updatePayload.status = update.status;
+                  }
+                  if (update.metadata !== undefined) {
+                    updatePayload.metadata = update.metadata;
+                  }
+                  if (update.progress !== undefined) {
+                    // Merge progress into metadata
+                    updatePayload.metadata = {
+                      ...updatePayload.metadata,
+                      progress: update.progress,
+                      progressMessage: update.progressMessage,
+                    };
+                  }
+                  if (update.output !== undefined) {
+                    updatePayload.output = update.output;
+                  }
+                  if (update.error !== undefined) {
+                    updatePayload.error = update.error;
+                  }
+
+                  await directStore.updateJob(localJobId, updatePayload);
+                  console.log('[Worker] Local job updated (direct DB):', {
+                    jobId: localJobId,
+                    workerId: id,
+                    updates: Object.keys(updatePayload),
+                  });
+                } catch (error: any) {
+                  console.warn('[Worker] Failed to update local job (direct DB):', {
+                    jobId: localJobId,
+                    workerId: id,
+                    error: error?.message || String(error),
+                  });
+                }
+              },
+              get: async () => {
+                try {
+                  // Use the same direct store that has updateJob - it should also have getJob
+                  if (directStore) {
+                    // Try to import getJob from the same module
+                    const nextJsPath = '@/app/api/workflows/stores/jobStore';
+                    const explicitPath = process.env.WORKER_JOB_STORE_MODULE_PATH;
+                    
+                    for (const importPath of [nextJsPath, explicitPath].filter(Boolean)) {
+                      try {
+                        const module = await import(importPath!);
+                        if (module?.getJob) {
+                          return await module.getJob(localJobId);
+                        }
+                      } catch {
+                        // Continue
+                      }
+                    }
+                  }
+                  return null;
+                } catch (error: any) {
+                  console.warn('[Worker] Failed to get local job (direct DB):', {
+                    jobId: localJobId,
+                    workerId: id,
+                    error: error?.message || String(error),
+                  });
+                  return null;
+                }
+              },
+            };
+          }
+
+          // Fallback to HTTP calls if no direct access
+          if (!httpUrl) {
+            return undefined;
+          }
+
+          // Use HTTP calls to update job store
+          return {
+            update: async (update) => {
+              try {
+                // Build update payload
+                const updatePayload: any = { jobId: localJobId, workerId: id };
+                
+                if (update.status !== undefined) {
+                  updatePayload.status = update.status;
+                }
+                if (update.metadata !== undefined) {
+                  updatePayload.metadata = update.metadata;
+                }
+                if (update.progress !== undefined) {
+                  // Merge progress into metadata
+                  updatePayload.metadata = {
+                    ...updatePayload.metadata,
+                    progress: update.progress,
+                    progressMessage: update.progressMessage,
+                  };
+                }
+                if (update.output !== undefined) {
+                  updatePayload.output = update.output;
+                }
+                if (update.error !== undefined) {
+                  updatePayload.error = update.error;
+                }
+
+                const response = await fetch(`${httpUrl}/update`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify(updatePayload),
+                });
+                if (!response.ok) {
+                  throw new Error(`Job store update failed: ${response.status} ${response.statusText}`);
+                }
+                console.log('[Worker] Local job updated (HTTP):', {
+                  jobId: localJobId,
+                  workerId: id,
+                  updates: Object.keys(updatePayload),
+                });
+              } catch (error: any) {
+                console.warn('[Worker] Failed to update local job (HTTP):', {
+                  jobId: localJobId,
+                  workerId: id,
+                  error: error?.message || String(error),
+                });
+              }
+            },
+            get: async () => {
+              try {
+                // GET /api/workflows/workers/:workerId/:jobId
+                const response = await fetch(`${httpUrl}/${id}/${localJobId}`, {
+                  method: 'GET',
+                  headers: { 'Content-Type': 'application/json' },
+                });
+
+                if (!response.ok) {
+                  if (response.status === 404) {
+                    return null;
+                  }
+                  throw new Error(`Job store get failed: ${response.status} ${response.statusText}`);
+                }
+
+                return await response.json();
+              } catch (error: any) {
+                console.warn('[Worker] Failed to get local job (HTTP):', {
+                  jobId: localJobId,
+                  workerId: id,
+                  error: error?.message || String(error),
+                });
+                return null;
+              }
+            },
+          };
+        };
+
+        const jobStore = createLocalJobStore(directJobStore, jobStoreUrl);
+
+        // Create initial job record if we have job store access
+        if (directJobStore?.setJob) {
+          try {
+            await directJobStore.setJob(localJobId, {
+              jobId: localJobId,
+              workerId: id,
+              status: 'queued',
+              input: parsedInput,
+              metadata: options.metadata || {},
+            });
+          } catch (error: any) {
+            console.warn('[Worker] Failed to create initial job record:', {
+              jobId: localJobId,
+              workerId: id,
+              error: error?.message || String(error),
+            });
+            // Continue - job will still be created when status is updated
+          }
+        }
+
+        // Create handler context with job store
+        const handlerContext = {
+          jobId: localJobId,
+          workerId: id,
+          ...(jobStore ? { jobStore } : {}),
+        };
+
+        try {
+          // Update status to running before execution
+          if (jobStore) {
+            await jobStore.update({ status: 'running' });
+          }
+
+          const output = await dispatchLocal(handler, parsedInput, handlerContext);
+
+          // Update status to completed before webhook
+          if (jobStore) {
+            await jobStore.update({ status: 'completed', output });
+          }
+
+          // Only send webhook if webhookUrl is provided
           if (options.webhookUrl) {
             try {
               await fetch(options.webhookUrl, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                  jobId: options.jobId || `local-${Date.now()}`,
+                  jobId: localJobId,
                   workerId: id,
                   status: 'success',
                   output,
@@ -254,24 +545,36 @@ export function createWorker<INPUT_SCHEMA extends ZodType<any>, OUTPUT>(
                 }),
               });
             } catch (error) {
-              console.warn('Local webhook call failed:', error);
+              console.warn('[Worker] Local webhook call failed:', error);
             }
           }
 
           return {
             messageId: `local-${Date.now()}`,
             status: 'queued',
-            jobId: options.jobId || `local-${Date.now()}`,
+            jobId: localJobId,
           };
         } catch (error: any) {
-          // Send error webhook if provided
+          // Update status to failed before webhook
+          if (jobStore) {
+            await jobStore.update({
+              status: 'failed',
+              error: {
+                message: error.message || 'Unknown error',
+                stack: error.stack,
+                name: error.name || 'Error',
+              },
+            });
+          }
+
+          // Only send error webhook if webhookUrl is provided
           if (options.webhookUrl) {
             try {
               await fetch(options.webhookUrl, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                  jobId: options.jobId || `local-${Date.now()}`,
+                  jobId: localJobId,
                   workerId: id,
                   status: 'error',
                   error: {
@@ -283,7 +586,7 @@ export function createWorker<INPUT_SCHEMA extends ZodType<any>, OUTPUT>(
                 }),
               });
             } catch (webhookError) {
-              console.warn('Local error webhook call failed:', webhookError);
+              console.warn('[Worker] Local error webhook call failed:', webhookError);
             }
           }
           throw error;

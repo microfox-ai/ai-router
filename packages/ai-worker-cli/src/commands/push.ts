@@ -279,9 +279,11 @@ function buildDependenciesMap(projectRoot: string, deps: Set<string>): Record<st
       projectDeps[dep] ||
       projectDevDeps[dep] ||
       workspaceDeps[dep];
-
-    // Prefer the exact range present in the project/workspace package.json files.
-    out[dep] = range ? String(range) : '*';
+    // Only add deps that the project or workspace already declares (e.g. in package.json).
+    // Skip subpath imports like @tokenlens/helpers that are not real packages and not in package.json.
+    if (range) {
+      out[dep] = String(range);
+    }
   }
 
   return out;
@@ -512,7 +514,24 @@ export const exportedWorkerConfig = workerModule.workerConfig || workerAgent?.wo
               modified = true;
             }
 
-            // Only write if we made a change
+            // Fix (0, import_node_module.createRequire)(import_meta.url) - esbuild emits import_meta.url
+            // which is undefined in CJS Lambda. Polyfill so createRequire gets a valid file URL.
+            if (bundledCode.includes('import_meta.url')) {
+              bundledCode = bundledCode.replace(
+                /import_meta\.url/g,
+                'require("url").pathToFileURL(__filename).href'
+              );
+              modified = true;
+            }
+
+            // Fix createRequire(undefined) / createRequire(void 0) if any dependency emits that
+            const beforeCreateRequire = bundledCode;
+            bundledCode = bundledCode.replace(
+              /\bcreateRequire\s*\(\s*(?:undefined|void\s*0)\s*\)/g,
+              'createRequire(require("url").pathToFileURL(__filename).href)'
+            );
+            if (bundledCode !== beforeCreateRequire) modified = true;
+
             if (modified) {
               fs.writeFileSync(handlerFile, bundledCode, 'utf-8');
             }
@@ -525,6 +544,7 @@ export const exportedWorkerConfig = workerModule.workerConfig || workerAgent?.wo
         bundle: true,
         platform: 'node',
         target: 'node20',
+        format: 'cjs',
         outfile: handlerFile,
         // We exclude aws-sdk as it's included in Lambda runtime
         // We exclude canvas because it's a binary dependency often problematic in bundling
@@ -1337,7 +1357,7 @@ function generateServerlessConfig(
 
   // Filter env vars - only include safe ones (exclude secrets that should be in AWS Secrets Manager)
   const safeEnvVars: Record<string, string> = {};
-  const allowedPrefixes = ['OPENAI_', 'ANTHROPIC_', 'DATABASE_', 'MONGODB_', 'REDIS_', 'WORKERS_'];
+  const allowedPrefixes = ['OPENAI_', 'ANTHROPIC_', 'DATABASE_', 'MONGODB_', 'REDIS_', 'WORKERS_', 'REMOTION_'];
 
   // AWS_ prefix is reserved by Lambda, do not include it in environment variables
   // https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars.html
@@ -1696,7 +1716,7 @@ async function build(args: any) {
     STAGE: envStage,
     NODE_ENV: envStage,
   };
-  const allowedPrefixes = ['OPENAI_', 'ANTHROPIC_', 'DATABASE_', 'MONGODB_', 'REDIS_', 'WORKERS_'];
+  const allowedPrefixes = ['OPENAI_', 'ANTHROPIC_', 'DATABASE_', 'MONGODB_', 'REDIS_', 'WORKERS_', 'REMOTION_'];
 
   for (const [key, value] of Object.entries(envVars)) {
     // AWS_ prefix is reserved by Lambda, do not include it in environment variables

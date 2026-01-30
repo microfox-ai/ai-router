@@ -253,6 +253,12 @@ export function createLambdaHandler<INPUT, OUTPUT>(
           }
         }
 
+        console.log('[Worker] Job completed:', {
+          jobId,
+          workerId,
+          output,
+        });
+
         const successPayload: WebhookPayload = {
           jobId,
           workerId,

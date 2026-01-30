@@ -403,8 +403,8 @@ export class AiRouter<
     /** The maximum number of agent-to-agent calls allowed in a single request to prevent infinite loops. */
     maxCallDepth: number;
   } = {
-    maxCallDepth: 10,
-  };
+      maxCallDepth: 10,
+    };
 
   /**
    * Constructs a new AiAgentKit router.
@@ -472,9 +472,9 @@ export class AiRouter<
     PARTS,
     TOOLS,
     REGISTERED_TOOLS &
-      (TAgents[number] extends AiRouter<any, any, any, any, any, infer R>
-        ? R
-        : {})
+    (TAgents[number] extends AiRouter<any, any, any, any, any, infer R>
+      ? R
+      : {})
   > {
     let prefix: string | RegExp = '/';
     if (typeof agentPath === 'string' || agentPath instanceof RegExp) {
@@ -512,10 +512,20 @@ export class AiRouter<
         }
         continue;
       }
+      // Check if path has dynamic parameters
+      const hasDynamic =
+        typeof prefix === 'string' ? hasDynamicParams(prefix) : false;
+      const paramNames =
+        typeof prefix === 'string' && hasDynamic
+          ? parsePathPattern(prefix).paramNames
+          : undefined;
+
       this.stack.push({
         path: prefix,
         handler: handler as any,
         isAgent: true, // Mark as an agent
+        hasDynamicParams: hasDynamic,
+        paramNames: paramNames,
       });
       this.logger?.log(`Agent registered: path=${prefix}`);
     }
@@ -532,8 +542,8 @@ export class AiRouter<
    */
   before<
     THandler extends
-      | AiMiddleware<KIT_METADATA, ContextState, PARAMS, PARTS, TOOLS>
-      | AiRouter<any, any, any, any, any, any>,
+    | AiMiddleware<KIT_METADATA, ContextState, PARAMS, PARTS, TOOLS>
+    | AiRouter<any, any, any, any, any, any>,
   >(
     mountPathArg: string | RegExp,
     handler: THandler
@@ -544,7 +554,7 @@ export class AiRouter<
     PARTS,
     TOOLS,
     REGISTERED_TOOLS &
-      (THandler extends AiRouter<any, any, any, any, any, infer R> ? R : {})
+    (THandler extends AiRouter<any, any, any, any, any, infer R> ? R : {})
   > {
     if (mountPathArg instanceof RegExp && handler instanceof AiRouter) {
       throw new AiKitError(
@@ -595,8 +605,8 @@ export class AiRouter<
    */
   after<
     THandler extends
-      | AiMiddleware<KIT_METADATA, ContextState, PARAMS, PARTS, TOOLS>
-      | AiRouter<any, any, any, any, any, any>,
+    | AiMiddleware<KIT_METADATA, ContextState, PARAMS, PARTS, TOOLS>
+    | AiRouter<any, any, any, any, any, any>,
   >(
     mountPathArg: string | RegExp,
     handler: THandler
@@ -607,7 +617,7 @@ export class AiRouter<
     PARTS,
     TOOLS,
     REGISTERED_TOOLS &
-      (THandler extends AiRouter<any, any, any, any, any, infer R> ? R : {})
+    (THandler extends AiRouter<any, any, any, any, any, infer R> ? R : {})
   > {
     if (mountPathArg instanceof RegExp && handler instanceof AiRouter) {
       throw new AiKitError(
@@ -884,9 +894,9 @@ export class AiRouter<
     // If no logger is available, return a no-op logger
     if (!effectiveLogger) {
       return {
-        log: () => {},
-        warn: () => {},
-        error: () => {},
+        log: () => { },
+        warn: () => { },
+        error: () => { },
       };
     }
 
@@ -977,14 +987,28 @@ export class AiRouter<
 
           const isExactMatch = normalizedPath === normalizedLayerPath;
 
-          if (isInternalCall) {
+          // Check for dynamic parameters in the layer path
+          const hasDynamic = hasDynamicParams(normalizedLayerPath);
+
+          if (hasDynamic) {
+            // Use extractPathParams to check if the path matches the pattern
+            const extractedParams = extractPathParams(normalizedLayerPath, normalizedPath);
+            if (extractedParams !== null) {
+              shouldRun = true;
+              // Merge extracted params into ctx.request.params
+              ctx.request.params = {
+                ...ctx.request.params,
+                ...extractedParams,
+              };
+            }
+          } else if (isInternalCall) {
             // --- Internal Call Logic ---
             // For internal calls, we only consider exact matches for all layer types.
             shouldRun = isExactMatch;
           } else {
             // --- External Call Logic ---
             if (layer.isAgent) {
-              // Agents are only matched exactly.
+              // Agents are only matched exactly (or by dynamic params, handled above).
               shouldRun = isExactMatch;
             } else {
               // Middlewares are matched by prefix.
@@ -1343,16 +1367,16 @@ export class AiRouter<
         finalMessages = finalMessages.map((m) =>
           m.id === thisMessageId
             ? {
-                ...m,
-                metadata: {
-                  ...(m.metadata ?? {}),
-                  ...(message.metadata ?? {}),
-                },
-                parts: clubParts([
-                  ...(m.parts ?? []),
-                  ...(message.parts ?? []),
-                ]),
-              }
+              ...m,
+              metadata: {
+                ...(m.metadata ?? {}),
+                ...(message.metadata ?? {}),
+              },
+              parts: clubParts([
+                ...(m.parts ?? []),
+                ...(message.parts ?? []),
+              ]),
+            }
             : m
         );
       } else {
@@ -1593,29 +1617,32 @@ class NextHandler<
       },
     } as AgentTool<any, any>;
   }
-}
 
-/** Deprecated execute style for L1402
- * execute: (params: any, options: any) => {
-          const finalParams = { ...params, ...fixedParams };
 
-          const executeInternal = async () => {
-            const result = await this.callAgent(
-              agentPath,
-              finalParams,
-              options
+  /** 
+   * Deprecated execute style for L1402
+   * execute: (params: any, options: any) => {
+            const finalParams = { ...params, ...fixedParams };
+  
+            const executeInternal = async () => {
+              const result = await this.callAgent(
+                agentPath,
+                finalParams,
+                options
+              );
+              if (!result.ok) {
+                throw result.error;
+              }
+              return result.data;
+            };
+  
+            const newPromise = this.router.toolExecutionPromise.then(
+              executeInternal,
+              executeInternal
             );
-            if (!result.ok) {
-              throw result.error;
-            }
-            return result.data;
-          };
+            this.router.toolExecutionPromise = newPromise;
+            return newPromise;
+   *
+   */
 
-          const newPromise = this.router.toolExecutionPromise.then(
-            executeInternal,
-            executeInternal
-          );
-          this.router.toolExecutionPromise = newPromise;
-          return newPromise;
- * 
- */
+}

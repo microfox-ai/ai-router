@@ -1,6 +1,6 @@
 {
   "name": "@microfox/ai-worker",
-  "version": "0.1.1",
+  "version": "1.0.0",
   "description": "Background worker runtime for ai-router - SQS-based async agent execution",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
@@ -42,6 +42,7 @@
     }
   },
   "dependencies": {
+    "mongodb": "^6.12.0",
     "zod": "^4.1.5"
   },
   "peerDependencies": {

@@ -279,9 +279,11 @@ function buildDependenciesMap(projectRoot: string, deps: Set<string>): Record<st
       projectDeps[dep] ||
       projectDevDeps[dep] ||
       workspaceDeps[dep];
-
-    // Prefer the exact range present in the project/workspace package.json files.
-    out[dep] = range ? String(range) : '*';
+    // Only add deps that the project or workspace already declares (e.g. in package.json).
+    // Skip subpath imports like @tokenlens/helpers that are not real packages and not in package.json.
+    if (range) {
+      out[dep] = String(range);
+    }
   }
 
   return out;
@@ -297,6 +299,13 @@ interface WorkerInfo {
     timeout?: number;
     memorySize?: number;
     layers?: string[];
+    schedule?: any; // Schedule config: string, object, or array of either
+    sqs?: {
+      maxReceiveCount?: number;
+      messageRetentionPeriod?: number;
+      visibilityTimeout?: number;
+      deadLetterMessageRetentionPeriod?: number;
+    };
   };
 }
 
@@ -312,6 +321,7 @@ interface ServerlessConfig {
     runtime: string;
     region: string;
     stage: string;
+    versionFunctions?: boolean;
     environment: Record<string, string | Record<string, any>> | string;
     iam: {
       role: {
@@ -448,23 +458,31 @@ async function generateHandlers(workers: WorkerInfo[], outputDir: string): Promi
     // Normalize slashes for Windows
     relativeImportPath = relativeImportPath.split(path.sep).join('/');
 
-    // Try to detect export name from file content
+    // Detect export: "export default createWorker" vs "export const X = createWorker"
     const fileContent = fs.readFileSync(worker.filePath, 'utf-8');
+    const defaultExport = /export\s+default\s+createWorker/.test(fileContent);
     const exportMatch = fileContent.match(/export\s+(const|let)\s+(\w+)\s*=\s*createWorker/);
     const exportName = exportMatch ? exportMatch[2] : 'worker';
 
     // 1. Create a temporary TS entrypoint
     const tempEntryFile = handlerFile.replace('.js', '.temp.ts');
 
+    const workerRef = defaultExport
+      ? 'workerModule.default'
+      : `workerModule.${exportName}`;
+
     // Try to import workerConfig (new pattern) - it might not exist (old pattern)
     const tempEntryContent = `
 import { createLambdaHandler } from '@microfox/ai-worker/handler';
 import * as workerModule from '${relativeImportPath}';
-const { ${exportName} } = workerModule;
 
-export const handler = createLambdaHandler(${exportName}.handler, ${exportName}.outputSchema);
-// Export workerConfig - prefer exported workerConfig (new pattern) or fall back to worker.workerConfig (old pattern)
-export const exportedWorkerConfig = workerModule.workerConfig || ${exportName}.workerConfig;
+const workerAgent = ${workerRef};
+if (!workerAgent || typeof workerAgent.handler !== 'function') {
+  throw new Error('Worker module must export a createWorker result (default or named) with .handler');
+}
+
+export const handler = createLambdaHandler(workerAgent.handler, workerAgent.outputSchema);
+export const exportedWorkerConfig = workerModule.workerConfig || workerAgent?.workerConfig;
 `;
     fs.writeFileSync(tempEntryFile, tempEntryContent);
 
@@ -496,7 +514,24 @@ export const exportedWorkerConfig = workerModule.workerConfig || ${exportName}.w
               modified = true;
             }
 
-            // Only write if we made a change
+            // Fix (0, import_node_module.createRequire)(import_meta.url) - esbuild emits import_meta.url
+            // which is undefined in CJS Lambda. Polyfill so createRequire gets a valid file URL.
+            if (bundledCode.includes('import_meta.url')) {
+              bundledCode = bundledCode.replace(
+                /import_meta\.url/g,
+                'require("url").pathToFileURL(__filename).href'
+              );
+              modified = true;
+            }
+
+            // Fix createRequire(undefined) / createRequire(void 0) if any dependency emits that
+            const beforeCreateRequire = bundledCode;
+            bundledCode = bundledCode.replace(
+              /\bcreateRequire\s*\(\s*(?:undefined|void\s*0)\s*\)/g,
+              'createRequire(require("url").pathToFileURL(__filename).href)'
+            );
+            if (bundledCode !== beforeCreateRequire) modified = true;
+
             if (modified) {
               fs.writeFileSync(handlerFile, bundledCode, 'utf-8');
             }
@@ -509,6 +544,7 @@ export const exportedWorkerConfig = workerModule.workerConfig || ${exportName}.w
         bundle: true,
         platform: 'node',
         target: 'node20',
+        format: 'cjs',
         outfile: handlerFile,
         // We exclude aws-sdk as it's included in Lambda runtime
         // We exclude canvas because it's a binary dependency often problematic in bundling
@@ -1057,6 +1093,94 @@ function loadEnvVars(envPath: string = '.env'): Record<string, string> {
 }
 
 /**
+ * Converts schedule configuration to serverless.yml schedule event format.
+ * Supports simple strings, configuration objects, and arrays of both.
+ */
+function processScheduleEvents(scheduleConfig: any): any[] {
+  if (!scheduleConfig) {
+    return [];
+  }
+
+  const events: any[] = [];
+
+  // Normalize to array
+  const schedules = Array.isArray(scheduleConfig) ? scheduleConfig : [scheduleConfig];
+
+  for (const schedule of schedules) {
+    // Simple string format: 'rate(2 hours)' or 'cron(0 12 * * ? *)'
+    if (typeof schedule === 'string') {
+      events.push({
+        schedule: schedule,
+      });
+      continue;
+    }
+
+    // Full configuration object
+    if (typeof schedule === 'object' && schedule !== null) {
+      const scheduleEvent: any = { schedule: {} };
+
+      // Handle rate - can be string or array of strings
+      if (schedule.rate) {
+        if (Array.isArray(schedule.rate)) {
+          // Multiple rate expressions
+          scheduleEvent.schedule.rate = schedule.rate;
+        } else {
+          // Single rate expression
+          scheduleEvent.schedule.rate = schedule.rate;
+        }
+      } else {
+        // If no rate specified but we have a schedule object, skip it
+        continue;
+      }
+
+      // Optional fields
+      if (schedule.enabled !== undefined) {
+        scheduleEvent.schedule.enabled = schedule.enabled;
+      }
+      if (schedule.input !== undefined) {
+        scheduleEvent.schedule.input = schedule.input;
+      }
+      if (schedule.inputPath !== undefined) {
+        scheduleEvent.schedule.inputPath = schedule.inputPath;
+      }
+      if (schedule.inputTransformer !== undefined) {
+        scheduleEvent.schedule.inputTransformer = schedule.inputTransformer;
+      }
+      if (schedule.name !== undefined) {
+        scheduleEvent.schedule.name = schedule.name;
+      }
+      if (schedule.description !== undefined) {
+        scheduleEvent.schedule.description = schedule.description;
+      }
+      if (schedule.method !== undefined) {
+        scheduleEvent.schedule.method = schedule.method;
+      }
+      if (schedule.timezone !== undefined) {
+        scheduleEvent.schedule.timezone = schedule.timezone;
+      }
+
+      // If schedule object only has rate (or is minimal), we can simplify it
+      // Serverless Framework accepts both { schedule: 'rate(...)' } and { schedule: { rate: 'rate(...)' } }
+      if (Object.keys(scheduleEvent.schedule).length === 1 && scheduleEvent.schedule.rate) {
+        // Simplify to string format if it's just a single rate
+        if (typeof scheduleEvent.schedule.rate === 'string') {
+          events.push({
+            schedule: scheduleEvent.schedule.rate,
+          });
+        } else {
+          // Keep object format for arrays
+          events.push(scheduleEvent);
+        }
+      } else {
+        events.push(scheduleEvent);
+      }
+    }
+  }
+
+  return events;
+}
+
+/**
  * Generates serverless.yml configuration.
  */
 function generateServerlessConfig(
@@ -1100,14 +1224,46 @@ function generateServerlessConfig(
   for (const worker of workers) {
     const queueName = `WorkerQueue${worker.id.replace(/[^a-zA-Z0-9]/g, '')}`;
     const queueLogicalId = `${queueName}${stage}`;
+    const dlqLogicalId = `${queueName}DLQ${stage}`;
+
+    const sqsCfg = worker.workerConfig?.sqs;
+    const retention =
+      typeof sqsCfg?.messageRetentionPeriod === 'number'
+        ? sqsCfg.messageRetentionPeriod
+        : 1209600; // 14 days
+    const dlqRetention =
+      typeof sqsCfg?.deadLetterMessageRetentionPeriod === 'number'
+        ? sqsCfg.deadLetterMessageRetentionPeriod
+        : retention;
+    const visibilityTimeout =
+      typeof sqsCfg?.visibilityTimeout === 'number'
+        ? sqsCfg.visibilityTimeout
+        : (worker.workerConfig?.timeout || 300) + 60; // Add buffer
+    const maxReceiveCountRaw =
+      typeof sqsCfg?.maxReceiveCount === 'number' ? sqsCfg.maxReceiveCount : 1;
+    // SQS does not support 0; treat <=0 as 1.
+    const maxReceiveCount = Math.max(1, Math.floor(maxReceiveCountRaw));
+
+    // DLQ (always create so we can support "no retries" mode safely)
+    resources.Resources[dlqLogicalId] = {
+      Type: 'AWS::SQS::Queue',
+      Properties: {
+        QueueName: `\${self:service}-${worker.id}-dlq-\${opt:stage, env:ENVIRONMENT, '${stage}'}`,
+        MessageRetentionPeriod: dlqRetention,
+      },
+    };
 
     resources.Resources[queueLogicalId] = {
       Type: 'AWS::SQS::Queue',
       Properties: {
         // Use ${self:service} to avoid hardcoding service name
         QueueName: `\${self:service}-${worker.id}-\${opt:stage, env:ENVIRONMENT, '${stage}'}`,
-        VisibilityTimeout: (worker.workerConfig?.timeout || 300) + 60, // Add buffer
-        MessageRetentionPeriod: 1209600, // 14 days
+        VisibilityTimeout: visibilityTimeout,
+        MessageRetentionPeriod: retention,
+        RedrivePolicy: {
+          deadLetterTargetArn: { 'Fn::GetAtt': [dlqLogicalId, 'Arn'] },
+          maxReceiveCount,
+        },
       },
     };
 
@@ -1128,19 +1284,28 @@ function generateServerlessConfig(
   for (const worker of workers) {
     const functionName = `worker${worker.id.replace(/[^a-zA-Z0-9]/g, '')}`;
 
+    // Start with SQS event (default)
+    const events: any[] = [
+      {
+        sqs: {
+          arn: { 'Fn::GetAtt': [`WorkerQueue${worker.id.replace(/[^a-zA-Z0-9]/g, '')}${stage}`, 'Arn'] },
+          batchSize: 1,
+        },
+      },
+    ];
+
+    // Add schedule events if configured
+    if (worker.workerConfig?.schedule) {
+      const scheduleEvents = processScheduleEvents(worker.workerConfig.schedule);
+      events.push(...scheduleEvents);
+    }
+
     functions[functionName] = {
       // IMPORTANT: Keep AWS handler string to exactly one dot: "<modulePath>.handler"
       handler: `${worker.handlerPath}.handler`,
       timeout: worker.workerConfig?.timeout || 300,
       memorySize: worker.workerConfig?.memorySize || 512,
-      events: [
-        {
-          sqs: {
-            arn: { 'Fn::GetAtt': [`WorkerQueue${worker.id.replace(/[^a-zA-Z0-9]/g, '')}${stage}`, 'Arn'] },
-            batchSize: 1,
-          },
-        },
-      ],
+      events,
     };
 
     if (worker.workerConfig?.layers?.length) {
@@ -1192,7 +1357,7 @@ function generateServerlessConfig(
 
   // Filter env vars - only include safe ones (exclude secrets that should be in AWS Secrets Manager)
   const safeEnvVars: Record<string, string> = {};
-  const allowedPrefixes = ['OPENAI_', 'ANTHROPIC_', 'DATABASE_', 'REDIS_', 'WORKERS_'];
+  const allowedPrefixes = ['OPENAI_', 'ANTHROPIC_', 'DATABASE_', 'MONGODB_', 'REDIS_', 'WORKERS_', 'REMOTION_'];
 
   // AWS_ prefix is reserved by Lambda, do not include it in environment variables
   // https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars.html
@@ -1241,6 +1406,7 @@ function generateServerlessConfig(
       name: 'aws',
       runtime: 'nodejs20.x',
       region,
+      versionFunctions: false,
       // Use ENVIRONMENT from env.json to drive the actual deployed stage (Microfox defaults to prod).
       stage: `\${env:ENVIRONMENT, '${stage}'}`,
       environment: '\${file(env.json)}',
@@ -1447,7 +1613,7 @@ async function build(args: any) {
     }
   }
 
-  let serviceName = `ai-router-workers-${stage}`;
+  let serviceName = (args['service-name'] as string | undefined)?.trim() || `ai-router-workers-${stage}`;
 
   // Check for microfox.json to customize service name
   const microfoxJsonPath = path.join(process.cwd(), 'microfox.json');
@@ -1455,7 +1621,10 @@ async function build(args: any) {
     try {
       const microfoxConfig = JSON.parse(fs.readFileSync(microfoxJsonPath, 'utf-8'));
       if (microfoxConfig.projectId) {
-        serviceName = getServiceNameFromProjectId(microfoxConfig.projectId);
+        // Only override if user did not explicitly provide a service name
+        if (!(args['service-name'] as string | undefined)?.trim()) {
+          serviceName = getServiceNameFromProjectId(microfoxConfig.projectId);
+        }
         console.log(chalk.blue(`ℹ️  Using service name from microfox.json: ${serviceName}`));
       }
     } catch (error) {
@@ -1508,10 +1677,13 @@ async function build(args: any) {
 
               // Use Function constructor to parse the object (safer than eval)
               const configObj = new Function('return ' + configStr)();
-              if (configObj && (configObj.layers || configObj.timeout || configObj.memorySize)) {
+              if (configObj && (configObj.layers || configObj.timeout || configObj.memorySize || configObj.schedule)) {
                 worker.workerConfig = configObj;
                 if (configObj.layers?.length) {
                   console.log(chalk.gray(`  ✓ ${worker.id}: found ${configObj.layers.length} layer(s) from source file`));
+                }
+                if (configObj.schedule) {
+                  console.log(chalk.gray(`  ✓ ${worker.id}: found schedule configuration`));
                 }
               }
             }
@@ -1544,7 +1716,7 @@ async function build(args: any) {
     STAGE: envStage,
     NODE_ENV: envStage,
   };
-  const allowedPrefixes = ['OPENAI_', 'ANTHROPIC_', 'DATABASE_', 'REDIS_', 'WORKERS_'];
+  const allowedPrefixes = ['OPENAI_', 'ANTHROPIC_', 'DATABASE_', 'MONGODB_', 'REDIS_', 'WORKERS_', 'REMOTION_'];
 
   for (const [key, value] of Object.entries(envVars)) {
     // AWS_ prefix is reserved by Lambda, do not include it in environment variables
@@ -1647,6 +1819,7 @@ export const pushCommand = new Command()
   .option('-s, --stage <stage>', 'Deployment stage', 'prod')
   .option('-r, --region <region>', 'AWS region', 'us-east-1')
   .option('--ai-path <path>', 'Path to AI directory containing workers', 'app/ai')
+  .option('--service-name <name>', 'Override serverless service name (defaults to ai-router-workers-<stage>)')
   .option('--skip-deploy', 'Skip deployment, only build', false)
   .option('--skip-install', 'Skip npm install in serverless directory', false)
   .action(async (options) => {

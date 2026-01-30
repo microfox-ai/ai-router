@@ -16,7 +16,7 @@ export async function POST(req: NextRequest) {
   const revalidatePath = lastMessage?.metadata?.revalidatePath;
 
   return aiMainRouter
-    .use(
+    .before(
       '/',
       StudioConfig.studioSettings.database.type === 'upstash-redis'
         ? chatRestoreUpstash

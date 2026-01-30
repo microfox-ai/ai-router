@@ -21,14 +21,14 @@
   "exports": {
     "./package.json": "./package.json",
     ".": {
+      "types": "./dist/index.d.ts",
       "import": "./dist/index.mjs",
-      "require": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "require": "./dist/index.js"
     },
     "./fs_store": {
+      "types": "./dist/fs_store.d.ts",
       "import": "./dist/fs_store.mjs",
-      "require": "./dist/fs_store.js",
-      "types": "./dist/fs_store.d.ts"
+      "require": "./dist/fs_store.js"
     }
   },
   "dependencies": {

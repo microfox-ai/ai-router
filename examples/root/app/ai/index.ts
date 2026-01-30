@@ -11,20 +11,32 @@ import { braveResearchAgent } from './agents/braveResearch';
 import { summarizeAgent } from './agents/summarize';
 import { systemAgent } from './agents/system';
 import { thinkerAgent } from './agents/thinker';
+import { contentGeneratorAgent } from './agents/content-generator';
+import { analyzerAgent } from './agents/analyzer';
+import { emitterAgent } from './agents/emitter';
+import { reflectAgent } from './agents/reflect';
 import { contextLimiter } from './middlewares/contextLimiter';
 import { onlyTextParts } from './middlewares/onlyTextParts';
 
-const aiRouter = new AiRouter<any, any, any, any>();
+const aiRouter = new AiRouter(undefined, undefined);
 // aiRouter.setLogger(console);
+
+// import { aiWorkflowRouter as workflowRouter } from './agents/workflows/shared';
 
 const aiMainRouter = aiRouter
   .agent('/system', systemAgent)
   .agent('/summarize', summarizeAgent)
   .agent('/research', braveResearchAgent)
   .agent('/thinker', thinkerAgent)
-  .use('/', contextLimiter(5))
-  .use('/', onlyTextParts(100))
-  .agent('/', async (props) => {
+  .agent('/content-generator', contentGeneratorAgent)
+  .agent('/analyzer', analyzerAgent)
+  .agent('/emitter', emitterAgent)
+  .agent('/reflect', reflectAgent)
+  // Mount workflow router as sub-router
+  // .agent('/workflows', workflowRouter)
+  .before('/', contextLimiter(5))
+  .before('/', onlyTextParts(100))
+  .agent('/', async (props: any) => {
     // show a loading indicator
     props.response.writeMessageMetadata({
       loader: 'Thinking...',
@@ -52,7 +64,7 @@ const aiMainRouter = aiRouter
         stepCountIs(10),
         ({ steps }) =>
           steps.some((step) =>
-            step.toolResults.some((tool) => tool.output?._isFinal),
+            step.toolResults.some((tool: any) => tool.output?._isFinal),
           ),
       ],
       onError: (error) => {
@@ -74,6 +86,7 @@ const aiMainRouter = aiRouter
 
 // console.log('--------REGISTRY--------');
 const aiRouterRegistry = aiMainRouter.registry();
+// console.log('Workflow paths:', Object.keys(aiRouterRegistry.map).filter(p => p.includes('workflow')));
 const aiRouterTools = aiRouterRegistry.tools;
 type AiRouterTools = InferUITools<typeof aiRouterTools>;
 // console.log('--------REGISTRY--------');

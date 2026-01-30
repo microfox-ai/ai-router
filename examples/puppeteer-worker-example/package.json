@@ -6,7 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "deploy-workers": "ai-worker",
+    "deploy-workers": "ai-worker push",
     "lint": "eslint"
   },
   "dependencies": {
@@ -89,7 +89,7 @@
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",
-    "@microfox/ai-worker-cli": "^0.1.0",
+    "@microfox/ai-worker-cli": "*",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
     "@types/react": "^19",

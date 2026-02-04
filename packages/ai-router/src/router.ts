@@ -1099,6 +1099,11 @@ export class AiRouter<
           // The handler is an async function, so we can await it directly.
           // The original Promise wrapper was redundant and could hide issues.
           const result = await layer.handler(ctx, next);
+          // Agents typically don't call next(), so "after" middlewares would never run.
+          // After an agent completes, explicitly continue the chain so .after() runs.
+          if (layer.isAgent) {
+            await next();
+          }
 
           // if (!isInternalCall) {
           //   console.log('toolDefinition', result);

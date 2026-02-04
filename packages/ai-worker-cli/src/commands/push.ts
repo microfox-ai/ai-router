@@ -314,6 +314,7 @@ interface ServerlessConfig {
   custom?: Record<string, any>;
   package: {
     excludeDevDependencies: boolean;
+    individually?: boolean;
     patterns: string[];
   };
   provider: {
@@ -1389,11 +1390,14 @@ function generateServerlessConfig(
     service: serviceName,
     package: {
       excludeDevDependencies: true,
+      individually: true,
+      // Handlers are fully bundled by esbuild (packages: 'bundle'); exclude node_modules to stay under Lambda 250 MB limit
       patterns: [
         '!venv/**',
         '!.idea/**',
         '!.vscode/**',
         '!src/**',
+        '!node_modules/**',
         '!node_modules/serverless-offline/**',
         '!node_modules/typescript/**',
         '!node_modules/@types/**',
@@ -1744,8 +1748,9 @@ async function build(args: any) {
 async function deploy(args: any) {
   const stage = args.stage || process.env.STAGE || 'prod';
   const region = args.region || process.env.AWS_REGION || 'us-east-1';
-  const skipDeploy = args['skip-deploy'] || false;
-  const skipInstall = args['skip-install'] || false;
+  // Commander passes option names as camelCase (e.g. skipDeploy, skipInstall)
+  const skipDeploy = args.skipDeploy ?? args['skip-deploy'] ?? false;
+  const skipInstall = args.skipInstall ?? args['skip-install'] ?? false;
 
   if (skipDeploy) {
     console.log(chalk.yellow('⏭️  Skipping deployment (--skip-deploy flag)'));

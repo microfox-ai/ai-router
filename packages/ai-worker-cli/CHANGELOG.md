@@ -1,5 +1,11 @@
 # @microfox/ai-worker-cli
 
+## 1.0.2
+
+### Patch Changes
+
+- c9507ea: Changes from PR #50: minor-fixes-04-feb-2026
+
 ## 1.0.1
 
 ### Patch Changes

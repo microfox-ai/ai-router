@@ -8,6 +8,17 @@
  */
 
 import type { ZodType, z } from 'zod';
+import type { WorkerQueueConfig, WorkerQueueContext } from './queue.js';
+
+export interface WorkerQueueRegistry {
+  getQueueById(queueId: string): WorkerQueueConfig | undefined;
+  invokeMapInput?: (
+    queueId: string,
+    stepIndex: number,
+    prevOutput: unknown,
+    initialInput: unknown
+  ) => Promise<unknown> | unknown;
+}
 
 export interface DispatchOptions {
   /**
@@ -24,12 +35,31 @@ export interface DispatchOptions {
   mode?: 'auto' | 'local' | 'remote';
   jobId?: string;
   metadata?: Record<string, any>;
+  /**
+   * In-memory queue registry for dispatchQueue. Required when using dispatchQueue.
+   * Pass a registry that imports from your .queue.ts definitions (works on Vercel/serverless).
+   */
+  registry?: WorkerQueueRegistry;
+  /**
+   * Optional callback to create a queue job record before dispatching.
+   * Called with queueJobId (= first worker's jobId), queueId, and firstStep.
+   */
+  onCreateQueueJob?: (params: {
+    queueJobId: string;
+    queueId: string;
+    firstStep: { workerId: string; workerJobId: string };
+    metadata?: Record<string, unknown>;
+  }) => Promise<void>;
 }
 
 export interface DispatchResult {
   messageId: string;
   status: 'queued';
   jobId: string;
+}
+
+export interface DispatchQueueResult extends DispatchResult {
+  queueId: string;
 }
 
 export interface SerializedContext {
@@ -41,6 +71,7 @@ export interface SerializedContext {
 
 /**
  * Derives the full /workers/trigger URL from env.
+ * Exported for use by local dispatchWorker (worker-to-worker in dev).
  *
  * Preferred env vars:
  * - WORKER_BASE_URL: base URL of the workers service (e.g. https://.../prod)
@@ -50,7 +81,7 @@ export interface SerializedContext {
  * - WORKERS_TRIGGER_API_URL / NEXT_PUBLIC_WORKERS_TRIGGER_API_URL
  * - WORKERS_CONFIG_API_URL / NEXT_PUBLIC_WORKERS_CONFIG_API_URL
  */
-function getWorkersTriggerUrl(): string {
+export function getWorkersTriggerUrl(): string {
   const raw =
     process.env.WORKER_BASE_URL ||
     process.env.NEXT_PUBLIC_WORKER_BASE_URL ||
@@ -104,6 +135,7 @@ function serializeContext(ctx: any): SerializedContext {
 
   return serialized;
 }
+
 
 /**
  * Dispatches a background worker job to SQS.
@@ -196,3 +228,150 @@ export async function dispatchLocal<INPUT, OUTPUT>(
 ): Promise<OUTPUT> {
   return handler({ input, ctx: ctx || {} });
 }
+
+/**
+ * Dispatches a queue by ID, using a generated registry of .queue.ts
+ * definitions to determine the first worker and initial input mapping.
+ *
+ * This API intentionally mirrors the ergonomics of dispatching a single
+ * worker, but under the hood it embeds queue context into the job input
+ * so queue-aware wrappers can chain subsequent steps.
+ */
+export async function dispatchQueue<InitialInput = any>(
+  queueId: string,
+  initialInput: InitialInput,
+  options: DispatchOptions = {},
+  ctx?: any
+): Promise<DispatchQueueResult> {
+  const registry = options.registry;
+  if (!registry?.getQueueById) {
+    throw new Error(
+      'dispatchQueue requires options.registry with getQueueById. ' +
+        'Use getQueueRegistry() from your workflows registry (e.g. app/api/workflows/registry/workers) and pass { registry: await getQueueRegistry() }.'
+    );
+  }
+  const { getQueueById, invokeMapInput } = registry;
+  const queue = getQueueById(queueId);
+
+  if (!queue) {
+    throw new Error(`Worker queue "${queueId}" not found in registry`);
+  }
+
+  if (!queue.steps || queue.steps.length === 0) {
+    throw new Error(`Worker queue "${queueId}" has no steps defined`);
+  }
+
+  const stepIndex = 0;
+  const firstStep = queue.steps[stepIndex];
+  const firstWorkerId = firstStep.workerId;
+
+  if (!firstWorkerId) {
+    throw new Error(
+      `Worker queue "${queueId}" has an invalid first step (missing workerId)`
+    );
+  }
+
+  // Compute the first step's input:
+  // - If a mapping function is configured and the registry exposes invokeMapInput,
+  //   use it (prevOutput is undefined for the first step).
+  // - Otherwise, default to the initial input.
+  let firstInput: unknown = initialInput;
+  if (firstStep.mapInputFromPrev && typeof invokeMapInput === 'function') {
+    firstInput = await invokeMapInput(
+      queueId,
+      stepIndex,
+      undefined,
+      initialInput
+    );
+  }
+
+  const jobId =
+    options.jobId ||
+    `job-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+  const queueContext: WorkerQueueContext<InitialInput> = {
+    id: queueId,
+    stepIndex,
+    initialInput,
+    queueJobId: jobId,
+  };
+
+  // Create queue job record if callback provided (for progress tracking)
+  if (options.onCreateQueueJob) {
+    try {
+      await options.onCreateQueueJob({
+        queueJobId: jobId,
+        queueId,
+        firstStep: { workerId: firstWorkerId, workerJobId: jobId },
+        metadata: options.metadata as Record<string, unknown> | undefined,
+      });
+    } catch (err: any) {
+      console.warn('[dispatchQueue] onCreateQueueJob failed:', err?.message ?? err);
+    }
+  }
+
+  // Embed queue context into the worker input under a reserved key.
+  const normalizedFirstInput =
+    firstInput !== null && typeof firstInput === 'object'
+      ? (firstInput as Record<string, any>)
+      : { value: firstInput };
+
+  const inputWithQueue = {
+    ...normalizedFirstInput,
+    __workerQueue: queueContext,
+  };
+
+  const metadataWithQueue = {
+    ...(options.metadata || {}),
+    __workerQueue: queueContext,
+  };
+
+  const triggerUrl = getWorkersTriggerUrl();
+  const serializedContext = ctx ? serializeContext(ctx) : {};
+
+  const messageBody = {
+    workerId: firstWorkerId,
+    jobId,
+    input: inputWithQueue,
+    context: serializedContext,
+    webhookUrl: options.webhookUrl,
+    metadata: metadataWithQueue,
+    timestamp: new Date().toISOString(),
+  };
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  const triggerKey = process.env.WORKERS_TRIGGER_API_KEY;
+  if (triggerKey) {
+    headers['x-workers-trigger-key'] = triggerKey;
+  }
+
+  const response = await fetch(triggerUrl, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      workerId: firstWorkerId,
+      body: messageBody,
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(
+      `Failed to trigger queue "${queueId}" (worker "${firstWorkerId}"): ` +
+        `${response.status} ${response.statusText}${text ? ` - ${text}` : ''}`
+    );
+  }
+
+  const data = (await response.json().catch(() => ({}))) as any;
+  const messageId = data?.messageId ? String(data.messageId) : `trigger-${jobId}`;
+
+  return {
+    queueId,
+    messageId,
+    status: 'queued',
+    jobId,
+  };
+}
+

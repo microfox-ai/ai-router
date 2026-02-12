@@ -17,6 +17,8 @@ const dbName =
 const collectionName =
   process.env.MONGODB_WORKER_JOBS_COLLECTION || 'worker_jobs';
 
+type InternalJobEntry = { jobId: string; workerId: string };
+
 type Doc = {
   _id: string;
   jobId: string;
@@ -26,6 +28,7 @@ type Doc = {
   output?: any;
   error?: { message: string; stack?: string; name?: string };
   metadata?: Record<string, any>;
+  internalJobs?: InternalJobEntry[];
   createdAt: string;
   updatedAt: string;
   completedAt?: string;
@@ -52,6 +55,37 @@ function getClient(): Promise<MongoClient> {
 async function getCollection(): Promise<Collection<Doc>> {
   const client = await getClient();
   return client.db(dbName).collection<Doc>(collectionName);
+}
+
+/**
+ * Load a job by id (read-only). Used for idempotency check before processing.
+ */
+export async function getJobById(jobId: string): Promise<{
+  jobId: string;
+  workerId: string;
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  input: any;
+  output?: any;
+  error?: { message: string; stack?: string };
+  metadata?: Record<string, any>;
+  internalJobs?: Array<{ jobId: string; workerId: string }>;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+} | null> {
+  try {
+    const coll = await getCollection();
+    const doc = await coll.findOne({ _id: jobId });
+    if (!doc) return null;
+    const { _id, ...r } = doc;
+    return r as any;
+  } catch (e: any) {
+    console.error('[Worker] MongoDB getJobById failed:', {
+      jobId,
+      error: e?.message ?? String(e),
+    });
+    return null;
+  }
 }
 
 /**
@@ -133,6 +167,48 @@ export function createMongoJobStore(
         console.error('[Worker] MongoDB job store get failed:', {
           jobId,
           workerId,
+          error: e?.message ?? String(e),
+        });
+        return null;
+      }
+    },
+    appendInternalJob: async (entry: { jobId: string; workerId: string }): Promise<void> => {
+      try {
+        const coll = await getCollection();
+        await coll.updateOne(
+          { _id: jobId },
+          { $push: { internalJobs: entry } }
+        );
+      } catch (e: any) {
+        console.error('[Worker] MongoDB job store appendInternalJob failed:', {
+          jobId,
+          workerId,
+          error: e?.message ?? String(e),
+        });
+      }
+    },
+    getJob: async (otherJobId: string): Promise<{
+      jobId: string;
+      workerId: string;
+      status: 'queued' | 'running' | 'completed' | 'failed';
+      input: any;
+      output?: any;
+      error?: { message: string; stack?: string };
+      metadata?: Record<string, any>;
+      internalJobs?: Array<{ jobId: string; workerId: string }>;
+      createdAt: string;
+      updatedAt: string;
+      completedAt?: string;
+    } | null> => {
+      try {
+        const coll = await getCollection();
+        const doc = await coll.findOne({ _id: otherJobId });
+        if (!doc) return null;
+        const { _id, ...r } = doc;
+        return r as any;
+      } catch (e: any) {
+        console.error('[Worker] MongoDB job store getJob failed:', {
+          otherJobId,
           error: e?.message ?? String(e),
         });
         return null;

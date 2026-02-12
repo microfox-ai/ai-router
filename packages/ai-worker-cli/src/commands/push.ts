@@ -178,6 +178,68 @@ async function collectEnvUsageForWorkers(
   return { runtimeKeys, buildtimeKeys };
 }
 
+/**
+ * Collect callee worker IDs per worker (ctx.dispatchWorker('id', ...) in handler code).
+ * Walks from each worker entry file and its local imports, extracts string literal IDs.
+ */
+async function collectCalleeWorkerIds(
+  workers: WorkerInfo[],
+  projectRoot: string
+): Promise<Map<string, Set<string>>> {
+  void projectRoot;
+  const calleeIdsByWorker = new Map<string, Set<string>>();
+
+  const workerIds = new Set(workers.map((w) => w.id));
+
+  for (const worker of workers) {
+    const calleeIds = new Set<string>();
+    const visited = new Set<string>();
+    const queue: string[] = [worker.filePath];
+
+    while (queue.length > 0) {
+      const file = queue.pop()!;
+      const normalized = path.resolve(file);
+      if (visited.has(normalized)) continue;
+      visited.add(normalized);
+
+      if (!fs.existsSync(normalized) || !fs.statSync(normalized).isFile()) continue;
+      const src = fs.readFileSync(normalized, 'utf-8');
+
+      // ctx.dispatchWorker('id', ...) or ctx.dispatchWorker("id", ...)
+      const re = /(?:ctx\.)?dispatchWorker\s*\(\s*['"]([^'"]+)['"]/g;
+      for (const match of src.matchAll(re)) {
+        if (match[1]) calleeIds.add(match[1]);
+      }
+
+      const specifiers = extractImportSpecifiers(src);
+      for (const spec of specifiers) {
+        if (!spec || !spec.startsWith('.')) continue;
+        const resolved = tryResolveLocalImport(normalized, spec);
+        if (resolved) queue.push(resolved);
+      }
+    }
+
+    if (calleeIds.size > 0) {
+      for (const calleeId of calleeIds) {
+        if (!workerIds.has(calleeId)) {
+          console.warn(
+            chalk.yellow(
+              `⚠️  Worker "${worker.id}" calls "${calleeId}" which is not in scanned workers (typo or other service?). Queue URL will not be auto-injected.`
+            )
+          );
+        }
+      }
+      calleeIdsByWorker.set(worker.id, calleeIds);
+    }
+  }
+
+  return calleeIdsByWorker;
+}
+
+function sanitizeWorkerIdForEnv(workerId: string): string {
+  return workerId.replace(/-/g, '_').toUpperCase();
+}
+
 function readJsonFile<T = any>(filePath: string): T | null {
   try {
     return JSON.parse(fs.readFileSync(filePath, 'utf-8')) as T;
@@ -250,6 +312,32 @@ async function collectRuntimeDependenciesForWorkers(
   return deps;
 }
 
+/** Resolve job store type from env (used for conditional deps). Default: upstash-redis. */
+function getJobStoreType(): 'mongodb' | 'upstash-redis' {
+  const raw = process.env.WORKER_DATABASE_TYPE?.toLowerCase();
+  if (raw === 'mongodb' || raw === 'upstash-redis') return raw;
+  return 'upstash-redis';
+}
+
+/**
+ * Filter runtime deps so only the chosen job-store backend is included (+ mongodb if user code uses it).
+ * - type mongodb: include only mongodb for job store.
+ * - type upstash-redis: include only @upstash/redis for job store.
+ * - If user code imports mongodb (e.g. worker uses Mongo for its own logic), always add mongodb.
+ */
+function filterDepsForJobStore(
+  runtimeDeps: Set<string>,
+  jobStoreType: 'mongodb' | 'upstash-redis'
+): Set<string> {
+  const filtered = new Set(runtimeDeps);
+  filtered.delete('mongodb');
+  filtered.delete('@upstash/redis');
+  if (jobStoreType === 'mongodb') filtered.add('mongodb');
+  else filtered.add('@upstash/redis');
+  if (runtimeDeps.has('mongodb')) filtered.add('mongodb');
+  return filtered;
+}
+
 function buildDependenciesMap(projectRoot: string, deps: Set<string>): Record<string, string> {
   const projectPkg =
     readJsonFile<any>(path.join(projectRoot, 'package.json')) || {};
@@ -287,6 +375,19 @@ function buildDependenciesMap(projectRoot: string, deps: Set<string>): Record<st
   }
 
   return out;
+}
+
+interface QueueStepInfo {
+  workerId: string;
+  delaySeconds?: number;
+  mapInputFromPrev?: string;
+}
+
+interface QueueInfo {
+  id: string;
+  filePath: string;
+  steps: QueueStepInfo[];
+  schedule?: string | { rate: string; enabled?: boolean; input?: Record<string, any> };
 }
 
 interface WorkerInfo {
@@ -415,10 +516,155 @@ async function scanWorkers(aiPath: string = 'app/ai'): Promise<WorkerInfo[]> {
 }
 
 /**
+ * Scans for *.queue.ts files and parses defineWorkerQueue configs.
+ */
+async function scanQueues(aiPath: string = 'app/ai'): Promise<QueueInfo[]> {
+  const base = aiPath.replace(/\\/g, '/');
+  const pattern = `${base}/queues/**/*.queue.ts`;
+  const files = await glob(pattern);
+
+  const queues: QueueInfo[] = [];
+
+  for (const filePath of files) {
+    try {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      // Match defineWorkerQueue({ id: '...', steps: [...], schedule?: ... })
+      const idMatch = content.match(/defineWorkerQueue\s*\(\s*\{[\s\S]*?id:\s*['"]([^'"]+)['"]/);
+      if (!idMatch) {
+        console.warn(chalk.yellow(`⚠️  Skipping ${filePath}: No queue id found in defineWorkerQueue`));
+        continue;
+      }
+      const queueId = idMatch[1];
+
+      const steps: QueueStepInfo[] = [];
+      const stepsMatch = content.match(/steps:\s*\[([\s\S]*?)\]/);
+      if (stepsMatch) {
+        const stepsStr = stepsMatch[1];
+        const stepRegex = /\{\s*workerId:\s*['"]([^'"]+)['"](?:,\s*delaySeconds:\s*(\d+))?(?:,\s*mapInputFromPrev:\s*['"]([^'"]+)['"])?\s*\}/g;
+        let m;
+        while ((m = stepRegex.exec(stepsStr)) !== null) {
+          steps.push({
+            workerId: m[1],
+            delaySeconds: m[2] ? parseInt(m[2], 10) : undefined,
+            mapInputFromPrev: m[3],
+          });
+        }
+      }
+
+      let schedule: QueueInfo['schedule'];
+      const scheduleStrMatch = content.match(/schedule:\s*['"]([^'"]+)['"]/);
+      const scheduleObjMatch = content.match(/schedule:\s*(\{[^}]+(?:\{[^}]*\}[^}]*)*\})/);
+      if (scheduleStrMatch) {
+        schedule = scheduleStrMatch[1];
+      } else if (scheduleObjMatch) {
+        try {
+          schedule = new Function('return ' + scheduleObjMatch[1])();
+        } catch {
+          schedule = undefined;
+        }
+      }
+
+      queues.push({ id: queueId, filePath, steps, schedule });
+    } catch (error) {
+      console.error(chalk.red(`❌ Error processing ${filePath}:`), error);
+    }
+  }
+
+  return queues;
+}
+
+/**
+ * Generates the queue registry module for runtime lookup.
+ */
+function generateQueueRegistry(queues: QueueInfo[], outputDir: string, projectRoot: string): void {
+  const generatedDir = path.join(outputDir, 'generated');
+  if (!fs.existsSync(generatedDir)) {
+    fs.mkdirSync(generatedDir, { recursive: true });
+  }
+
+  const registryContent = `/**
+ * Auto-generated queue registry. DO NOT EDIT.
+ * Generated by @microfox/ai-worker-cli from .queue.ts files.
+ */
+
+const QUEUES = ${JSON.stringify(queues.map((q) => ({ id: q.id, steps: q.steps, schedule: q.schedule })), null, 2)};
+
+export function getQueueById(queueId) {
+  return QUEUES.find((q) => q.id === queueId);
+}
+
+export function getNextStep(queueId, stepIndex) {
+  const queue = getQueueById(queueId);
+  if (!queue || !queue.steps || stepIndex < 0 || stepIndex >= queue.steps.length - 1) {
+    return undefined;
+  }
+  const step = queue.steps[stepIndex + 1];
+  return step ? { workerId: step.workerId, delaySeconds: step.delaySeconds, mapInputFromPrev: step.mapInputFromPrev } : undefined;
+}
+
+export function invokeMapInput(_queueId, _stepIndex, prevOutput, _initialInput) {
+  return prevOutput;
+}
+`;
+
+  const registryPath = path.join(generatedDir, 'workerQueues.registry.js');
+  fs.writeFileSync(registryPath, registryContent);
+  console.log(chalk.green(`✓ Generated queue registry: ${registryPath}`));
+
+  // Note: For dispatchQueue in app (e.g. Vercel), use in-memory registry:
+  // app/ai/queues/registry.ts imports from .queue.ts and exports queueRegistry.
+}
+
+/**
+ * Returns worker IDs that participate in any queue (for wrapping and callee injection).
+ */
+function getWorkersInQueues(queues: QueueInfo[]): Set<string> {
+  const set = new Set<string>();
+  for (const q of queues) {
+    for (const step of q.steps) {
+      set.add(step.workerId);
+    }
+  }
+  return set;
+}
+
+/**
+ * Merges queue next-step worker IDs into calleeIds so WORKER_QUEUE_URL_* gets injected.
+ */
+function mergeQueueCallees(
+  calleeIds: Map<string, Set<string>>,
+  queues: QueueInfo[],
+  workers: WorkerInfo[]
+): Map<string, Set<string>> {
+  const merged = new Map(calleeIds);
+  const workerIds = new Set(workers.map((w) => w.id));
+
+  for (const queue of queues) {
+    for (let i = 0; i < queue.steps.length - 1; i++) {
+      const fromWorkerId = queue.steps[i].workerId;
+      const toWorkerId = queue.steps[i + 1].workerId;
+      if (!workerIds.has(toWorkerId)) continue;
+      let callees = merged.get(fromWorkerId);
+      if (!callees) {
+        callees = new Set<string>();
+        merged.set(fromWorkerId, callees);
+      }
+      callees.add(toWorkerId);
+    }
+  }
+  return merged;
+}
+
+/**
  * Generates Lambda handler entrypoints for each worker.
  */
-async function generateHandlers(workers: WorkerInfo[], outputDir: string): Promise<void> {
+async function generateHandlers(
+  workers: WorkerInfo[],
+  outputDir: string,
+  queues: QueueInfo[] = []
+): Promise<void> {
   const handlersDir = path.join(outputDir, 'handlers');
+  const workersInQueues = getWorkersInQueues(queues);
 
   // Ensure handlers directory exists and is clean
   if (fs.existsSync(handlersDir)) {
@@ -472,19 +718,83 @@ async function generateHandlers(workers: WorkerInfo[], outputDir: string): Promi
       ? 'workerModule.default'
       : `workerModule.${exportName}`;
 
-    // Try to import workerConfig (new pattern) - it might not exist (old pattern)
-    const tempEntryContent = `
-import { createLambdaHandler } from '@microfox/ai-worker/handler';
+    const inQueue = workersInQueues.has(worker.id);
+    const registryRelPath = path
+      .relative(path.dirname(path.resolve(handlerFile)), path.join(outputDir, 'generated', 'workerQueues.registry'))
+      .split(path.sep)
+      .join('/');
+    const registryImportPath = registryRelPath.startsWith('.') ? registryRelPath : './' + registryRelPath;
+
+    const handlerCreation = inQueue
+      ? `
+import { createLambdaHandler, wrapHandlerForQueue } from '@microfox/ai-worker/handler';
+import * as queueRegistry from '${registryImportPath}';
 import * as workerModule from '${relativeImportPath}';
+
+const WORKER_LOG_PREFIX = '[WorkerEntrypoint]';
 
 const workerAgent = ${workerRef};
 if (!workerAgent || typeof workerAgent.handler !== 'function') {
   throw new Error('Worker module must export a createWorker result (default or named) with .handler');
 }
 
-export const handler = createLambdaHandler(workerAgent.handler, workerAgent.outputSchema);
+const queueRuntime = {
+  getNextStep: queueRegistry.getNextStep,
+  invokeMapInput: queueRegistry.invokeMapInput,
+};
+const wrappedHandler = wrapHandlerForQueue(workerAgent.handler, queueRuntime);
+
+const baseHandler = createLambdaHandler(wrappedHandler, workerAgent.outputSchema);
+
+export const handler = async (event: any, context: any) => {
+  const records = Array.isArray((event as any)?.Records) ? (event as any).Records.length : 0;
+  try {
+    console.log(WORKER_LOG_PREFIX, {
+      workerId: workerAgent.id,
+      inQueue: true,
+      records,
+      requestId: (context as any)?.awsRequestId,
+    });
+  } catch {
+    // Best-effort logging only
+  }
+  return baseHandler(event, context);
+};
+
+export const exportedWorkerConfig = workerModule.workerConfig || workerAgent?.workerConfig;
+`
+      : `
+import { createLambdaHandler } from '@microfox/ai-worker/handler';
+import * as workerModule from '${relativeImportPath}';
+
+const WORKER_LOG_PREFIX = '[WorkerEntrypoint]';
+
+const workerAgent = ${workerRef};
+if (!workerAgent || typeof workerAgent.handler !== 'function') {
+  throw new Error('Worker module must export a createWorker result (default or named) with .handler');
+}
+
+const baseHandler = createLambdaHandler(workerAgent.handler, workerAgent.outputSchema);
+
+export const handler = async (event: any, context: any) => {
+  const records = Array.isArray((event as any)?.Records) ? (event as any).Records.length : 0;
+  try {
+    console.log(WORKER_LOG_PREFIX, {
+      workerId: workerAgent.id,
+      inQueue: false,
+      records,
+      requestId: (context as any)?.awsRequestId,
+    });
+  } catch {
+    // Best-effort logging only
+  }
+  return baseHandler(event, context);
+};
+
 export const exportedWorkerConfig = workerModule.workerConfig || workerAgent?.workerConfig;
 `;
+
+    const tempEntryContent = handlerCreation;
     fs.writeFileSync(tempEntryFile, tempEntryContent);
 
     // 2. Bundle using esbuild
@@ -934,12 +1244,95 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
 }
 
 /**
+ * Generates queue-starter Lambda for a scheduled queue.
+ * When the schedule fires, it sends the first worker a message with __workerQueue context.
+ */
+function generateQueueStarterHandler(
+  outputDir: string,
+  queue: QueueInfo,
+  serviceName: string
+): void {
+  const safeId = queue.id.replace(/[^a-zA-Z0-9]/g, '');
+  const handlerFile = path.join(outputDir, 'handlers', `queue-starter-${safeId}.js`);
+  const tempEntryFile = handlerFile.replace('.js', '.temp.ts');
+  const handlerDir = path.dirname(handlerFile);
+
+  if (!fs.existsSync(handlerDir)) {
+    fs.mkdirSync(handlerDir, { recursive: true });
+  }
+
+  const firstWorkerId = queue.steps[0]?.workerId;
+  if (!firstWorkerId) return;
+
+  const handlerContent = `/**
+ * Auto-generated queue-starter for queue "${queue.id}"
+ * DO NOT EDIT - This file is generated by @microfox/ai-worker-cli
+ */
+
+import { ScheduledHandler } from 'aws-lambda';
+import { SQSClient, GetQueueUrlCommand, SendMessageCommand } from '@aws-sdk/client-sqs';
+
+const QUEUE_ID = ${JSON.stringify(queue.id)};
+const FIRST_WORKER_ID = ${JSON.stringify(firstWorkerId)};
+const SERVICE_NAME = ${JSON.stringify(serviceName)};
+
+export const handler: ScheduledHandler = async () => {
+  const stage = process.env.ENVIRONMENT || process.env.STAGE || 'prod';
+  const region = process.env.AWS_REGION || 'us-east-1';
+  const queueName = \`\${SERVICE_NAME}-\${FIRST_WORKER_ID}-\${stage}\`;
+
+  const sqs = new SQSClient({ region });
+  const { QueueUrl } = await sqs.send(new GetQueueUrlCommand({ QueueName: queueName }));
+  if (!QueueUrl) {
+    throw new Error('Queue URL not found: ' + queueName);
+  }
+
+  const jobId = 'job-' + Date.now() + '-' + Math.random().toString(36).slice(2, 11);
+  const initialInput = {};
+  const messageBody = {
+    workerId: FIRST_WORKER_ID,
+    jobId,
+    input: {
+      ...initialInput,
+      __workerQueue: { id: QUEUE_ID, stepIndex: 0, initialInput },
+    },
+    context: {},
+    metadata: { __workerQueue: { id: QUEUE_ID, stepIndex: 0, initialInput } },
+    timestamp: new Date().toISOString(),
+  };
+
+  await sqs.send(new SendMessageCommand({
+    QueueUrl,
+    MessageBody: JSON.stringify(messageBody),
+  }));
+
+  console.log('[queue-starter] Dispatched first worker for queue:', { queueId: QUEUE_ID, jobId, workerId: FIRST_WORKER_ID });
+};
+`;
+
+  fs.writeFileSync(tempEntryFile, handlerContent);
+  esbuild.buildSync({
+    entryPoints: [tempEntryFile],
+    bundle: true,
+    platform: 'node',
+    target: 'node20',
+    outfile: handlerFile,
+    external: ['aws-sdk', 'canvas', '@microfox/puppeteer-sls', '@sparticuz/chromium'],
+    packages: 'bundle',
+    logLevel: 'error',
+  });
+  fs.unlinkSync(tempEntryFile);
+  console.log(chalk.green(`✓ Generated queue-starter for ${queue.id}`));
+}
+
+/**
  * Generates workers-config Lambda handler.
  */
 function generateWorkersConfigHandler(
   outputDir: string,
   workers: WorkerInfo[],
-  serviceName: string
+  serviceName: string,
+  queues: QueueInfo[] = []
 ): void {
   // We'll bundle this one too
   const handlerFile = path.join(outputDir, 'handlers', 'workers-config.js');
@@ -961,8 +1354,9 @@ function generateWorkersConfigHandler(
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { SQSClient, GetQueueUrlCommand } from '@aws-sdk/client-sqs';
 
-// Worker IDs embedded at build time so this endpoint doesn't depend on any generated files.
+// Worker IDs and queue definitions embedded at build time.
 const WORKER_IDS: string[] = ${JSON.stringify(workers.map(w => w.id), null, 2)};
+const QUEUES = ${JSON.stringify(queues.map(q => ({ id: q.id, steps: q.steps, schedule: q.schedule })), null, 2)};
 const SERVICE_NAME = ${JSON.stringify(serviceName)};
 
 export const handler = async (
@@ -1033,6 +1427,7 @@ export const handler = async (
       stage,
       region,
       workers,
+      queues: QUEUES,
       ...(debug ? { attemptedQueueNames, errors } : {}),
     }),
   };
@@ -1189,7 +1584,9 @@ function generateServerlessConfig(
   stage: string,
   region: string,
   envVars: Record<string, string>,
-  serviceName: string
+  serviceName: string,
+  calleeIds: Map<string, Set<string>> = new Map(),
+  queues: QueueInfo[] = []
 ): ServerlessConfig {
   // Create SQS queues for each worker
   const resources: ServerlessConfig['resources'] = {
@@ -1312,6 +1709,23 @@ function generateServerlessConfig(
     if (worker.workerConfig?.layers?.length) {
       functions[functionName].layers = worker.workerConfig.layers;
     }
+
+    // Per-function env: queue URLs for workers this Lambda calls (ctx.dispatchWorker)
+    const callees = calleeIds.get(worker.id);
+    if (callees && callees.size > 0) {
+      const env: Record<string, any> = {};
+      for (const calleeId of callees) {
+        const calleeWorker = workers.find((w) => w.id === calleeId);
+        if (calleeWorker) {
+          const queueLogicalId = `WorkerQueue${calleeWorker.id.replace(/[^a-zA-Z0-9]/g, '')}${stage}`;
+          const envKey = `WORKER_QUEUE_URL_${sanitizeWorkerIdForEnv(calleeId)}`;
+          env[envKey] = { Ref: queueLogicalId };
+        }
+      }
+      if (Object.keys(env).length > 0) {
+        functions[functionName].environment = env;
+      }
+    }
   }
 
   // Add docs.json function for Microfox compatibility
@@ -1356,9 +1770,24 @@ function generateServerlessConfig(
     ],
   };
 
+  // Add queue-starter functions for scheduled queues
+  for (const queue of queues) {
+    if (queue.schedule) {
+      const safeId = queue.id.replace(/[^a-zA-Z0-9]/g, '');
+      const fnName = `queueStarter${safeId}`;
+      const scheduleEvents = processScheduleEvents(queue.schedule);
+      functions[fnName] = {
+        handler: `handlers/queue-starter-${safeId}.handler`,
+        timeout: 60,
+        memorySize: 128,
+        events: scheduleEvents,
+      };
+    }
+  }
+
   // Filter env vars - only include safe ones (exclude secrets that should be in AWS Secrets Manager)
   const safeEnvVars: Record<string, string> = {};
-  const allowedPrefixes = ['OPENAI_', 'ANTHROPIC_', 'DATABASE_', 'MONGODB_', 'REDIS_', 'WORKERS_', 'REMOTION_'];
+  const allowedPrefixes = ['OPENAI_', 'ANTHROPIC_', 'DATABASE_', 'MONGODB_', 'REDIS_', 'UPSTASH_', 'WORKER_', 'WORKERS_', 'WORKFLOW_', 'REMOTION_', 'QUEUE_JOB_', 'DEBUG_WORKER_QUEUES'];
 
   // AWS_ prefix is reserved by Lambda, do not include it in environment variables
   // https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars.html
@@ -1552,11 +1981,14 @@ async function build(args: any) {
   // Build an accurate dependencies map for Microfox installs:
   // include any npm packages imported by the worker entrypoints (and their local imports),
   // plus runtime packages used by generated handlers.
+  // Job store backend is conditional on WORKER_DATABASE_TYPE; include only that backend (+ mongodb if user code uses it).
   const runtimeDeps = await collectRuntimeDependenciesForWorkers(
     workers.map((w) => w.filePath),
     process.cwd()
   );
-  const dependencies = buildDependenciesMap(process.cwd(), runtimeDeps);
+  const jobStoreType = getJobStoreType();
+  const filteredDeps = filterDepsForJobStore(runtimeDeps, jobStoreType);
+  const dependencies = buildDependenciesMap(process.cwd(), filteredDeps);
 
   // Generate package.json for the serverless service (used by Microfox push)
   const packageJson = {
@@ -1636,8 +2068,14 @@ async function build(args: any) {
     }
   }
 
+  const queues = await scanQueues(aiPath);
+  if (queues.length > 0) {
+    console.log(chalk.blue(`ℹ️  Found ${queues.length} queue(s): ${queues.map((q) => q.id).join(', ')}`));
+    generateQueueRegistry(queues, serverlessDir, process.cwd());
+  }
+
   ora('Generating handlers...').start().succeed('Generated handlers');
-  await generateHandlers(workers, serverlessDir);
+  await generateHandlers(workers, serverlessDir, queues);
 
   // Now import the bundled handlers to extract workerConfig
   const extractSpinner = ora('Extracting worker configs from bundled handlers...').start();
@@ -1706,11 +2144,19 @@ async function build(args: any) {
   }
   extractSpinner.succeed('Extracted configs');
 
-  generateWorkersConfigHandler(serverlessDir, workers, serviceName);
+  generateWorkersConfigHandler(serverlessDir, workers, serviceName, queues);
   generateDocsHandler(serverlessDir, serviceName, stage, region);
   generateTriggerHandler(serverlessDir, serviceName);
 
-  const config = generateServerlessConfig(workers, stage, region, envVars, serviceName);
+  for (const queue of queues) {
+    if (queue.schedule) {
+      generateQueueStarterHandler(serverlessDir, queue, serviceName);
+    }
+  }
+
+  let calleeIds = await collectCalleeWorkerIds(workers, process.cwd());
+  calleeIds = mergeQueueCallees(calleeIds, queues, workers);
+  const config = generateServerlessConfig(workers, stage, region, envVars, serviceName, calleeIds, queues);
 
   // Always generate env.json now as serverless.yml relies on it.
   // Microfox deploys APIs on prod by default; when microfox.json exists, default ENVIRONMENT/STAGE to "prod".
@@ -1720,7 +2166,7 @@ async function build(args: any) {
     STAGE: envStage,
     NODE_ENV: envStage,
   };
-  const allowedPrefixes = ['OPENAI_', 'ANTHROPIC_', 'DATABASE_', 'MONGODB_', 'REDIS_', 'WORKERS_', 'REMOTION_'];
+  const allowedPrefixes = ['OPENAI_', 'ANTHROPIC_', 'DATABASE_', 'MONGODB_', 'REDIS_', 'UPSTASH_', 'WORKER_', 'WORKERS_', 'WORKFLOW_', 'REMOTION_', 'QUEUE_JOB_', 'DEBUG_WORKER_QUEUES'];
 
   for (const [key, value] of Object.entries(envVars)) {
     // AWS_ prefix is reserved by Lambda, do not include it in environment variables

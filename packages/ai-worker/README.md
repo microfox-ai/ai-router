@@ -110,7 +110,10 @@ npx @microfox/ai-worker-cli@latest push
 **Required for Lambda (set via deploy script):**
 - `AWS_REGION` - AWS region for SQS/Lambda
 - `STAGE` - Deployment stage (dev/stage/prod)
+- `MONGODB_URI` or `DATABASE_MONGODB_URI` - For job store (and internalJobs / await polling).
 - Any secrets your workers need (OPENAI_KEY, DATABASE_URL, etc.)
+
+**Worker-to-worker (Lambda):** When a worker calls another via `ctx.dispatchWorker`, the CLI injects `WORKER_QUEUE_URL_<SANITIZED_ID>` (e.g. `WORKER_QUEUE_URL_COST_USAGE_AI`) into that function’s environment. Same-service callees get this automatically; cross-service callees require setting the env var manually.
 
 ### Worker Configuration
 
@@ -179,6 +182,21 @@ Dispatches a job to the background worker.
 - `options: { webhookUrl?: string, jobId?: string, metadata?: Record<string, any> }`
 
 **Returns:** `Promise<{ messageId: string, status: 'queued', jobId: string }>`
+
+### Worker-to-worker: `ctx.dispatchWorker(workerId, input, options?)`
+
+Inside a worker handler, call another worker (fire-and-forget or await):
+
+```typescript
+handler: async ({ ctx }) => {
+  await ctx.dispatchWorker('other-worker', {}, { await: true });
+};
+```
+
+- **Fire-and-forget**: `ctx.dispatchWorker(id, input)` — enqueues and returns `{ jobId, messageId }`. Parent job’s `internalJobs` is appended.
+- **Await**: `ctx.dispatchWorker(id, input, { await: true })` — enqueues, appends to `internalJobs`, then polls the job store until the child completes or fails. Returns `{ jobId, messageId, output }` or throws. Optional `pollIntervalMs`, `pollTimeoutMs`.
+
+The CLI detects `ctx.dispatchWorker('id', ...)` and adds `WORKER_QUEUE_URL_<ID>` to that Lambda’s env. Local dev uses the HTTP trigger when queue URL is not set.
 
 ## License
 

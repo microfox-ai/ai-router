@@ -1,6 +1,6 @@
 {
   "name": "@microfox/ai-worker-cli",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "CLI tooling for deploying ai-router background workers",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",

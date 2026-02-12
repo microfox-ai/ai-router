@@ -1,5 +1,13 @@
 # @microfox/ai-worker-cli
 
+## 1.0.3
+
+### Patch Changes
+
+- ab4a506: Changes from PR #52: add_workers-dispatch-queue
+- Updated dependencies [ab4a506]
+  - @microfox/ai-worker@1.0.2
+
 ## 1.0.2
 
 ### Patch Changes

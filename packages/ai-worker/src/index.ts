@@ -3,13 +3,14 @@
  * Worker runtime for ai-router - SQS-based async agent execution
  */
 
-import { dispatch, dispatchLocal, type DispatchOptions, type DispatchResult } from './client.js';
-import { createLambdaHandler, type WorkerHandler, type JobStore } from './handler.js';
+import { dispatch, dispatchLocal, getWorkersTriggerUrl, type DispatchOptions, type DispatchResult } from './client.js';
+import { createLambdaHandler, type WorkerHandler, type JobStore, type DispatchWorkerOptions, SQS_MAX_DELAY_SECONDS } from './handler.js';
 import type { ZodType, z } from 'zod';
 
 export * from './client.js';
 export * from './handler.js';
 export * from './config.js';
+export * from './queue.js';
 
 /**
  * Schedule event configuration for a worker.
@@ -403,6 +404,44 @@ export function createWorker<INPUT_SCHEMA extends ZodType<any>, OUTPUT>(
                   return null;
                 }
               },
+              appendInternalJob: async (entry: { jobId: string; workerId: string }) => {
+                try {
+                  const nextJsPath = '@/app/api/workflows/stores/jobStore';
+                  const explicitPath = process.env.WORKER_JOB_STORE_MODULE_PATH;
+                  for (const importPath of [nextJsPath, explicitPath].filter(Boolean)) {
+                    try {
+                      const module = await import(importPath!);
+                      if (typeof module?.appendInternalJob === 'function') {
+                        await module.appendInternalJob(localJobId, entry);
+                        return;
+                      }
+                    } catch {
+                      // Continue
+                    }
+                  }
+                } catch (error: any) {
+                  console.warn('[Worker] Failed to appendInternalJob (direct DB):', { localJobId, error: error?.message || String(error) });
+                }
+              },
+              getJob: async (otherJobId: string) => {
+                try {
+                  const nextJsPath = '@/app/api/workflows/stores/jobStore';
+                  const explicitPath = process.env.WORKER_JOB_STORE_MODULE_PATH;
+                  for (const importPath of [nextJsPath, explicitPath].filter(Boolean)) {
+                    try {
+                      const module = await import(importPath!);
+                      if (typeof module?.getJob === 'function') {
+                        return await module.getJob(otherJobId);
+                      }
+                    } catch {
+                      // Continue
+                    }
+                  }
+                } catch (error: any) {
+                  console.warn('[Worker] Failed to getJob (direct DB):', { otherJobId, error: error?.message || String(error) });
+                }
+                return null;
+              },
             };
           }
 
@@ -490,6 +529,126 @@ export function createWorker<INPUT_SCHEMA extends ZodType<any>, OUTPUT>(
 
         const jobStore = createLocalJobStore(directJobStore, jobStoreUrl);
 
+        const DEFAULT_POLL_INTERVAL_MS = 2000;
+        const DEFAULT_POLL_TIMEOUT_MS = 15 * 60 * 1000;
+
+        const createLocalDispatchWorker = (
+          parentJobId: string,
+          parentWorkerId: string,
+          parentContext: Record<string, any>,
+          store: JobStore | undefined
+        ): ((
+          workerId: string,
+          input: unknown,
+          options?: DispatchWorkerOptions
+        ) => Promise<{ jobId: string; messageId?: string; output?: unknown }>) => {
+          return async (
+            calleeWorkerId: string,
+            input: unknown,
+            options?: DispatchWorkerOptions
+          ): Promise<{ jobId: string; messageId?: string; output?: unknown }> => {
+            const childJobId =
+              options?.jobId ||
+              `job-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+            const metadata = options?.metadata ?? {};
+            const serializedContext: Record<string, any> = {};
+            if (parentContext.requestId) serializedContext.requestId = parentContext.requestId;
+            const messageBody = {
+              workerId: calleeWorkerId,
+              jobId: childJobId,
+              input: input ?? {},
+              context: serializedContext,
+              webhookUrl: options?.webhookUrl,
+              metadata,
+              timestamp: new Date().toISOString(),
+            };
+            let triggerUrl: string;
+            try {
+              triggerUrl = getWorkersTriggerUrl();
+            } catch (e: any) {
+              throw new Error(
+                `Local dispatchWorker requires WORKER_BASE_URL (or similar) for worker "${calleeWorkerId}": ${e?.message ?? e}`
+              );
+            }
+            const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+            const triggerKey = process.env.WORKERS_TRIGGER_API_KEY;
+            if (triggerKey) headers['x-workers-trigger-key'] = triggerKey;
+
+            // Fire-and-forget with delay: schedule trigger after delay, return immediately (no computation/wait in caller).
+            if (options?.await !== true && options?.delaySeconds != null && options.delaySeconds > 0) {
+              const sec = Math.min(SQS_MAX_DELAY_SECONDS, Math.max(0, Math.floor(options.delaySeconds)));
+              const storeRef = store;
+              setTimeout(() => {
+                fetch(triggerUrl, {
+                  method: 'POST',
+                  headers,
+                  body: JSON.stringify({ workerId: calleeWorkerId, body: messageBody }),
+                })
+                  .then(async (response) => {
+                    if (!response.ok) {
+                      const text = await response.text().catch(() => '');
+                      console.error(
+                        `[Worker] Delayed trigger failed for "${calleeWorkerId}": ${response.status} ${response.statusText}${text ? ` - ${text}` : ''}`
+                      );
+                      return;
+                    }
+                    if (storeRef?.appendInternalJob) {
+                      await storeRef.appendInternalJob({ jobId: childJobId, workerId: calleeWorkerId });
+                    }
+                  })
+                  .catch((err) => {
+                    console.error('[Worker] Delayed trigger error:', { calleeWorkerId, jobId: childJobId, error: err?.message ?? err });
+                  });
+              }, sec * 1000);
+              return { jobId: childJobId, messageId: undefined };
+            }
+
+            const response = await fetch(triggerUrl, {
+              method: 'POST',
+              headers,
+              body: JSON.stringify({ workerId: calleeWorkerId, body: messageBody }),
+            });
+            if (!response.ok) {
+              const text = await response.text().catch(() => '');
+              throw new Error(
+                `Failed to trigger worker "${calleeWorkerId}": ${response.status} ${response.statusText}${text ? ` - ${text}` : ''}`
+              );
+            }
+            const data = (await response.json().catch(() => ({}))) as any;
+            const messageId = data?.messageId ? String(data.messageId) : `trigger-${childJobId}`;
+
+            if (store?.appendInternalJob) {
+              await store.appendInternalJob({ jobId: childJobId, workerId: calleeWorkerId });
+            }
+
+            if (options?.await && store?.getJob) {
+              const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+              const pollTimeoutMs = options.pollTimeoutMs ?? DEFAULT_POLL_TIMEOUT_MS;
+              const deadline = Date.now() + pollTimeoutMs;
+              while (Date.now() < deadline) {
+                const child = await store.getJob(childJobId);
+                if (!child) {
+                  await new Promise((r) => setTimeout(r, pollIntervalMs));
+                  continue;
+                }
+                if (child.status === 'completed') {
+                  return { jobId: childJobId, messageId, output: child.output };
+                }
+                if (child.status === 'failed') {
+                  const err = child.error;
+                  throw new Error(err?.message ?? `Child worker ${calleeWorkerId} failed`);
+                }
+                await new Promise((r) => setTimeout(r, pollIntervalMs));
+              }
+              throw new Error(
+                `Child worker ${calleeWorkerId} (${childJobId}) did not complete within ${pollTimeoutMs}ms`
+              );
+            }
+
+            return { jobId: childJobId, messageId };
+          };
+        };
+
         // Create initial job record if we have job store access
         if (directJobStore?.setJob) {
           try {
@@ -510,11 +669,16 @@ export function createWorker<INPUT_SCHEMA extends ZodType<any>, OUTPUT>(
           }
         }
 
-        // Create handler context with job store
+        const baseContext = { jobId: localJobId, workerId: id };
         const handlerContext = {
-          jobId: localJobId,
-          workerId: id,
+          ...baseContext,
           ...(jobStore ? { jobStore } : {}),
+          dispatchWorker: createLocalDispatchWorker(
+            localJobId,
+            id,
+            baseContext,
+            jobStore
+          ),
         };
 
         try {

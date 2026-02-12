@@ -6,15 +6,31 @@
  *
  * - getWorker(workerId): returns a synthetic WorkerAgent that dispatches via POST /workers/trigger
  * - listWorkers(): returns worker IDs from the config API response
+ * - getQueueRegistry(): returns QueueRegistry from config (for dispatchQueue)
  */
 
 import type { WorkerAgent } from '@microfox/ai-worker';
+
+/** Queue step config (matches WorkerQueueStep from @microfox/ai-worker). */
+export interface QueueStepConfig {
+  workerId: string;
+  delaySeconds?: number;
+  mapInputFromPrev?: string;
+}
+
+/** Queue config from workers/config API (matches WorkerQueueConfig structure). */
+export interface QueueConfig {
+  id: string;
+  steps: QueueStepConfig[];
+  schedule?: string | { rate: string; enabled?: boolean; input?: Record<string, any> };
+}
 
 export interface WorkersConfig {
   version?: string;
   stage?: string;
   region?: string;
   workers: Record<string, { queueUrl: string; region: string }>;
+  queues?: QueueConfig[];
 }
 
 let configCache: WorkersConfig | null = null;
@@ -52,7 +68,7 @@ function getTriggerUrl(): string {
  * Fetch and cache workers config from GET /workers/config.
  */
 export async function fetchWorkersConfig(): Promise<WorkersConfig> {
-  if (configCache?.workers && Object.keys(configCache.workers).length > 0) {
+  if (configCache) {
     return configCache;
   }
   const configUrl = getConfigUrl();
@@ -74,6 +90,9 @@ export async function fetchWorkersConfig(): Promise<WorkersConfig> {
     );
   }
   configCache = data;
+  const workerIds = Object.keys(data.workers);
+  const queueIds = data.queues?.map((q) => q.id) ?? [];
+  console.log('[WorkerRegistry] Config loaded', { workers: workerIds.length, queues: queueIds });
   return data;
 }
 
@@ -145,6 +164,38 @@ export async function getWorker(
     return null;
   }
   return createSyntheticAgent(workerId);
+}
+
+/**
+ * Registry compatible with dispatchQueue options.registry.
+ * Uses queue definitions from workers/config API.
+ */
+export interface QueueRegistry {
+  getQueueById(queueId: string): QueueConfig | undefined;
+  invokeMapInput?(
+    queueId: string,
+    stepIndex: number,
+    prevOutput: unknown,
+    initialInput: unknown
+  ): Promise<unknown> | unknown;
+}
+
+/**
+ * Get the queue registry from the workers config API.
+ * Use with dispatchQueue: dispatchQueue('cost-usage', {}, { registry: await getQueueRegistry() }).
+ */
+export async function getQueueRegistry(): Promise<QueueRegistry> {
+  const config = await fetchWorkersConfig();
+  const queues: QueueConfig[] = config.queues ?? [];
+
+  return {
+    getQueueById(queueId: string): QueueConfig | undefined {
+      return queues.find((q) => q.id === queueId);
+    },
+    invokeMapInput(_queueId: string, _stepIndex: number, prevOutput: unknown): unknown {
+      return prevOutput;
+    },
+  };
 }
 
 /**

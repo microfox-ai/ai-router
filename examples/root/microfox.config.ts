@@ -14,27 +14,44 @@ export const StudioConfig = {
       },
     },
     database: {
-      // Set type directly here or via DATABASE_TYPE env var (config takes precedence)
-      type: (process.env.DATABASE_TYPE as 'local' | 'mongodb' | 'redis' | 'supabase') || 'mongodb', // local | mongodb | redis | supabase
-      // MongoDB configuration (set values directly here, or they'll fallback to env vars)
-      mongodb: {
-        uri: process.env.DATABASE_MONGODB_URI || process.env.MONGODB_URI, // Set directly: 'mongodb://localhost:27017'
-        db: process.env.DATABASE_MONGODB_DB || process.env.MONGODB_DB || 'ai_router', // Set directly: 'ai_router'
-        // Override in config (e.g. 'my_status') or use env. Defaults: workflow_status, worker_jobs.
-        workflowStatusCollection:
-          process.env.MONGODB_WORKFLOW_STATUS_COLLECTION || 'workflow_status',
-        workerJobsCollection:
-          process.env.MONGODB_WORKER_JOBS_COLLECTION || 'worker_jobs',
-      },
-      // Redis configuration (set values directly here, or they'll fallback to env vars)
-      redis: {
-        url: process.env.UPSTASH_REDIS_REST_URL || process.env.UPSTASH_REDIS_URL, // Set directly: 'https://your-redis.upstash.io'
-        token: process.env.UPSTASH_REDIS_REST_TOKEN || process.env.UPSTASH_REDIS_TOKEN, // Set directly: 'your_token'
-        keyPrefix: process.env.UPSTASH_REDIS_KEY_PREFIX || 'workflow:jobs:', // Set directly: 'workflow:jobs:'
-      },
+      type: 'local', // local | upstash-redis | supabase
       fileUpload: {
         enabled: true,
         apiKey: process.env.SERVER_SECRET_API_KEY,
+      },
+    },
+  },
+  // Workflow + worker runtime configuration (job store, etc.)
+  workflowSettings: {
+    jobStore: {
+      // 'mongodb' | 'upstash-redis'
+      type:
+        (process.env.WORKER_DATABASE_TYPE as
+          | 'mongodb'
+          | 'upstash-redis') || 'upstash-redis',
+      mongodb: {
+        uri: process.env.DATABASE_MONGODB_URI || process.env.MONGODB_URI,
+        db:
+          process.env.DATABASE_MONGODB_DB ||
+          process.env.MONGODB_DB ||
+          'ai_router',
+        workerJobsCollection:
+          process.env.MONGODB_WORKER_JOBS_COLLECTION || 'worker_jobs',
+        workflowStatusCollection:
+          process.env.MONGODB_WORKFLOW_STATUS_COLLECTION || 'workflow_status',
+      },
+      redis: {
+        url:
+          process.env.WORKER_UPSTASH_REDIS_REST_URL ||
+          process.env.UPSTASH_REDIS_REST_URL,
+        token:
+          process.env.WORKER_UPSTASH_REDIS_REST_TOKEN ||
+          process.env.UPSTASH_REDIS_REST_TOKEN,
+        keyPrefix:
+          process.env.WORKER_UPSTASH_REDIS_JOBS_PREFIX ||
+          'worker:jobs:',
+        ttlSeconds:
+          Number(process.env.WORKER_JOBS_TTL_SECONDS ?? 60 * 60 * 24 * 7),
       },
     },
   },

@@ -4,15 +4,15 @@
  * Provides persistent storage for worker job state using MongoDB.
  *
  * Configuration (from microfox.config.ts or env vars):
- * - studioSettings.database.mongodb.uri or DATABASE_MONGODB_URI/MONGODB_URI: MongoDB connection string
- * - studioSettings.database.mongodb.db or DATABASE_MONGODB_DB/MONGODB_DB: Database name (default: 'ai_router')
+ * - workflowSettings.jobStore.mongodb.uri or DATABASE_MONGODB_URI/MONGODB_URI: MongoDB connection string
+ * - workflowSettings.jobStore.mongodb.db or DATABASE_MONGODB_DB/MONGODB_DB: Database name (default: 'ai_router')
  *
- * Collection name: config -> studioSettings.database.mongodb.workerJobsCollection
- * (default: 'worker_jobs'). Env fallback: DATABASE_MONGODB_WORKER_JOBS_COLLECTION.
+ * Collection name: config -> workflowSettings.jobStore.mongodb.workerJobsCollection
+ * (default: 'worker_jobs'). Env: MONGODB_WORKER_JOBS_COLLECTION then DATABASE_MONGODB_WORKER_JOBS_COLLECTION.
  */
 
 import { MongoClient, type Db, type Collection } from 'mongodb';
-import type { JobRecord } from './jobStore';
+import type { JobRecord, InternalJobEntry } from './jobStore';
 
 declare global {
   // eslint-disable-next-line no-var
@@ -23,8 +23,10 @@ function getMongoUri(): string {
   // Try to get from config first, fallback to env vars
   let uri: string | undefined;
   try {
-    const config = require('@/microfox.config').StudioConfig;
-    uri = config?.studioSettings?.database?.mongodb?.uri;
+    const config = require('@/microfox.config').StudioConfig as {
+      workflowSettings?: { jobStore?: { mongodb?: { uri?: string } } };
+    };
+    uri = config?.workflowSettings?.jobStore?.mongodb?.uri;
   } catch (error) {
     // Config not available, use env vars
   }
@@ -33,8 +35,7 @@ function getMongoUri(): string {
   
   if (!uri) {
     throw new Error(
-      'Missing MongoDB connection string. Set in microfox.config.ts -> studioSettings.database.mongodb.uri ' +
-      'or environment variable DATABASE_MONGODB_URI (recommended) or MONGODB_URI.'
+      'Missing MongoDB connection string. Set workflowSettings.jobStore.mongodb.uri in microfox.config.ts or environment variable DATABASE_MONGODB_URI or MONGODB_URI.'
     );
   }
   return uri;
@@ -44,8 +45,10 @@ function getMongoDbName(): string {
   // Try to get from config first, fallback to env vars
   let dbName: string | undefined;
   try {
-    const config = require('@/microfox.config').StudioConfig;
-    dbName = config?.studioSettings?.database?.mongodb?.db;
+    const config = require('@/microfox.config').StudioConfig as {
+      workflowSettings?: { jobStore?: { mongodb?: { db?: string } } };
+    };
+    dbName = config?.workflowSettings?.jobStore?.mongodb?.db;
   } catch (error) {
     // Config not available, use env vars
   }
@@ -56,13 +59,16 @@ function getMongoDbName(): string {
 function getWorkerJobsCollection(): string {
   let collection: string | undefined;
   try {
-    const config = require('@/microfox.config').StudioConfig;
-    collection = config?.studioSettings?.database?.mongodb?.workerJobsCollection;
+    const config = require('@/microfox.config').StudioConfig as {
+      workflowSettings?: { jobStore?: { mongodb?: { workerJobsCollection?: string } } };
+    };
+    collection = config?.workflowSettings?.jobStore?.mongodb?.workerJobsCollection;
   } catch {
     // Config not available
   }
   return (
     collection ||
+    process.env.MONGODB_WORKER_JOBS_COLLECTION ||
     process.env.DATABASE_MONGODB_WORKER_JOBS_COLLECTION ||
     'worker_jobs'
   );
@@ -88,6 +94,11 @@ async function getMongoClient(): Promise<MongoClient> {
 async function getMongoDb(): Promise<Db> {
   const client = await getMongoClient();
   return client.db(getMongoDbName());
+}
+
+/** Export for queue job store (shared MongoDB connection). */
+export async function getWorkflowDb(): Promise<Db> {
+  return getMongoDb();
 }
 
 async function getCollection(): Promise<Collection<JobRecord & { _id: string }>> {
@@ -180,6 +191,18 @@ export const mongoJobStore = {
     }
 
     await collection.updateOne({ _id: jobId }, update);
+  },
+
+  async appendInternalJob(parentJobId: string, entry: InternalJobEntry): Promise<void> {
+    const collection = await getCollection();
+    const now = new Date().toISOString();
+    await collection.updateOne(
+      { _id: parentJobId },
+      {
+        $push: { internalJobs: entry },
+        $set: { updatedAt: now },
+      }
+    );
   },
 
   async listJobsByWorker(workerId: string): Promise<JobRecord[]> {

@@ -113,13 +113,10 @@ const memoryAdapter: WorkflowStatusStoreAdapter = {
 async function getMongoCollection() {
   const { MongoClient } = await import('mongodb');
   const config = (await import('@/microfox.config')).StudioConfig;
-  const uri = config.studioSettings.database.mongodb.uri;
-  const dbName = config.studioSettings.database.mongodb.db || 'ai_router';
-  const collectionName =
-    config.studioSettings.database.mongodb.workflowStatusCollection ||
-    process.env.DATABASE_MONGODB_WORKFLOW_STATUS_COLLECTION ||
-    'workflow_status';
-
+  const uri = config.workflowSettings.jobStore.mongodb.uri;
+  const dbName = config.workflowSettings.jobStore.mongodb.db || 'ai_router';
+  const collectionName = config.workflowSettings.jobStore.mongodb.workflowStatusCollection || 'workflow_status';
+  
   if (!uri) {
     throw new Error('MongoDB URI not configured. Set DATABASE_MONGODB_URI or configure in microfox.config.ts');
   }

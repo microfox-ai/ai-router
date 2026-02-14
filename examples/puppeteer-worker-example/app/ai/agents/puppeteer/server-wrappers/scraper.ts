@@ -53,7 +53,7 @@ export async function handleScraperAgent(params: Record<string, any>) {
   const input = InputSchema.parse(params);
 
   const canRemote = Boolean(
-    process.env.WORKER_BASE_URL || process.env.NEXT_PUBLIC_WORKER_BASE_URL
+    process.env.WORKER_BASE_URL
   );
 
   const result = await scraperWorker.dispatch(input, {

@@ -19,7 +19,7 @@ export async function handleScreenshotAgent(params: Record<string, any>) {
   const input = InputSchema.parse(params);
 
   const canRemote = Boolean(
-    process.env.WORKER_BASE_URL || process.env.NEXT_PUBLIC_WORKER_BASE_URL
+    process.env.WORKER_BASE_URL
   );
   console.log('canRemote', canRemote);
   const result = await screenshotWorker.dispatch(input, {

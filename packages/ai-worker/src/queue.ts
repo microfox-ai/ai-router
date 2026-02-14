@@ -14,9 +14,11 @@ export interface WorkerQueueStep {
    */
   delaySeconds?: number;
   /**
-   * Optional name of a mapping function exported from the .queue.ts file
-   * that derives this step's input from the previous step's output and
-   * the original initial input.
+   * Optional name of a mapping function exported from the .queue.ts file.
+   * The function is called with (initialInput, previousOutputs):
+   * - initialInput: original input passed to dispatchQueue (always first, for best DX).
+   * - previousOutputs: array of { stepIndex, workerId, output } for steps 0..current-1.
+   *   Use any prior step's output; the immediate previous step is previousOutputs[previousOutputs.length - 1]?.output.
    */
   mapInputFromPrev?: string;
 }

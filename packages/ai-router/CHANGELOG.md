@@ -1,5 +1,11 @@
 # @microfox/ai-router
 
+## 2.1.5
+
+### Patch Changes
+
+- d79d331: Changes from PR #55: ai-worker-wrapup-and-docs
+
 ## 2.1.4
 
 ### Patch Changes

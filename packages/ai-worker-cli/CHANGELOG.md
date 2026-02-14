@@ -1,5 +1,13 @@
 # @microfox/ai-worker-cli
 
+## 1.0.4
+
+### Patch Changes
+
+- d79d331: Changes from PR #55: ai-worker-wrapup-and-docs
+- Updated dependencies [d79d331]
+  - @microfox/ai-worker@1.0.3
+
 ## 1.0.3
 
 ### Patch Changes

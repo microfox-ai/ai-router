@@ -103,8 +103,7 @@ npx @microfox/ai-worker-cli@latest push
 ### Environment Variables
 
 **Required for Next.js:**
-- `WORKER_BASE_URL` - Base URL of your workers service (server-side). We append `/workers/trigger` and `/workers/config` internally when needed (e.g. `https://.../prod`).
-- `NEXT_PUBLIC_WORKER_BASE_URL` - Same as `WORKER_BASE_URL`, but exposed to the browser (use this if you call `dispatch()` from client-side code).
+- `WORKER_BASE_URL` - Base URL of your workers service (server-side only). We append `/workers/trigger` and `/workers/config` internally when needed (e.g. `https://.../prod`). For client-side, use `useWorkflowJob` which calls your app's `/api/workflows/*` routes.
 - `WORKERS_TRIGGER_API_KEY` - Optional API key for trigger authentication (sent as `x-workers-trigger-key`)
 
 **Required for Lambda (set via deploy script):**

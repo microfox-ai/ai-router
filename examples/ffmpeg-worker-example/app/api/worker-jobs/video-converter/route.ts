@@ -13,7 +13,7 @@ const CreateJobSchema = z.object({
 });
 
 function canDispatchRemote(): boolean {
-  return Boolean(process.env.WORKER_BASE_URL || process.env.NEXT_PUBLIC_WORKER_BASE_URL);
+  return Boolean(process.env.WORKER_BASE_URL);
 }
 
 function getWebhookUrl(): string {

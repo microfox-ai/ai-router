@@ -1,51 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { dispatchWorker } from '@microfox/ai-worker';
 
 /**
  * Worker execution endpoint.
- * 
- * POST /api/workflows/workers/:workerId - Execute a worker
+ *
+ * POST /api/workflows/workers/:workerId - Execute a worker (calls trigger API directly; no registry).
  * GET /api/workflows/workers/:workerId/:jobId - Get worker job status
  * POST /api/workflows/workers/:workerId/webhook - Webhook callback for completion notifications
- * 
- * This endpoint allows workers to be called like workflows, enabling
- * them to be used in orchestration.
- * 
- * Workers are auto-discovered from app/ai directory (any .worker.ts files) or
- * can be imported and registered manually via registerWorker().
  */
-
-// Worker auto-discovery is implemented in ../registry/workers
-// - Create worker registry module: app/api/workflows/registry/workers.ts
-// - Scan app/ai/**/*.worker.ts files at startup or lazily on first access
-// - Use glob pattern: 'app/ai/**/*.worker.ts'
-// - Extract worker ID from file: const worker = await import(filePath); worker.id
-// - Cache workers in memory or persistent store
-// - Support hot-reload in development
-// - Export: scanWorkers(), getWorker(workerId), listWorkers()
-
-// Legacy registry for backward compatibility (deprecated - use registry/workers instead)
-const legacyWorkerRegistry = new Map<string, () => Promise<any>>();
-
-// NOTE: Next.js route modules must not export arbitrary symbols.
-// Keep legacy registry support internal-only.
-function registerWorkerLoader(workerId: string, workerLoader: () => Promise<any>) {
-  legacyWorkerRegistry.set(workerId, workerLoader);
-}
-
-/**
- * Get a worker by ID using the new registry system.
- */
-async function getWorkerById(workerId: string): Promise<any | null> {
-  // Check legacy registry first for backward compatibility
-  const loader = legacyWorkerRegistry.get(workerId);
-  if (loader) {
-    return await loader();
-  }
-  
-  // Use new registry system with auto-discovery (dynamic import to avoid TypeScript resolution issues)
-  const workersModule = await import('../../registry/workers') as { getWorker: (workerId: string) => Promise<any | null> };
-  return await workersModule.getWorker(workerId);
-}
 
 export async function POST(
   req: NextRequest,
@@ -101,31 +63,6 @@ export async function POST(
       hasInput: !!input,
     });
 
-    // Get the worker using registry system
-    let worker;
-    try {
-      worker = await getWorkerById(workerId);
-    } catch (getWorkerError: any) {
-      console.error('[Worker] Error getting worker:', {
-        workerId,
-        error: getWorkerError?.message || String(getWorkerError),
-      });
-      return NextResponse.json(
-        { error: `Failed to get worker: ${getWorkerError?.message || String(getWorkerError)}` },
-        { status: 500 }
-      );
-    }
-
-    if (!worker) {
-      console.warn('[Worker] Worker not found:', {
-        workerId,
-      });
-      return NextResponse.json(
-        { error: `Worker "${workerId}" not found. Make sure it's exported from a .worker.ts file.` },
-        { status: 404 }
-      );
-    }
-
     // Webhook optional. Job updates use MongoDB only; never pass jobStoreUrl.
     const webhookBase = process.env.WORKFLOW_WEBHOOK_BASE_URL;
     const webhookUrl =
@@ -163,15 +100,18 @@ export async function POST(
       // Continue even if job store fails - worker dispatch can still proceed
     }
 
-    // Dispatch the worker. Job updates use MongoDB only; webhook only if configured.
+    // Dispatch via trigger API (no registry). Unknown workerId will fail at trigger API.
     let dispatchResult;
     try {
-      dispatchResult = await worker.dispatch(input || {}, {
-        mode: 'auto',
-        jobId,
-        ...(webhookUrl ? { webhookUrl } : {}),
-        metadata: { source: 'workflow-orchestration' },
-      });
+      dispatchResult = await dispatchWorker(
+        workerId,
+        (input || {}) as Record<string, unknown>,
+        {
+          jobId,
+          ...(webhookUrl ? { webhookUrl } : {}),
+          metadata: { source: 'workflow-orchestration' },
+        }
+      );
       console.log('[Worker] Worker dispatched successfully:', {
         jobId: dispatchResult.jobId,
         workerId,
@@ -183,7 +123,10 @@ export async function POST(
         error: dispatchError?.message || String(dispatchError),
         stack: process.env.NODE_ENV === 'development' ? dispatchError?.stack : undefined,
       });
-      throw new Error(`Failed to dispatch worker: ${dispatchError?.message || String(dispatchError)}`);
+      return NextResponse.json(
+        { error: `Failed to dispatch worker: ${dispatchError?.message || String(dispatchError)}` },
+        { status: 502 }
+      );
     }
 
     const finalJobId = dispatchResult.jobId || jobId;

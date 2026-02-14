@@ -4,7 +4,7 @@
  */
 
 import { dispatch, dispatchLocal, getWorkersTriggerUrl, type DispatchOptions, type DispatchResult } from './client.js';
-import { createLambdaHandler, type WorkerHandler, type JobStore, type DispatchWorkerOptions, SQS_MAX_DELAY_SECONDS } from './handler.js';
+import { createLambdaHandler, createWorkerLogger, type WorkerHandler, type JobStore, type DispatchWorkerOptions, SQS_MAX_DELAY_SECONDS } from './handler.js';
 import type { ZodType, z } from 'zod';
 
 export * from './client.js';
@@ -673,6 +673,7 @@ export function createWorker<INPUT_SCHEMA extends ZodType<any>, OUTPUT>(
         const handlerContext = {
           ...baseContext,
           ...(jobStore ? { jobStore } : {}),
+          logger: createWorkerLogger(localJobId, id),
           dispatchWorker: createLocalDispatchWorker(
             localJobId,
             id,

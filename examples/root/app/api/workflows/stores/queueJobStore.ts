@@ -268,6 +268,34 @@ export async function appendQueueStep(
   );
 }
 
+/**
+ * Update queue job overall status (e.g. from webhook when queue run completes).
+ */
+export async function updateQueueJob(
+  queueJobId: string,
+  update: { status?: QueueJobRecord['status']; completedAt?: string }
+): Promise<void> {
+  const now = new Date().toISOString();
+  if (preferRedis()) {
+    const redis = getRedis();
+    const key = queueKey(queueJobId);
+    const existing = await loadQueueJobRedis(queueJobId);
+    if (!existing) throw new Error(`Queue job ${queueJobId} not found`);
+    const toSet: Record<string, string> = {
+      status: update.status ?? existing.status,
+      updatedAt: now,
+    };
+    if (update.completedAt !== undefined) toSet.completedAt = update.completedAt;
+    await redis.hset(key, toSet);
+    return;
+  }
+  const collection = await getCollection();
+  const setDoc: Record<string, string> = { updatedAt: now };
+  if (update.status !== undefined) setDoc.status = update.status;
+  if (update.completedAt !== undefined) setDoc.completedAt = update.completedAt;
+  await collection.updateOne({ _id: queueJobId }, { $set: setDoc });
+}
+
 export async function getQueueJob(queueJobId: string): Promise<QueueJobRecord | null> {
   if (preferRedis()) {
     return loadQueueJobRedis(queueJobId);

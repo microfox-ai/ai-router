@@ -21,7 +21,7 @@ function getWebhookUrl(): string {
 }
 
 function canDispatchRemote(): boolean {
-  return Boolean(process.env.WORKER_BASE_URL || process.env.NEXT_PUBLIC_WORKER_BASE_URL);
+  return Boolean(process.env.WORKER_BASE_URL);
 }
 
 export async function handleVideoConverterAgent(params: Record<string, any>) {

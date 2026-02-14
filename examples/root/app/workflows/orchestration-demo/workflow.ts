@@ -8,7 +8,7 @@
  * 1. Generate content in parallel (content1, content2, content3)
  * 2. Analyze all via _fromSteps + _path + _join -> content
  * 3. HITL approval
- * 4. If approved: data-processor worker -> summarize agent
+ * 4. If approved: demo worker (process) -> summarize agent
  * 5. Else: rejection agent
  */
 
@@ -61,7 +61,7 @@ const steps: OrchestrationStep[] = [
     then: [
       {
         type: 'worker',
-        worker: 'data-processor',
+        worker: 'demo',
         input: {
           _fromSteps: ['content1', 'content2', 'content3'],
           _path: 'content',

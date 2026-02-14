@@ -23,6 +23,7 @@ import {
   appendQueueJobStepInStore,
   updateQueueJobStepInStore,
   upsertInitialQueueJob,
+  getQueueJob,
 } from './queueJobStore';
 
 export interface JobStoreUpdate {
@@ -95,6 +96,37 @@ export interface DispatchWorkerOptions {
   delaySeconds?: number;
 }
 
+/**
+ * Logger provided on ctx with prefixed levels: [INFO], [WARN], [ERROR], [DEBUG].
+ * Each method accepts a message and optional data (logged as JSON).
+ */
+export interface WorkerLogger {
+  info(message: string, data?: Record<string, unknown>): void;
+  warn(message: string, data?: Record<string, unknown>): void;
+  error(message: string, data?: Record<string, unknown>): void;
+  debug(message: string, data?: Record<string, unknown>): void;
+}
+
+export function createWorkerLogger(jobId: string, workerId: string): WorkerLogger {
+  const prefix = (level: string) => `[${level}] [${workerId}] [${jobId}]`;
+  return {
+    info(msg: string, data?: Record<string, unknown>) {
+      console.log(prefix('INFO'), msg, data !== undefined ? JSON.stringify(data) : '');
+    },
+    warn(msg: string, data?: Record<string, unknown>) {
+      console.warn(prefix('WARN'), msg, data !== undefined ? JSON.stringify(data) : '');
+    },
+    error(msg: string, data?: Record<string, unknown>) {
+      console.error(prefix('ERROR'), msg, data !== undefined ? JSON.stringify(data) : '');
+    },
+    debug(msg: string, data?: Record<string, unknown>) {
+      if (process.env.DEBUG || process.env.WORKER_DEBUG) {
+        console.debug(prefix('DEBUG'), msg, data !== undefined ? JSON.stringify(data) : '');
+      }
+    },
+  };
+}
+
 export interface WorkerHandlerParams<INPUT, OUTPUT> {
   input: INPUT;
   ctx: {
@@ -106,6 +138,10 @@ export interface WorkerHandlerParams<INPUT, OUTPUT> {
      * Uses MongoDB directly when configured; never HTTP/origin URL.
      */
     jobStore?: JobStore;
+    /**
+     * Logger with prefixed levels: ctx.logger.info(), .warn(), .error(), .debug().
+     */
+    logger: WorkerLogger;
     /**
      * Dispatch another worker (fire-and-forget or await). Uses WORKER_QUEUE_URL_<SANITIZED_ID> env.
      * Always provided by the runtime (Lambda and local).
@@ -130,14 +166,24 @@ export interface QueueNextStep {
   mapInputFromPrev?: string;
 }
 
+/** One previous step's output (for mapInputFromPrev context). */
+export interface QueueStepOutput {
+  stepIndex: number;
+  workerId: string;
+  output: unknown;
+}
+
 /** Runtime helpers for queue-aware wrappers (provided by generated registry). */
 export interface QueueRuntime {
   getNextStep(queueId: string, stepIndex: number): QueueNextStep | undefined;
+  /** Optional: when provided, mapping can use outputs from any previous step. */
+  getQueueJob?(queueJobId: string): Promise<{ steps: Array<{ workerId: string; output?: unknown }> } | null>;
+  /** (initialInput, previousOutputs) – previousOutputs includes outputs for steps 0..stepIndex-1 and current step. */
   invokeMapInput?(
     queueId: string,
     stepIndex: number,
-    prevOutput: unknown,
-    initialInput: unknown
+    initialInput: unknown,
+    previousOutputs: QueueStepOutput[]
   ): Promise<unknown> | unknown;
 }
 
@@ -152,6 +198,7 @@ async function notifyQueueJobStep(
     output?: unknown;
     error?: { message: string };
     input?: unknown;
+    queueId?: string;
   }
 ): Promise<void> {
   try {
@@ -194,14 +241,14 @@ async function notifyQueueJobStep(
       output: params.output,
       error: params.error,
     });
-    if (process.env.DEBUG_WORKER_QUEUES === '1') {
-      console.log('[Worker] Queue job step updated', {
-        queueJobId,
-        action,
-        stepIndex: params.stepIndex,
-        status,
-      });
-    }
+    // Always log queue step updates so logs show which queue and step ran
+    console.log('[Worker] Queue job step updated', {
+      queueId: params.queueId ?? queueJobId,
+      queueJobId,
+      stepIndex: params.stepIndex,
+      workerId: params.workerId,
+      status,
+    });
   } catch (err: any) {
     console.warn('[Worker] Queue job update error:', {
       queueJobId,
@@ -220,7 +267,7 @@ async function notifyQueueJobStep(
 export function wrapHandlerForQueue<INPUT, OUTPUT>(
   handler: WorkerHandler<INPUT, OUTPUT>,
   queueRuntime: QueueRuntime
-): WorkerHandler<INPUT & { __workerQueue?: { id: string; stepIndex: number; initialInput: unknown } }, OUTPUT> {
+): WorkerHandler<INPUT & { __workerQueue?: { id: string; stepIndex: number; initialInput: unknown; queueJobId?: string } }, OUTPUT> {
   return async (params) => {
     const queueContext = (params.input as any)?.[WORKER_QUEUE_KEY];
     const output = await handler(params);
@@ -230,22 +277,60 @@ export function wrapHandlerForQueue<INPUT, OUTPUT>(
     }
 
     const { id: queueId, stepIndex, initialInput, queueJobId } = queueContext;
-    const next = queueRuntime.getNextStep(queueId, stepIndex);
-    if (!next) {
-      return output;
-    }
+    const jobId = (params.ctx as any)?.jobId;
+    const workerId = (params.ctx as any)?.workerId ?? '';
 
-    const childJobId = `job-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
-    if (queueJobId) {
+    const next = queueRuntime.getNextStep(queueId, stepIndex);
+    const childJobId = next ? `job-${Date.now()}-${Math.random().toString(36).slice(2, 11)}` : undefined;
+    if (next && queueJobId) {
+      // Append next step first so updateQueueJobStepInStore(complete) sees steps.length > 1
       await notifyQueueJobStep(queueJobId, 'append', {
-        workerJobId: childJobId,
+        workerJobId: childJobId!,
         workerId: next.workerId,
       });
     }
 
+    // Notify current step complete (after append when there's next, so queue isn't marked completed yet)
+    if (queueJobId && typeof stepIndex === 'number') {
+      await notifyQueueJobStep(queueJobId, 'complete', {
+        queueId,
+        stepIndex,
+        workerJobId: jobId,
+        workerId,
+        output,
+      });
+    }
+
+    if (!next) {
+      return output;
+    }
+
     let nextInput: unknown = output;
     if (next.mapInputFromPrev && typeof queueRuntime.invokeMapInput === 'function') {
-      nextInput = await queueRuntime.invokeMapInput(queueId, stepIndex + 1, output, initialInput);
+      let previousOutputs: QueueStepOutput[] = [];
+      if (queueJobId && typeof queueRuntime.getQueueJob === 'function') {
+        try {
+          const job = await queueRuntime.getQueueJob(queueJobId);
+          if (job?.steps) {
+            const fromStore = job.steps
+              .slice(0, stepIndex)
+              .map((s, i) => ({ stepIndex: i, workerId: s.workerId, output: s.output }));
+            previousOutputs = fromStore.concat([
+              { stepIndex, workerId: (params.ctx as any)?.workerId ?? '', output },
+            ]);
+          }
+        } catch (e: any) {
+          if (process.env.AI_WORKER_QUEUES_DEBUG === '1') {
+            console.warn('[Worker] getQueueJob failed, mapping without previousOutputs:', e?.message ?? e);
+          }
+        }
+      }
+      nextInput = await queueRuntime.invokeMapInput(
+        queueId,
+        stepIndex + 1,
+        initialInput,
+        previousOutputs
+      );
     }
 
     const nextInputWithQueue = {
@@ -528,6 +613,7 @@ export function createLambdaHandler<INPUT, OUTPUT>(
         const handlerContext = {
           ...baseContext,
           ...(jobStore ? { jobStore } : {}),
+          logger: createWorkerLogger(jobId, workerId),
           dispatchWorker: createDispatchWorker(
             jobId,
             workerId,
@@ -539,9 +625,12 @@ export function createLambdaHandler<INPUT, OUTPUT>(
         if (jobStore) {
           try {
             await jobStore.update({ status: 'running' });
+            const queueCtxForLog = (input as any)?.__workerQueue ?? metadata?.__workerQueue;
             console.log('[Worker] Job status updated to running:', {
               jobId,
               workerId,
+              ...(queueCtxForLog?.id && { queueId: queueCtxForLog.id }),
+              ...(queueCtxForLog?.queueJobId && { queueJobId: queueCtxForLog.queueJobId }),
             });
           } catch (error: any) {
             console.warn('[Worker] Failed to update status to running:', {
@@ -573,6 +662,7 @@ export function createLambdaHandler<INPUT, OUTPUT>(
             }
           }
           await notifyQueueJobStep(queueCtx.queueJobId, 'start', {
+            queueId: queueCtx.id,
             stepIndex: queueCtx.stepIndex,
             workerJobId: jobId,
             workerId,
@@ -625,6 +715,7 @@ export function createLambdaHandler<INPUT, OUTPUT>(
           const queueCtxFail = (input as any)?.__workerQueue ?? metadata?.__workerQueue;
           if (queueCtxFail?.queueJobId && typeof queueCtxFail.stepIndex === 'number') {
             await notifyQueueJobStep(queueCtxFail.queueJobId, 'fail', {
+              queueId: queueCtxFail.id,
               stepIndex: queueCtxFail.stepIndex,
               workerJobId: jobId,
               workerId,
@@ -657,15 +748,7 @@ export function createLambdaHandler<INPUT, OUTPUT>(
           }
         }
 
-        const queueCtxSuccess = (input as any)?.__workerQueue ?? metadata?.__workerQueue;
-        if (queueCtxSuccess?.queueJobId && typeof queueCtxSuccess.stepIndex === 'number') {
-          await notifyQueueJobStep(queueCtxSuccess.queueJobId, 'complete', {
-            stepIndex: queueCtxSuccess.stepIndex,
-            workerJobId: jobId,
-            workerId,
-            output,
-          });
-        }
+        // Queue step complete is notified from wrapHandlerForQueue (after append) so one DB update marks step + queue.
 
         console.log('[Worker] Job completed:', {
           jobId,

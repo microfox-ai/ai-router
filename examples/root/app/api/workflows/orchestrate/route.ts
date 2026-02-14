@@ -190,9 +190,7 @@ export async function POST(req: NextRequest) {
     const baseUrl = req.nextUrl.origin;
     const workerTriggerBaseUrl =
       process.env.WORKER_BASE_URL ||
-      process.env.NEXT_PUBLIC_WORKER_BASE_URL ||
-      process.env.WORKERS_CONFIG_API_URL ||
-      process.env.NEXT_PUBLIC_WORKERS_CONFIG_API_URL;
+      process.env.WORKERS_CONFIG_API_URL;
     const raw = process.env.WORKFLOW_APP_BASE_URL || process.env.NEXT_PUBLIC_APP_URL;
     const workerCallbackBaseUrl =
       typeof raw === 'string' && raw.trim() ? raw.trim().replace(/\/+$/, '') : undefined;

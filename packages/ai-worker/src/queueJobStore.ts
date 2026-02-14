@@ -36,6 +36,7 @@ type QueueJobDoc = {
   completedAt?: string;
 };
 
+
 // === Mongo backend (shares connection pattern with mongoJobStore) ===
 
 const mongoUri = process.env.DATABASE_MONGODB_URI || process.env.MONGODB_URI;
@@ -423,5 +424,49 @@ export async function appendQueueJobStepInStore(options: {
     existing.updatedAt = now;
     await saveQueueJobRedis(existing);
   }
+}
+
+/**
+ * Load a queue job by ID (for mapping context: previous step outputs).
+ * Used by wrapHandlerForQueue when invoking mapInputFromPrev with previousOutputs.
+ */
+export async function getQueueJob(queueJobId: string): Promise<{
+  id: string;
+  queueId: string;
+  status: string;
+  steps: Array<{ workerId: string; workerJobId: string; status: string; output?: unknown }>;
+} | null> {
+  if (preferMongo()) {
+    const coll = await getMongoQueueCollection();
+    const doc = await coll.findOne({ _id: queueJobId });
+    if (!doc) return null;
+    return {
+      id: doc.id ?? queueJobId,
+      queueId: doc.queueId,
+      status: doc.status,
+      steps: (doc.steps ?? []).map((s: QueueJobStep) => ({
+        workerId: s.workerId,
+        workerJobId: s.workerJobId,
+        status: s.status,
+        output: s.output,
+      })),
+    };
+  }
+  if (preferRedis()) {
+    const record = await loadQueueJobRedis(queueJobId);
+    if (!record) return null;
+    return {
+      id: record.id,
+      queueId: record.queueId,
+      status: record.status,
+      steps: (record.steps ?? []).map((s) => ({
+        workerId: s.workerId,
+        workerJobId: s.workerJobId,
+        status: s.status,
+        output: s.output,
+      })),
+    };
+  }
+  return null;
 }
 

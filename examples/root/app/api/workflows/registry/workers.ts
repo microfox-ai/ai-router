@@ -9,7 +9,7 @@
  * - getQueueRegistry(): returns QueueRegistry from config (for dispatchQueue)
  */
 
-import type { WorkerAgent } from '@microfox/ai-worker';
+import type { WorkerAgent, WorkerQueueRegistry } from '@microfox/ai-worker';
 
 /** Queue step config (matches WorkerQueueStep from @microfox/ai-worker). */
 export interface QueueStepConfig {
@@ -38,9 +38,7 @@ let configCache: WorkersConfig | null = null;
 function getConfigBaseUrl(): string {
   const raw =
     process.env.WORKERS_CONFIG_API_URL ||
-    process.env.NEXT_PUBLIC_WORKERS_CONFIG_API_URL ||
-    process.env.WORKER_BASE_URL ||
-    process.env.NEXT_PUBLIC_WORKER_BASE_URL;
+    process.env.WORKER_BASE_URL;
   if (!raw?.trim()) {
     throw new Error(
       'WORKERS_CONFIG_API_URL or WORKER_BASE_URL is required for the worker registry. ' +
@@ -166,36 +164,74 @@ export async function getWorker(
   return createSyntheticAgent(workerId);
 }
 
-/**
- * Registry compatible with dispatchQueue options.registry.
- * Uses queue definitions from workers/config API.
- */
-export interface QueueRegistry {
-  getQueueById(queueId: string): QueueConfig | undefined;
-  invokeMapInput?(
-    queueId: string,
-    stepIndex: number,
-    prevOutput: unknown,
-    initialInput: unknown
-  ): Promise<unknown> | unknown;
+/** Webpack require.context – auto-discovers app/ai/queues/*.queue.ts (Next.js). */
+function getQueueModuleContext(): { keys(): string[]; (key: string): unknown } | null {
+  try {
+    if (typeof require === 'undefined') return null;
+    const ctx = (require as unknown as { context: (dir: string, sub: boolean, re: RegExp) => { keys(): string[]; (k: string): unknown } }).context(
+      '@/app/ai/queues',
+      false,
+      /\.queue\.ts$/
+    );
+    return ctx;
+  } catch {
+    return null;
+  }
 }
 
 /**
- * Get the queue registry from the workers config API.
- * Use with dispatchQueue: dispatchQueue('cost-usage', {}, { registry: await getQueueRegistry() }).
+ * Auto-discover queue modules from app/ai/queues/*.queue.ts (no per-queue registration).
+ * Uses require.context when available (Next.js/webpack).
  */
-export async function getQueueRegistry(): Promise<QueueRegistry> {
+function buildQueueModules(): Record<string, Record<string, (initial: unknown, prevOutputs: unknown[]) => unknown>> {
+  const ctx = getQueueModuleContext();
+  if (!ctx) return {};
+  const out: Record<string, Record<string, (initial: unknown, prevOutputs: unknown[]) => unknown>> = {};
+  for (const key of ctx.keys()) {
+    const mod = ctx(key) as { default?: { id?: string }; [k: string]: unknown };
+    const id = mod?.default?.id;
+    if (id && typeof id === 'string') {
+      out[id] = mod as Record<string, (initial: unknown, prevOutputs: unknown[]) => unknown>;
+    }
+  }
+  return out;
+}
+
+const queueModules = buildQueueModules();
+
+/**
+ * Returns a registry compatible with dispatchQueue. Queue definitions come from
+ * GET /workers/config; mapInputFromPrev is resolved from app/ai/queues/*.queue.ts
+ * automatically (no manual registration per queue).
+ */
+export async function getQueueRegistry(): Promise<WorkerQueueRegistry> {
   const config = await fetchWorkersConfig();
   const queues: QueueConfig[] = config.queues ?? [];
 
-  return {
-    getQueueById(queueId: string): QueueConfig | undefined {
+  const registry = {
+    getQueueById(queueId: string) {
       return queues.find((q) => q.id === queueId);
     },
-    invokeMapInput(_queueId: string, _stepIndex: number, prevOutput: unknown): unknown {
-      return prevOutput;
+    invokeMapInput(
+      queueId: string,
+      stepIndex: number,
+      initialInput: unknown,
+      previousOutputs: Array<{ stepIndex: number; workerId: string; output: unknown }>
+    ): unknown {
+      const queue = queues.find((q) => q.id === queueId);
+      const step = queue?.steps?.[stepIndex];
+      const fnName = step?.mapInputFromPrev;
+      if (!fnName) {
+        return previousOutputs.length > 0 ? previousOutputs[previousOutputs.length - 1].output : initialInput;
+      }
+      const mod = queueModules[queueId];
+      if (!mod || typeof mod[fnName] !== 'function') {
+        return previousOutputs.length > 0 ? previousOutputs[previousOutputs.length - 1].output : initialInput;
+      }
+      return mod[fnName](initialInput, previousOutputs);
     },
   };
+  return registry as WorkerQueueRegistry;
 }
 
 /**

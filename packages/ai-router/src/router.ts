@@ -21,6 +21,76 @@ import { z, ZodObject, ZodType } from 'zod';
 import path from 'path';
 import { Store, MemoryStore } from './store.js';
 
+/** Result type for ctx.dispatchWorker. */
+export type DispatchWorkerResult = {
+  jobId: string;
+  messageId: string;
+  status: 'queued';
+};
+
+/** Options for ctx.dispatchWorker. */
+export type DispatchWorkerOptions = {
+  jobId?: string;
+  webhookUrl?: string;
+  metadata?: Record<string, any>;
+};
+
+/** Derives /workers/trigger URL from env (WORKER_BASE_URL or WORKERS_TRIGGER_API_URL / WORKERS_CONFIG_API_URL). */
+function getWorkersTriggerUrl(): string {
+  const raw =
+    process.env.WORKER_BASE_URL ||
+    process.env.WORKERS_TRIGGER_API_URL ||
+    process.env.WORKERS_CONFIG_API_URL;
+  if (!raw) {
+    throw new Error('WORKER_BASE_URL is required for ctx.dispatchWorker. Set it server-side only.');
+  }
+  const url = new URL(raw);
+  url.search = '';
+  url.hash = '';
+  const pathname = url.pathname || '';
+  url.pathname = pathname.replace(/\/?workers\/(trigger|config)\/?$/, '');
+  const basePath = url.pathname.replace(/\/+$/, '');
+  url.pathname = `${basePath}/workers/trigger`.replace(/\/+$/, '');
+  return url.toString();
+}
+
+/** Dispatch a worker by ID via the workers trigger API. Inlined so ai-router has no dependency on @microfox/ai-worker. */
+async function dispatchWorker(
+  workerId: string,
+  input?: Record<string, unknown>,
+  options: DispatchWorkerOptions = {}
+): Promise<DispatchWorkerResult> {
+  const jobId =
+    options.jobId || `job-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  const triggerUrl = getWorkersTriggerUrl();
+  const messageBody = {
+    workerId,
+    jobId,
+    input: input ?? {},
+    context: {},
+    webhookUrl: options.webhookUrl,
+    metadata: options.metadata || {},
+    timestamp: new Date().toISOString(),
+  };
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const key = process.env.WORKERS_TRIGGER_API_KEY;
+  if (key) headers['x-workers-trigger-key'] = key;
+  const response = await fetch(triggerUrl, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ workerId, body: messageBody }),
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => '');
+    throw new Error(
+      `Failed to trigger worker "${workerId}": ${response.status} ${response.statusText}${text ? ` - ${text}` : ''}`
+    );
+  }
+  const data = (await response.json().catch(() => ({}))) as any;
+  const messageId = data?.messageId ? String(data.messageId) : `trigger-${jobId}`;
+  return { messageId, status: 'queued', jobId };
+}
+
 // Add global logger management
 let globalLogger: AiLogger | undefined = undefined;
 
@@ -285,6 +355,15 @@ export type AiContext<
    * @internal
    */
   next: NextHandler<METADATA, ContextState, PARAMS, PARTS, TOOLS>;
+  /**
+   * Dispatch a background worker by ID (when @microfox/ai-worker is installed).
+   * No need to import the worker module. Sends to the workers trigger API.
+   */
+  dispatchWorker?: (
+    workerId: string,
+    input?: Record<string, unknown>,
+    options?: DispatchWorkerOptions
+  ) => Promise<DispatchWorkerResult>;
 
   _onExecutionStart?: () => void;
   _onExecutionEnd?: () => void;
@@ -1237,6 +1316,7 @@ export class AiRouter<
             generateId: generateId,
           },
           next: undefined as any, // Will be replaced right after
+          dispatchWorker,
           _onExecutionStart: () => {
             self.pendingExecutions++;
             self.logger?.log(

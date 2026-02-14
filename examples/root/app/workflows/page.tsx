@@ -1,13 +1,10 @@
 'use client';
 
-import { useState } from 'react';
 import Link from 'next/link';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import { Workflow, Zap, Mail, Search } from 'lucide-react';
+import { Workflow, Zap, Layers, ListOrdered } from 'lucide-react';
 
 export default function WorkflowsPage() {
   return (
@@ -15,192 +12,115 @@ export default function WorkflowsPage() {
       <div className="mb-8">
         <h1 className="text-4xl font-bold mb-2">Workflow Examples</h1>
         <p className="text-muted-foreground">
-          Test durable workflows with Human-in-the-Loop (HITL) support
+          Orchestration, workers, and queues — one example for each.
         </p>
       </div>
 
-      <div className="grid md:grid-cols-2 gap-6">
-        {/* Orchestration Workflow */}
+      <div className="grid md:grid-cols-3 gap-6">
+        {/* Orchestration (ai-workflow) */}
         <Card>
           <CardHeader>
             <div className="flex items-center justify-between">
               <CardTitle className="flex items-center gap-2">
                 <Workflow className="w-5 h-5" />
-                Orchestration Workflow
+                Orchestration
               </CardTitle>
-              <Badge variant="secondary">New</Badge>
+              <Badge variant="secondary">@microfox/ai-workflow</Badge>
             </div>
             <CardDescription>
-              Multi-agent orchestration with sequential steps, sleep, and HITL hooks
+              Multi-step orchestration with parallel agents, HITL approval, worker step, and conditionals.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <div className="space-y-2">
-              <p className="text-sm text-muted-foreground">
-                <strong>Steps:</strong>
-              </p>
-              <ul className="text-sm space-y-1 list-disc list-inside text-muted-foreground">
-                <li>Call agent (get current date)</li>
-                <li>Sleep for 2 seconds</li>
-                <li>Wait for approval (HITL)</li>
-                <li>Call agent again (get date after approval)</li>
-              </ul>
-            </div>
-            <div className="flex gap-2">
-              <Button asChild>
-                <Link href="/workflows/orchestrate">
-                  <Zap className="w-4 h-4 mr-2" />
-                  Test Orchestration
-                </Link>
-              </Button>
-            </div>
+            <ul className="text-sm space-y-1 list-disc list-inside text-muted-foreground">
+              <li>Parallel content generation</li>
+              <li>Analyzer + HITL approval</li>
+              <li>Worker + conditional branch</li>
+            </ul>
+            <Button asChild>
+              <Link href="/workflows/orchestration-demo">
+                <Zap className="w-4 h-4 mr-2" />
+                Orchestration demo
+              </Link>
+            </Button>
           </CardContent>
         </Card>
 
-        {/* Research Workflow */}
+        {/* Worker demo */}
         <Card>
           <CardHeader>
             <div className="flex items-center justify-between">
               <CardTitle className="flex items-center gap-2">
-                <Search className="w-5 h-5" />
-                Research Workflow
+                <Layers className="w-5 h-5" />
+                Worker
               </CardTitle>
-              <Badge variant="secondary">v1.0</Badge>
+              <Badge variant="secondary">useWorkflowJob</Badge>
             </div>
             <CardDescription>
-              Long-running research workflow with web search, summarization, and human approval
+              Trigger a worker via the API and poll until completion. Uses the shared hook.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <div className="space-y-2">
-              <p className="text-sm text-muted-foreground">
-                <strong>Steps:</strong>
-              </p>
-              <ul className="text-sm space-y-1 list-disc list-inside text-muted-foreground">
-                <li>Web search for topic</li>
-                <li>Summarize results</li>
-                <li>Human approval (HITL)</li>
-                <li>Send email with summary</li>
-              </ul>
-            </div>
-            <div className="flex gap-2">
-              <Button asChild>
-                <Link href="/workflows/research">
-                  <Zap className="w-4 h-4 mr-2" />
-                  Test Workflow
-                </Link>
-              </Button>
-              <Button asChild variant="outline">
-                <Link href="/workflows/research/instances">
-                  View Instances
-                </Link>
-              </Button>
-            </div>
+            <ul className="text-sm space-y-1 list-disc list-inside text-muted-foreground">
+              <li>POST /api/workflows/workers/:id</li>
+              <li>Poll job status</li>
+              <li>Display output</li>
+            </ul>
+            <Button asChild>
+              <Link href="/workflows/worker-demo">
+                <Zap className="w-4 h-4 mr-2" />
+                Worker demo
+              </Link>
+            </Button>
           </CardContent>
         </Card>
 
-        {/* Onboarding Workflow */}
+        {/* Queue demo */}
         <Card>
           <CardHeader>
             <div className="flex items-center justify-between">
               <CardTitle className="flex items-center gap-2">
-                <Mail className="w-5 h-5" />
-                Onboarding Workflow
+                <ListOrdered className="w-5 h-5" />
+                Queue
               </CardTitle>
-              <Badge variant="secondary">v1.0</Badge>
+              <Badge variant="secondary">useWorkflowJob</Badge>
             </div>
             <CardDescription>
-              User onboarding with email verification and admin override capabilities
+              Trigger a queue and poll queue job status and steps. Uses the same hook in queue mode.
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <div className="space-y-2">
-              <p className="text-sm text-muted-foreground">
-                <strong>Steps:</strong>
-              </p>
-              <ul className="text-sm space-y-1 list-disc list-inside text-muted-foreground">
-                <li>Create user account</li>
-                <li>Send verification email</li>
-                <li>Wait for verification (HITL)</li>
-                <li>Send welcome email</li>
-              </ul>
-            </div>
-            <div className="flex gap-2">
-              <Button asChild>
-                <Link href="/workflows/onboarding">
-                  <Zap className="w-4 h-4 mr-2" />
-                  Test Workflow
-                </Link>
-              </Button>
-              <Button asChild variant="outline">
-                <Link href="/workflows/onboarding/instances">
-                  View Instances
-                </Link>
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* Worker Proof Workflow */}
-        <Card>
-          <CardHeader>
-            <div className="flex items-center justify-between">
-              <CardTitle className="flex items-center gap-2">
-                <Workflow className="w-5 h-5" />
-                Worker Proof (Sequential + Parallel)
-              </CardTitle>
-              <Badge variant="secondary">Proof</Badge>
-            </div>
-            <CardDescription>
-              Await workers sequentially and in parallel, then HITL, then return a timeline proof object.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="space-y-2">
-              <p className="text-sm text-muted-foreground">
-                <strong>What you’ll see:</strong>
-              </p>
-              <ul className="text-sm space-y-1 list-disc list-inside text-muted-foreground">
-                <li>Sequential worker timestamps (seq-2 starts after seq-1 ends)</li>
-                <li>Parallel worker overlap (par-A & par-B overlap)</li>
-                <li>Workflow pauses on a HITL gate before producing proof</li>
-              </ul>
-            </div>
-            <div className="flex gap-2">
-              <Button asChild>
-                <Link href="/workflows/worker-proof">
-                  <Zap className="w-4 h-4 mr-2" />
-                  Run Worker Proof
-                </Link>
-              </Button>
-            </div>
+            <ul className="text-sm space-y-1 list-disc list-inside text-muted-foreground">
+              <li>POST /api/workflows/queues/:id</li>
+              <li>Poll queue job + steps</li>
+              <li>Display progress</li>
+            </ul>
+            <Button asChild>
+              <Link href="/workflows/queue-demo">
+                <Zap className="w-4 h-4 mr-2" />
+                Queue demo
+              </Link>
+            </Button>
           </CardContent>
         </Card>
       </div>
 
       <Card className="mt-8">
         <CardHeader>
-          <CardTitle>About Workflows</CardTitle>
+          <CardTitle>About</CardTitle>
           <CardDescription>
-            Durable execution with replay-based state management
+            Orchestration runs multi-step workflows with HITL. Workers and queues run via API + polling with the useWorkflowJob hook.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-2 text-sm text-muted-foreground">
           <p>
-            <strong>Durable Execution:</strong> Workflows survive server restarts and can run for days or weeks.
+            <strong>Orchestration:</strong> Durable execution with replay, sleep, and human-in-the-loop hooks.
           </p>
           <p>
-            <strong>Human-in-the-Loop:</strong> Workflows can pause and wait for human approval or input.
-          </p>
-          <p>
-            <strong>Automatic Retries:</strong> Failed steps are automatically retried with exponential backoff.
-          </p>
-          <p>
-            <strong>Event Sourcing:</strong> Complete execution history is stored for debugging and replay.
+            <strong>Workers & Queues:</strong> Trigger via POST, then poll GET until completed. Use <code className="rounded bg-muted px-1">useWorkflowJob</code> in your client components.
           </p>
         </CardContent>
       </Card>
     </div>
   );
 }
-

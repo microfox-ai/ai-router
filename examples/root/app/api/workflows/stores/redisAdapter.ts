@@ -295,4 +295,3 @@ export const redisJobStore = {
     return jobs;
   },
 };
-

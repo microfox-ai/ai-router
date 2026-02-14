@@ -39,6 +39,11 @@
       "types": "./dist/config.d.ts",
       "import": "./dist/config.mjs",
       "require": "./dist/config.js"
+    },
+    "./queueJobStore": {
+      "types": "./dist/queueJobStore.d.ts",
+      "import": "./dist/queueJobStore.mjs",
+      "require": "./dist/queueJobStore.js"
     }
   },
   "dependencies": {

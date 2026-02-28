@@ -157,6 +157,12 @@ export interface WorkerConfig {
   schedule?: ScheduleConfig;
 
   /**
+   * If set, this worker is deployed to the serverless project for this group.
+   * Do not use 'core' (reserved). Max 12 characters (serverless service name limits).
+   */
+  group?: string;
+
+  /**
    * SQS queue settings for this worker (used by @microfox/ai-worker-cli when generating serverless.yml).
    *
    * Notes:

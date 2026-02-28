@@ -13,5 +13,14 @@
     "apiMode": "staging",
     "apiVersion": "v2",
     "ignorePatterns": [".build/**", "package-lock.json"]
+  },
+  "worker": {
+    "externalDeps": ["@microfox/puppeteer-sls", "@sparticuz/chromium"],
+    "includeNodeModules": false,
+    "groups": {
+      "scraper": {
+        "includeNodeModules": true
+      }
+    }
   }
 }

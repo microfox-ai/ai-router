@@ -521,20 +521,31 @@ function getJobTtlSeconds(): number {
   return Number.isFinite(n) && n > 0 ? n : defaultTtlSeconds;
 }
 
-async function loadJob(jobId: string): Promise<JobRecord | null> {
-  const redis = getRedis();
-  const key = jobKey(jobId);
-  const data = await redis.hgetall<Record<string, string>>(key);
-  if (!data || Object.keys(data).length === 0) return null;
-
-  const parseJson = <T>(val?: string | null): T | undefined => {
-    if (!val) return undefined;
+/** Hash values from Upstash hgetall may be auto-parsed (object/array) or raw strings. */
+function valueFromHash<T>(val: unknown): T | undefined {
+  if (val === undefined || val === null) return undefined;
+  if (typeof val === 'object') return val as T;
+  if (typeof val === 'string') {
     try {
       return JSON.parse(val) as T;
     } catch {
       return undefined;
     }
-  };
+  }
+  return undefined;
+}
+
+function stringFromHash(val: unknown): string {
+  if (val == null) return '';
+  if (typeof val === 'string') return val;
+  return String(val);
+}
+
+async function loadJob(jobId: string): Promise<JobRecord | null> {
+  const redis = getRedis();
+  const key = jobKey(jobId);
+  const data = await redis.hgetall(key) as Record<string, unknown> | null;
+  if (!data || typeof data !== 'object' || Object.keys(data).length === 0) return null;
 
   // Prefer atomic list key for internal jobs; fallback to hash field for old records
   const listKey = internalListKey(jobId);
@@ -544,28 +555,28 @@ async function loadJob(jobId: string): Promise<JobRecord | null> {
     internalJobs = listItems
       .map((s) => {
         try {
-          return JSON.parse(s) as InternalJobEntry;
+          return (typeof s === 'string' ? JSON.parse(s) : s) as InternalJobEntry;
         } catch {
           return null;
         }
       })
       .filter((e): e is InternalJobEntry => e != null);
   } else {
-    internalJobs = parseJson<InternalJobEntry[]>(data.internalJobs);
+    internalJobs = valueFromHash<InternalJobEntry[]>(data.internalJobs);
   }
 
   const record: JobRecord = {
-    jobId: data.jobId,
-    workerId: data.workerId,
-    status: (data.status as JobRecord['status']) || 'queued',
-    input: parseJson<any>(data.input) ?? {},
-    output: parseJson<any>(data.output),
-    error: parseJson<any>(data.error),
-    metadata: parseJson<Record<string, any>>(data.metadata) ?? {},
+    jobId: stringFromHash(data.jobId),
+    workerId: stringFromHash(data.workerId),
+    status: (stringFromHash(data.status) as JobRecord['status']) || 'queued',
+    input: valueFromHash<any>(data.input) ?? {},
+    output: valueFromHash<any>(data.output),
+    error: valueFromHash<JobRecord['error']>(data.error),
+    metadata: valueFromHash<Record<string, any>>(data.metadata) ?? {},
     internalJobs,
-    createdAt: data.createdAt,
-    updatedAt: data.updatedAt,
-    completedAt: data.completedAt,
+    createdAt: stringFromHash(data.createdAt),
+    updatedAt: stringFromHash(data.updatedAt),
+    completedAt: data.completedAt != null ? stringFromHash(data.completedAt) : undefined,
   };
 
   return record;

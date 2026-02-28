@@ -1,5 +1,11 @@
 # @microfox/ai-worker
 
+## 1.0.4
+
+### Patch Changes
+
+- c4db3a9: Changes from PR #57: grouper-worker-projects
+
 ## 1.0.3
 
 ### Patch Changes

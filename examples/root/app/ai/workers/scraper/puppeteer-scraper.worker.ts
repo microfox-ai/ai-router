@@ -1,5 +1,5 @@
 /**
- * Puppeteer Web Scraper Worker (from puppeteer-worker-example)
+ * Puppeteer Web Scraper Worker
  * Group: scraper – extracts structured data from webpages using CSS selectors.
  */
 

@@ -1,5 +1,13 @@
 # @microfox/ai-worker-cli
 
+## 1.0.5
+
+### Patch Changes
+
+- c4db3a9: Changes from PR #57: grouper-worker-projects
+- Updated dependencies [c4db3a9]
+  - @microfox/ai-worker@1.0.4
+
 ## 1.0.4
 
 ### Patch Changes

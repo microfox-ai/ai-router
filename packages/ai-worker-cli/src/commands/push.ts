@@ -413,11 +413,14 @@ interface WorkerInfo {
   // Module path WITHOUT extension and WITHOUT ".handler" suffix.
   // Example: "handlers/agents/test/test"
   handlerPath: string;
+  /** Deployment group (default 'default'). Used to assign worker to a serverless project. */
+  group: string;
   workerConfig?: {
     timeout?: number;
     memorySize?: number;
     layers?: string[];
     schedule?: any; // Schedule config: string, object, or array of either
+    group?: string;
     sqs?: {
       maxReceiveCount?: number;
       messageRetentionPeriod?: number;
@@ -460,9 +463,123 @@ interface ServerlessConfig {
   };
 }
 
-export function getServiceNameFromProjectId(projectId: string): string {
+export function getServiceNameFromProjectId(projectId: string, group?: string): string {
   const cleanedProjectId = projectId.replace(/-/g, '').slice(0, 15);
-  return `p-${cleanedProjectId}`;
+  if (!group || group === 'default') {
+    return `p-${cleanedProjectId}`;
+  }
+  const groupSlug = group.replace(/-/g, '').slice(0, 12);
+  return `p-${cleanedProjectId}-${groupSlug}`;
+}
+
+/** Default external for esbuild (aws-sdk is always available in Lambda runtime). */
+const DEFAULT_EXTERNAL_PACKAGES = ['aws-sdk'];
+
+/**
+ * Effective worker config for a group (worker.* merged with worker.groups[groupName]).
+ * externalDeps is project-level only (worker.externalDeps); includeNodeModules and excludeNodeModules can be overridden per group.
+ */
+function getGroupWorkerConfig(
+  microfoxConfig: Record<string, any> | null,
+  group?: string | null
+): { includeNodeModules?: boolean; excludeNodeModules?: string[]; externalDeps?: string[] } {
+  const base = {
+    includeNodeModules: microfoxConfig?.worker?.includeNodeModules,
+    excludeNodeModules: microfoxConfig?.worker?.excludeNodeModules as string[] | undefined,
+    externalDeps: microfoxConfig?.worker?.externalDeps as string[] | undefined,
+  };
+  if (!group || !microfoxConfig?.worker?.groups?.[group] || typeof microfoxConfig.worker.groups[group] !== 'object') {
+    return base;
+  }
+  const g = microfoxConfig.worker.groups[group] as Record<string, any>;
+  return {
+    includeNodeModules: g.includeNodeModules !== undefined ? !!g.includeNodeModules : base.includeNodeModules,
+    excludeNodeModules: Array.isArray(g.excludeNodeModules)
+      ? g.excludeNodeModules
+      : base.excludeNodeModules,
+    externalDeps: base.externalDeps,
+  };
+}
+
+/**
+ * Resolve external packages from microfox.json (worker.externalDeps, project-level only).
+ * Default is only aws-sdk; any worker.externalDeps are appended. Used for esbuild external and package patterns.
+ * @param group Optional; when building per-group configs, group is passed but externalDeps are not overridden per group.
+ */
+function getExternalPackages(microfoxConfig: Record<string, any> | null, group?: string | null): string[] {
+  const base = [...DEFAULT_EXTERNAL_PACKAGES];
+  if (!microfoxConfig) return base;
+  const { externalDeps } = getGroupWorkerConfig(microfoxConfig, group);
+  const list = externalDeps;
+  if (Array.isArray(list) && list.length > 0) {
+    const extra = list.filter((p: any) => typeof p === 'string' && p && !base.includes(p));
+    return [...base, ...extra];
+  }
+  return base;
+}
+
+/**
+ * Build serverless package include patterns for external packages (node_modules/<pkg>/**).
+ * Excludes aws-sdk since it is always available in Lambda runtime and must not be in serverless.yml.
+ */
+function getExternalPackagePatterns(externalPackages: string[]): string[] {
+  return externalPackages
+    .filter((pkg) => pkg !== 'aws-sdk')
+    .map((pkg) => `node_modules/${pkg}/**`);
+}
+
+/** Default node_modules packages to exclude when includeNodeModules is true (dev/build only). */
+const DEFAULT_EXCLUDE_NODE_MODULES = ['serverless-offline', 'typescript', '@types', 'aws-sdk', '@aws-sdk'];
+
+/**
+ * Build full serverless package.patterns array.
+ * - When worker.includeNodeModules (or worker.groups[group].includeNodeModules) is true: include all node_modules except listed packages.
+ * - Otherwise: exclude node_modules and include only externalDeps (and aws-sdk is not in patterns).
+ * @param group When set, uses worker.groups[group] overrides for includeNodeModules / excludeNodeModules.
+ */
+function getPackagePatterns(
+  microfoxConfig: Record<string, any> | null,
+  externalPackages: string[],
+  group?: string | null
+): string[] {
+  const base = ['!venv/**', '!.idea/**', '!.vscode/**', '!src/**'];
+  const groupConfig = microfoxConfig ? getGroupWorkerConfig(microfoxConfig, group) : null;
+  const includeNodeModules = groupConfig?.includeNodeModules === true;
+  const customExclude = groupConfig?.excludeNodeModules;
+  const excludePkgs = Array.isArray(customExclude)
+    ? [...DEFAULT_EXCLUDE_NODE_MODULES, ...customExclude.filter((p: any) => typeof p === 'string')]
+    : DEFAULT_EXCLUDE_NODE_MODULES;
+
+  if (includeNodeModules) {
+    const excludePatterns = excludePkgs.map((pkg) => `!node_modules/${pkg}/**`);
+    return [...base, ...excludePatterns];
+  }
+  const nodeExcludes = [
+    '!node_modules/**',
+    '!node_modules/serverless-offline/**',
+    '!node_modules/typescript/**',
+    '!node_modules/@types/**',
+    '!node_modules/aws-sdk/**',
+    '!node_modules/@aws-sdk/**',
+  ];
+  const includeExternals = getExternalPackagePatterns(externalPackages.length > 0 ? externalPackages : DEFAULT_EXTERNAL_PACKAGES);
+  return [...base, ...nodeExcludes, ...includeExternals];
+}
+
+/**
+ * Validates group names: reject reserved 'core', max 12 characters.
+ */
+function validateGroupNames(workers: WorkerInfo[]): void {
+  for (const w of workers) {
+    if (w.group === 'core') {
+      console.error(chalk.red("Group name 'core' is reserved. Use another group name for your workers."));
+      process.exit(1);
+    }
+    if (w.group.length > 12) {
+      console.error(chalk.red('Group name must be at most 12 characters.'));
+      process.exit(1);
+    }
+  }
 }
 
 /**
@@ -499,8 +616,9 @@ async function scanWorkers(aiPath: string = 'app/ai'): Promise<WorkerInfo[]> {
       // We'll import the workerConfig from the bundled handlers later
 
       // Fallback to regex parsing if import didn't work
+      let groupFromSource = 'default';
+      const content = fs.readFileSync(filePath, 'utf-8');
       if (!workerId) {
-        const content = fs.readFileSync(filePath, 'utf-8');
         // Match createWorker with optional type parameters: createWorker<...>({ id: '...' })
         // or createWorker({ id: '...' })
         const idMatch = content.match(/createWorker\s*(?:<[^>]+>)?\s*\(\s*\{[\s\S]*?id:\s*['"]([^'"]+)['"]/);
@@ -509,6 +627,11 @@ async function scanWorkers(aiPath: string = 'app/ai'): Promise<WorkerInfo[]> {
           continue;
         }
         workerId = idMatch[1];
+      }
+      // Extract group from exported workerConfig if present (e.g. workerConfig: { group: 'workflows' })
+      const groupMatch = content.match(/group:\s*['"]([^'"]+)['"]/);
+      if (groupMatch) {
+        groupFromSource = groupMatch[1];
       }
 
       // Generate handler path (relative to serverless root)
@@ -522,6 +645,7 @@ async function scanWorkers(aiPath: string = 'app/ai'): Promise<WorkerInfo[]> {
         id: workerId,
         filePath,
         handlerPath,
+        group: groupFromSource,
         workerConfig,
       });
     } catch (error) {
@@ -715,7 +839,8 @@ function mergeQueueCallees(
 async function generateHandlers(
   workers: WorkerInfo[],
   outputDir: string,
-  queues: QueueInfo[] = []
+  queues: QueueInfo[] = [],
+  externalPackages: string[] = []
 ): Promise<void> {
   const handlersDir = path.join(outputDir, 'handlers');
   const workersSubdir = path.join(handlersDir, 'workers');
@@ -925,14 +1050,7 @@ export const exportedWorkerConfig = workerModule.workerConfig || workerAgent?.wo
         target: 'node20',
         format: 'cjs',
         outfile: handlerFile,
-        // We exclude aws-sdk as it's included in Lambda runtime
-        // We exclude canvas because it's a binary dependency often problematic in bundling
-        external: [
-          'aws-sdk',
-          'canvas',
-          '@microfox/puppeteer-sls',
-          "@sparticuz/chromium"
-        ],
+        external: externalPackages.length > 0 ? externalPackages : DEFAULT_EXTERNAL_PACKAGES,
         // Force lazy-cache to eagerly load modules during bundling
         // This prevents runtime dynamic require() calls that fail in bundled code
         define: {
@@ -956,7 +1074,7 @@ export const exportedWorkerConfig = workerModule.workerConfig || workerAgent?.wo
   console.log(chalk.green(`✓ Generated ${workers.length} bundled handlers`));
 }
 
-function generateDocsHandler(outputDir: string, serviceName: string, stage: string, region: string): void {
+function generateDocsHandler(outputDir: string, serviceName: string, stage: string, region: string, externalPackages: string[] = []): void {
   const apiDir = path.join(outputDir, 'handlers', 'api');
   const handlerFile = path.join(apiDir, 'docs.js');
   const tempEntryFile = handlerFile.replace('.js', '.temp.ts');
@@ -1158,18 +1276,14 @@ export const handler = async (
   fs.writeFileSync(tempEntryFile, handlerContent);
 
   // Bundle it
+  const externals = externalPackages.length > 0 ? externalPackages : DEFAULT_EXTERNAL_PACKAGES;
   esbuild.buildSync({
     entryPoints: [tempEntryFile],
     bundle: true,
     platform: 'node',
     target: 'node20',
     outfile: handlerFile,
-    external: [
-      'aws-sdk',
-      'canvas',
-      '@microfox/puppeteer-sls',
-      "@sparticuz/chromium"
-    ],
+    external: externals,
     define: {
       'process.env.UNLAZY': '"true"',
     },
@@ -1180,7 +1294,7 @@ export const handler = async (
   console.log(chalk.green(`✓ Generated docs.json handler`));
 }
 
-function generateTriggerHandler(outputDir: string, serviceName: string): void {
+function generateTriggerHandler(outputDir: string, serviceName: string, externalPackages: string[] = []): void {
   const apiDir = path.join(outputDir, 'handlers', 'api');
   const handlerFile = path.join(apiDir, 'workers-trigger.js');
   const tempEntryFile = handlerFile.replace('.js', '.temp.ts');
@@ -1258,18 +1372,21 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
     return jsonResponse(400, { error: 'body/messageBody is required' });
   }
 
-  const queueName = \`\${SERVICE_NAME}-\${workerId}-\${stage}\`;
+  const envKey = 'WORKER_QUEUE_URL_' + workerId.replace(/-/g, '_').toUpperCase();
+  let queueUrl: string | undefined = process.env[envKey];
   const sqs = new SQSClient({ region });
-
-  let queueUrl: string;
-  try {
-    const urlRes = await sqs.send(new GetQueueUrlCommand({ QueueName: queueName }));
-    if (!urlRes.QueueUrl) {
-      return jsonResponse(404, { error: 'Queue URL not found', queueName });
+  let queueName: string | undefined;
+  if (!queueUrl) {
+    queueName = \`\${SERVICE_NAME}-\${workerId}-\${stage}\`;
+    try {
+      const urlRes = await sqs.send(new GetQueueUrlCommand({ QueueName: queueName }));
+      if (!urlRes.QueueUrl) {
+        return jsonResponse(404, { error: 'Queue URL not found', queueName });
+      }
+      queueUrl = String(urlRes.QueueUrl);
+    } catch (e: any) {
+      return jsonResponse(404, { error: 'Queue does not exist or not accessible', queueName, message: String(e?.message || e) });
     }
-    queueUrl = String(urlRes.QueueUrl);
-  } catch (e: any) {
-    return jsonResponse(404, { error: 'Queue does not exist or not accessible', queueName, message: String(e?.message || e) });
   }
 
   try {
@@ -1290,18 +1407,14 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
 
   fs.writeFileSync(tempEntryFile, handlerContent);
 
+  const externals = externalPackages.length > 0 ? externalPackages : DEFAULT_EXTERNAL_PACKAGES;
   esbuild.buildSync({
     entryPoints: [tempEntryFile],
     bundle: true,
     platform: 'node',
     target: 'node20',
     outfile: handlerFile,
-    external: [
-      'aws-sdk',
-      'canvas',
-      '@microfox/puppeteer-sls',
-      "@sparticuz/chromium"
-    ],
+    external: externals,
     define: {
       'process.env.UNLAZY': '"true"',
     },
@@ -1320,7 +1433,8 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
 function generateQueueHandler(
   outputDir: string,
   queue: QueueInfo,
-  serviceName: string
+  serviceName: string,
+  externalPackages: string[] = []
 ): void {
   // File-safe queue id for path (keep dashes for readability, e.g. demo-data-processor)
   const queueFileId = queue.id.replace(/[^a-zA-Z0-9-]/g, '-').replace(/-+/g, '-');
@@ -1353,10 +1467,20 @@ function isHttpEvent(event: any): event is { body?: string; requestContext?: any
   return event && typeof event.requestContext === 'object' && (event.body !== undefined || event.httpMethod === 'POST');
 }
 
+async function getFirstWorkerQueueUrl(region: string, stage: string): Promise<string> {
+  const envKey = 'WORKER_QUEUE_URL_' + FIRST_WORKER_ID.replace(/-/g, '_').toUpperCase();
+  const fromEnv = process.env[envKey];
+  if (fromEnv) return fromEnv;
+  const queueName = \`\${SERVICE_NAME}-\${FIRST_WORKER_ID}-\${stage}\`;
+  const sqs = new SQSClient({ region });
+  const { QueueUrl } = await sqs.send(new GetQueueUrlCommand({ QueueName: queueName }));
+  if (!QueueUrl) throw new Error('Queue URL not found: ' + queueName);
+  return QueueUrl;
+}
+
 export const handler = async (event: any) => {
   const stage = process.env.ENVIRONMENT || process.env.STAGE || 'prod';
   const region = process.env.AWS_REGION || 'us-east-1';
-  const queueName = \`\${SERVICE_NAME}-\${FIRST_WORKER_ID}-\${stage}\`;
 
   let jobId: string;
   let initialInput: Record<string, any>;
@@ -1388,7 +1512,8 @@ export const handler = async (event: any) => {
     const response = { statusCode: 200, headers: { 'Content-Type': 'application/json' }, body: '' };
     try {
       await upsertInitialQueueJob({ queueJobId: jobId, queueId: QUEUE_ID, firstWorkerId: FIRST_WORKER_ID, firstWorkerJobId: jobId, metadata });
-      await sendFirstMessage(region, queueName, jobId, initialInput, context, metadata, webhookUrl, 'http');
+      const queueUrl = await getFirstWorkerQueueUrl(region, stage);
+      await sendFirstMessage(region, queueUrl, jobId, initialInput, context, metadata, webhookUrl, 'http');
       response.body = JSON.stringify({ queueId: QUEUE_ID, jobId, status: 'queued' });
     } catch (err: any) {
       response.statusCode = 500;
@@ -1403,12 +1528,13 @@ export const handler = async (event: any) => {
   try {
     await upsertInitialQueueJob({ queueJobId: jobId, queueId: QUEUE_ID, firstWorkerId: FIRST_WORKER_ID, firstWorkerJobId: jobId, metadata: {} });
   } catch (_) {}
-  await sendFirstMessage(region, queueName, jobId, initialInput, context, metadata, webhookUrl, 'schedule');
+  const queueUrl = await getFirstWorkerQueueUrl(region, stage);
+  await sendFirstMessage(region, queueUrl, jobId, initialInput, context, metadata, webhookUrl, 'schedule');
 };
 
 async function sendFirstMessage(
   region: string,
-  queueName: string,
+  queueUrlOrName: string,
   jobId: string,
   initialInput: Record<string, any>,
   context: Record<string, any>,
@@ -1417,9 +1543,9 @@ async function sendFirstMessage(
   trigger?: 'schedule' | 'http'
 ) {
   const sqs = new SQSClient({ region });
-  const { QueueUrl } = await sqs.send(new GetQueueUrlCommand({ QueueName: queueName }));
+  const QueueUrl = queueUrlOrName.startsWith('http') ? queueUrlOrName : (await sqs.send(new GetQueueUrlCommand({ QueueName: queueUrlOrName }))).QueueUrl;
   if (!QueueUrl) {
-    throw new Error('Queue URL not found: ' + queueName);
+    throw new Error('Queue URL not found: ' + queueUrlOrName);
   }
 
   const queueContext = { id: QUEUE_ID, stepIndex: 0, initialInput, queueJobId: jobId };
@@ -1443,13 +1569,14 @@ async function sendFirstMessage(
 `;
 
   fs.writeFileSync(tempEntryFile, handlerContent);
+  const queueExternals = externalPackages.length > 0 ? externalPackages : DEFAULT_EXTERNAL_PACKAGES;
   esbuild.buildSync({
     entryPoints: [tempEntryFile],
     bundle: true,
     platform: 'node',
     target: 'node20',
     outfile: handlerFile,
-    external: ['aws-sdk', 'canvas', '@microfox/puppeteer-sls', '@sparticuz/chromium'],
+    external: queueExternals,
     packages: 'bundle',
     logLevel: 'error',
   });
@@ -1464,7 +1591,8 @@ function generateWorkersConfigHandler(
   outputDir: string,
   workers: WorkerInfo[],
   serviceName: string,
-  queues: QueueInfo[] = []
+  queues: QueueInfo[] = [],
+  externalPackages: string[] = []
 ): void {
   // We'll bundle this one too
   const apiDir = path.join(outputDir, 'handlers', 'api');
@@ -1528,6 +1656,15 @@ export const handler = async (
 
   await Promise.all(
     WORKER_IDS.map(async (workerId) => {
+      // Prefer convention-based env vars generated in core stack so we can support multiple groups.
+      const envKey = 'WORKER_QUEUE_URL_' + workerId.replace(/-/g, '_').toUpperCase();
+      const fromEnv = process.env[envKey];
+      if (fromEnv) {
+        workers[workerId] = { queueUrl: fromEnv, region };
+        return;
+      }
+
+      // Fallback: resolve via SQS GetQueueUrl for backward compatibility.
       const queueName = \`\${SERVICE_NAME}-\${workerId}-\${stage}\`;
       attemptedQueueNames.push(queueName);
       try {
@@ -1567,18 +1704,14 @@ export const handler = async (
   fs.writeFileSync(tempEntryFile, handlerContent);
 
   // Bundle it
+  const configExternals = externalPackages.length > 0 ? externalPackages : DEFAULT_EXTERNAL_PACKAGES;
   esbuild.buildSync({
     entryPoints: [tempEntryFile],
     bundle: true,
     platform: 'node',
     target: 'node20',
     outfile: handlerFile,
-    external: [
-      'aws-sdk',
-      'canvas',
-      '@microfox/puppeteer-sls',
-      "@sparticuz/chromium"
-    ],
+    external: configExternals,
     define: {
       'process.env.UNLAZY': '"true"',
     },
@@ -1706,6 +1839,20 @@ function processScheduleEvents(scheduleConfig: any): any[] {
   return events;
 }
 
+/** Options for user-group-only serverless config (no trigger/config/docs/queue starters). */
+interface GenerateServerlessConfigOptions {
+  userGroupOnly?: boolean;
+  projectId?: string;
+  /** All workers across groups (for cross-group queue next-step env + IAM). */
+  allWorkers?: WorkerInfo[];
+  /** External packages to include in Lambda package (node_modules/<pkg>/**). */
+  externalPackages?: string[];
+  /** microfox.json config for package pattern control (worker.includeNodeModules, worker.excludeNodeModules, worker.groups[group]). */
+  microfoxConfig?: Record<string, any> | null;
+  /** Group name for per-group overrides (worker.groups[group].includeNodeModules, excludeNodeModules). */
+  group?: string | null;
+}
+
 /**
  * Generates serverless.yml configuration.
  */
@@ -1716,8 +1863,11 @@ function generateServerlessConfig(
   envVars: Record<string, string>,
   serviceName: string,
   calleeIds: Map<string, Set<string>> = new Map(),
-  queues: QueueInfo[] = []
+  queues: QueueInfo[] = [],
+  options: GenerateServerlessConfigOptions = {}
 ): ServerlessConfig {
+  const { userGroupOnly = false, projectId, allWorkers: allWorkersForCallee = [], externalPackages = [], microfoxConfig = null, group: optionsGroup = null } = options;
+  const workerIdsInThisGroup = new Set(workers.map((w) => w.id));
   // Create SQS queues for each worker
   const resources: ServerlessConfig['resources'] = {
     Resources: {},
@@ -1850,6 +2000,13 @@ function generateServerlessConfig(
           const queueLogicalId = `WorkerQueue${calleeWorker.id.replace(/[^a-zA-Z0-9]/g, '')}${stage}`;
           const envKey = `WORKER_QUEUE_URL_${sanitizeWorkerIdForEnv(calleeId)}`;
           env[envKey] = { Ref: queueLogicalId };
+        } else if (userGroupOnly && projectId && allWorkersForCallee.length > 0) {
+          const crossCallee = allWorkersForCallee.find((w) => w.id === calleeId);
+          if (crossCallee) {
+            const svc = getServiceNameFromProjectId(projectId, crossCallee.group);
+            const url = `https://sqs.\${aws:region}.amazonaws.com/\${aws:accountId}/${svc}-${calleeId}-\${opt:stage, env:ENVIRONMENT, '${stage}'}`;
+            env[`WORKER_QUEUE_URL_${sanitizeWorkerIdForEnv(calleeId)}`] = url;
+          }
         }
       }
       if (Object.keys(env).length > 0) {
@@ -1858,7 +2015,27 @@ function generateServerlessConfig(
     }
   }
 
-  // Add docs.json function for Microfox compatibility
+  // Cross-group queue ARN patterns for IAM (userGroupOnly, queue next-step)
+  let crossGroupArnPatterns: string[] = [];
+  if (userGroupOnly && projectId && allWorkersForCallee.length > 0) {
+    const set = new Set<string>();
+    for (const worker of workers) {
+      const callees = calleeIds.get(worker.id);
+      if (callees) {
+        for (const calleeId of callees) {
+          const calleeWorker = allWorkersForCallee.find((w) => w.id === calleeId);
+          if (calleeWorker && !workerIdsInThisGroup.has(calleeId)) {
+            const svc = getServiceNameFromProjectId(projectId, calleeWorker.group);
+            set.add(`arn:aws:sqs:\${aws:region}:\${aws:accountId}:${svc}-${calleeId}-*`);
+          }
+        }
+      }
+    }
+    crossGroupArnPatterns = Array.from(set);
+  }
+
+  // Add docs.json function for Microfox compatibility (skip when userGroupOnly)
+  if (!userGroupOnly) {
   functions['getDocs'] = {
     handler: 'handlers/api/docs.handler',
     events: [
@@ -1872,7 +2049,10 @@ function generateServerlessConfig(
     ],
   };
 
-  // Add workers trigger endpoint (HTTP -> SQS SendMessage)
+  }
+
+  // Add workers trigger endpoint (HTTP -> SQS SendMessage) - skip when userGroupOnly
+  if (!userGroupOnly) {
   functions['triggerWorker'] = {
     handler: 'handlers/api/workers-trigger.handler',
     events: [
@@ -1886,7 +2066,6 @@ function generateServerlessConfig(
     ],
   };
 
-  // Add workers-config function
   functions['workersConfig'] = {
     handler: 'handlers/api/workers-config.handler',
     events: [
@@ -1900,7 +2079,10 @@ function generateServerlessConfig(
     ],
   };
 
-  // One function per queue: HTTP POST /queues/:queueId/start (dispatch proxy) + optional schedule
+  }
+
+  // One function per queue: HTTP POST /queues/:queueId/start (dispatch proxy) + optional schedule - skip when userGroupOnly
+  if (!userGroupOnly) {
   for (const queue of queues) {
     const queueFileId = queue.id.replace(/[^a-zA-Z0-9-]/g, '-').replace(/-+/g, '-');
     const fnName = toPrefixedCamel('queue', queue.id);
@@ -1923,6 +2105,7 @@ function generateServerlessConfig(
       events,
     };
   }
+  }
 
   // Filter env vars - only include safe ones (exclude secrets that should be in AWS Secrets Manager)
   const safeEnvVars: Record<string, string> = {};
@@ -1937,41 +2120,33 @@ function generateServerlessConfig(
     }
   }
 
-  // Add ApiEndpoints output for Microfox
-  resources.Outputs['ApiEndpoints'] = {
-    Description: "API Endpoints",
-    Value: {
-      "Fn::Join": [
-        "",
-        [
-          "API: https://",
-          { "Ref": "ApiGatewayRestApi" },
-          ".execute-api.",
-          { "Ref": "AWS::Region" },
-          `.amazonaws.com/\${env:ENVIRONMENT, '${stage}'}`
+  // ApiEndpoints output only when this stack has HTTP (core/single-group). Non-core groups have no ApiGatewayRestApi.
+  if (!userGroupOnly) {
+    resources.Outputs['ApiEndpoints'] = {
+      Description: "API Endpoints",
+      Value: {
+        "Fn::Join": [
+          "",
+          [
+            "API: https://",
+            { "Ref": "ApiGatewayRestApi" },
+            ".execute-api.",
+            { "Ref": "AWS::Region" },
+            `.amazonaws.com/\${env:ENVIRONMENT, '${stage}'}`
+          ]
         ]
-      ]
-    }
-  };
+      }
+    };
+  }
+
+  const patterns = getPackagePatterns(microfoxConfig, externalPackages.length > 0 ? externalPackages : DEFAULT_EXTERNAL_PACKAGES, optionsGroup);
 
   return {
     service: serviceName,
     package: {
       excludeDevDependencies: true,
       individually: true,
-      // Handlers are fully bundled by esbuild (packages: 'bundle'); exclude node_modules to stay under Lambda 250 MB limit
-      patterns: [
-        '!venv/**',
-        '!.idea/**',
-        '!.vscode/**',
-        '!src/**',
-        '!node_modules/**',
-        '!node_modules/serverless-offline/**',
-        '!node_modules/typescript/**',
-        '!node_modules/@types/**',
-        '!node_modules/aws-sdk/**',
-        '!node_modules/@aws-sdk/**'
-      ],
+      patterns,
     },
     custom: customConfig,
     provider: {
@@ -1995,6 +2170,9 @@ function generateServerlessConfig(
               ],
               Resource: queueArns,
             },
+            ...(crossGroupArnPatterns.length > 0
+              ? [{ Effect: 'Allow', Action: ['sqs:SendMessage'], Resource: crossGroupArnPatterns }]
+              : []),
             {
               Effect: 'Allow',
               Action: ['sqs:GetQueueUrl'],
@@ -2008,6 +2186,141 @@ function generateServerlessConfig(
     plugins: ['serverless-offline'],
     functions,
     resources,
+  };
+}
+
+/**
+ * Generates serverless.yml for the core group only: trigger, workers-config, docs, queue starters.
+ * No worker Lambdas or worker SQS. Env + IAM for all workers in all groups (convention-based queue URLs).
+ */
+function generateServerlessConfigCore(
+  projectId: string,
+  allWorkersByGroup: Map<string, WorkerInfo[]>,
+  queues: QueueInfo[],
+  stage: string,
+  region: string,
+  envVars: Record<string, string>,
+  serviceName: string,
+  externalPackages: string[] = [],
+  microfoxConfig: Record<string, any> | null = null
+): ServerlessConfig {
+  const allWorkers = Array.from(allWorkersByGroup.values()).flat();
+  const allGroups = Array.from(allWorkersByGroup.keys()).sort();
+
+  const queueUrlEnv: Record<string, string> = {};
+  for (const w of allWorkers) {
+    const svc = getServiceNameFromProjectId(projectId, w.group);
+    const queueNamePart = `${svc}-${w.id}`;
+    const url = `https://sqs.\${aws:region}.amazonaws.com/\${aws:accountId}/${queueNamePart}-\${opt:stage, env:ENVIRONMENT, '${stage}'}`;
+    queueUrlEnv[`WORKER_QUEUE_URL_${sanitizeWorkerIdForEnv(w.id)}`] = url;
+  }
+
+  const queueArnPatterns: string[] = allGroups.map((g) => {
+    const svc = getServiceNameFromProjectId(projectId, g);
+    return `arn:aws:sqs:\${aws:region}:\${aws:accountId}:${svc}-*`;
+  });
+
+  const customConfig: Record<string, any> = {
+    stage: `\${env:ENVIRONMENT, '${stage}'}`,
+    'serverless-offline': {
+      httpPort: 4000,
+      lambdaPort: 4002,
+      useChildProcesses: true,
+      useWorkerThreads: true,
+      noCookieValidation: true,
+      allowCache: true,
+      hideStackTraces: false,
+      disableCookieValidation: true,
+      noTimeout: true,
+      environment: '\${file(env.json)}',
+    },
+  };
+
+  const functions: Record<string, any> = {};
+  functions['getDocs'] = {
+    handler: 'handlers/api/docs.handler',
+    events: [{ http: { path: '/docs.json', method: 'GET', cors: true } }],
+  };
+  functions['triggerWorker'] = {
+    handler: 'handlers/api/workers-trigger.handler',
+    events: [{ http: { path: '/workers/trigger', method: 'POST', cors: true } }],
+    environment: queueUrlEnv,
+  };
+  functions['workersConfig'] = {
+    handler: 'handlers/api/workers-config.handler',
+    events: [{ http: { path: 'workers/config', method: 'GET', cors: true } }],
+    environment: queueUrlEnv,
+  };
+  for (const queue of queues) {
+    const queueFileId = queue.id.replace(/[^a-zA-Z0-9-]/g, '-').replace(/-+/g, '-');
+    const fnName = toPrefixedCamel('queue', queue.id);
+    const events: any[] = [{ http: { path: `queues/${queueFileId}/start`, method: 'POST', cors: true } }];
+    if (queue.schedule) {
+      events.push(...processScheduleEvents(queue.schedule));
+    }
+    functions[fnName] = {
+      handler: `handlers/queues/${queueFileId}.handler`,
+      timeout: 60,
+      memorySize: 128,
+      events,
+      environment: queueUrlEnv,
+    };
+  }
+
+  const allowedPrefixes = ['OPENAI_', 'ANTHROPIC_', 'DATABASE_', 'MONGODB_', 'REDIS_', 'UPSTASH_', 'WORKER_', 'WORKERS_', 'WORKFLOW_', 'REMOTION_', 'QUEUE_JOB_', 'DEBUG_WORKER_QUEUES'];
+  const safeEnvVars: Record<string, string> = {};
+  for (const [key, value] of Object.entries(envVars)) {
+    if (allowedPrefixes.some((prefix) => key.startsWith(prefix))) {
+      safeEnvVars[key] = value;
+    }
+  }
+
+  const corePatterns = getPackagePatterns(microfoxConfig, externalPackages.length > 0 ? externalPackages : DEFAULT_EXTERNAL_PACKAGES, 'core');
+
+  return {
+    service: serviceName,
+    package: {
+      excludeDevDependencies: true,
+      individually: true,
+      patterns: corePatterns,
+    },
+    custom: customConfig,
+    provider: {
+      name: 'aws',
+      runtime: 'nodejs20.x',
+      region,
+      versionFunctions: false,
+      stage: `\${env:ENVIRONMENT, '${stage}'}`,
+      environment: '\${file(env.json)}',
+      iam: {
+        role: {
+          statements: [
+            {
+              Effect: 'Allow',
+              Action: ['sqs:SendMessage', 'sqs:ReceiveMessage', 'sqs:DeleteMessage', 'sqs:GetQueueAttributes'],
+              Resource: queueArnPatterns,
+            },
+            { Effect: 'Allow', Action: ['sqs:GetQueueUrl'], Resource: '*' },
+          ],
+        },
+      },
+    },
+    plugins: ['serverless-offline'],
+    functions,
+    resources: {
+      Resources: {},
+      Outputs: {
+        ApiEndpoints: {
+          Description: 'API Endpoints',
+          Value: {
+            'Fn::Join': [
+              '',
+              ['API: https://', { Ref: 'ApiGatewayRestApi' }, '.execute-api.', { Ref: 'AWS::Region' }, `.amazonaws.com/\${env:ENVIRONMENT, '${stage}'}`],
+            ],
+          },
+        },
+      },
+    },
   };
 }
 
@@ -2113,8 +2426,17 @@ async function build(args: any) {
   workers.forEach(w => console.log(chalk.gray(`  - ${w.id} (${w.filePath})`)));
 
   const serverlessDir = path.join(process.cwd(), '.serverless-workers');
+  // Clean .serverless-workers contents but keep node_modules for faster rebuilds.
   if (!fs.existsSync(serverlessDir)) {
     fs.mkdirSync(serverlessDir, { recursive: true });
+  } else {
+    const entries = fs.readdirSync(serverlessDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.name === 'node_modules') continue;
+      if (entry.name === 'deployments.json') continue;
+      const target = path.join(serverlessDir, entry.name);
+      fs.rmSync(target, { recursive: true, force: true });
+    }
   }
 
   // Build an accurate dependencies map for Microfox installs:
@@ -2189,12 +2511,15 @@ async function build(args: any) {
   }
 
   let serviceName = (args['service-name'] as string | undefined)?.trim() || `ai-router-workers-${stage}`;
+  let externalPackages = getExternalPackages(null);
+  let microfoxConfig: Record<string, any> | null = null;
 
-  // Check for microfox.json to customize service name
+  // Check for microfox.json to customize service name and external packages
   const microfoxJsonPath = path.join(process.cwd(), 'microfox.json');
   if (fs.existsSync(microfoxJsonPath)) {
     try {
-      const microfoxConfig = JSON.parse(fs.readFileSync(microfoxJsonPath, 'utf-8'));
+      microfoxConfig = JSON.parse(fs.readFileSync(microfoxJsonPath, 'utf-8'));
+      externalPackages = getExternalPackages(microfoxConfig);
       if (microfoxConfig.projectId) {
         // Only override if user did not explicitly provide a service name
         if (!(args['service-name'] as string | undefined)?.trim()) {
@@ -2214,7 +2539,7 @@ async function build(args: any) {
   }
 
   ora('Generating handlers...').start().succeed('Generated handlers');
-  await generateHandlers(workers, serverlessDir, queues);
+  await generateHandlers(workers, serverlessDir, queues, externalPackages);
 
   // Now import the bundled handlers to extract workerConfig
   const extractSpinner = ora('Extracting worker configs from bundled handlers...').start();
@@ -2233,6 +2558,9 @@ async function build(args: any) {
           // exportedWorkerConfig is exported directly from the handler file
           if (module.exportedWorkerConfig) {
             worker.workerConfig = module.exportedWorkerConfig;
+            if (module.exportedWorkerConfig.group != null) {
+              worker.group = module.exportedWorkerConfig.group;
+            }
             if (module.exportedWorkerConfig.layers?.length) {
               console.log(chalk.gray(`  ✓ ${worker.id}: found ${module.exportedWorkerConfig.layers.length} layer(s)`));
             }
@@ -2259,8 +2587,11 @@ async function build(args: any) {
 
               // Use Function constructor to parse the object (safer than eval)
               const configObj = new Function('return ' + configStr)();
-              if (configObj && (configObj.layers || configObj.timeout || configObj.memorySize || configObj.schedule)) {
+              if (configObj && (configObj.layers || configObj.timeout || configObj.memorySize || configObj.schedule || configObj.group != null)) {
                 worker.workerConfig = configObj;
+                if (configObj.group != null) {
+                  worker.group = configObj.group;
+                }
                 if (configObj.layers?.length) {
                   console.log(chalk.gray(`  ✓ ${worker.id}: found ${configObj.layers.length} layer(s) from source file`));
                 }
@@ -2291,17 +2622,163 @@ async function build(args: any) {
   }
   extractSpinner.succeed('Extracted configs');
 
-  generateWorkersConfigHandler(serverlessDir, workers, serviceName, queues);
-  generateDocsHandler(serverlessDir, serviceName, stage, region);
-  generateTriggerHandler(serverlessDir, serviceName);
+  validateGroupNames(workers);
+
+  const userGroups = [...new Set(workers.map((w) => w.group))].sort((a, b) =>
+    a === 'default' ? -1 : b === 'default' ? 1 : a.localeCompare(b)
+  );
+  const isMultiGroup = userGroups.length > 1;
+  let projectId: string | undefined;
+  if (fs.existsSync(microfoxJsonPath)) {
+    try {
+      const microfoxConfig = JSON.parse(fs.readFileSync(microfoxJsonPath, 'utf-8'));
+      projectId = microfoxConfig.projectId;
+    } catch {}
+  }
+
+  if (isMultiGroup) {
+    if (!projectId) {
+      console.error(chalk.red('❌ Multi-group build requires projectId in microfox.json'));
+      process.exit(1);
+    }
+    const allWorkersByGroup = new Map<string, WorkerInfo[]>();
+    for (const g of userGroups) {
+      allWorkersByGroup.set(g, workers.filter((w) => w.group === g));
+    }
+    const allowedPrefixes = ['OPENAI_', 'ANTHROPIC_', 'DATABASE_', 'MONGODB_', 'REDIS_', 'UPSTASH_', 'WORKER_', 'WORKERS_', 'WORKFLOW_', 'REMOTION_', 'QUEUE_JOB_', 'DEBUG_WORKER_QUEUES'];
+
+    const coreDir = path.join(serverlessDir, 'core');
+    fs.mkdirSync(coreDir, { recursive: true });
+    // Core: minimal deps (no user workers; only job store + devDeps for serverless tooling)
+    const coreFilteredDeps = filterDepsForJobStore(new Set(), jobStoreType);
+    const coreDependencies = buildDependenciesMap(process.cwd(), coreFilteredDeps);
+    const packageJsonCore = {
+      name: 'ai-router-workers',
+      version: '1.0.0',
+      description: 'Auto-generated serverless workers (core)',
+      private: true,
+      dependencies: coreDependencies,
+      scripts: { build: "echo 'Already compiled.'" },
+      devDependencies: {
+        serverless: '^3.38.0',
+        'serverless-offline': '^13.3.3',
+        '@aws-sdk/client-sqs': '^3.700.0',
+      },
+    };
+    fs.writeFileSync(path.join(coreDir, 'package.json'), JSON.stringify(packageJsonCore, null, 2));
+    if (fs.existsSync(microfoxJsonPath)) {
+      fs.copyFileSync(microfoxJsonPath, path.join(coreDir, 'microfox.json'));
+    }
+    generateQueueRegistry(queues, coreDir, process.cwd());
+    const serviceNameCore = getServiceNameFromProjectId(projectId, 'core');
+    const coreExternalPackages = getExternalPackages(microfoxConfig, 'core');
+    generateWorkersConfigHandler(coreDir, workers, serviceNameCore, queues, coreExternalPackages);
+    generateDocsHandler(coreDir, serviceNameCore, stage, region, coreExternalPackages);
+    generateTriggerHandler(coreDir, serviceNameCore, coreExternalPackages);
+    for (const queue of queues) {
+      generateQueueHandler(coreDir, queue, serviceNameCore, coreExternalPackages);
+    }
+    const configCore = generateServerlessConfigCore(projectId, allWorkersByGroup, queues, stage, region, envVars, serviceNameCore, coreExternalPackages, microfoxConfig);
+    fs.writeFileSync(path.join(coreDir, 'serverless.yml'), yaml.dump(configCore, { lineWidth: -1 }));
+    const safeEnv: Record<string, string> = { ENVIRONMENT: 'prod', STAGE: 'prod', NODE_ENV: 'prod' };
+    for (const [k, v] of Object.entries(envVars)) {
+      if (allowedPrefixes.some((p) => k.startsWith(p))) safeEnv[k] = v;
+    }
+    fs.writeFileSync(path.join(coreDir, 'env.json'), JSON.stringify(safeEnv, null, 2));
+
+    for (const g of userGroups) {
+      const groupDir = path.join(serverlessDir, g);
+      fs.mkdirSync(groupDir, { recursive: true });
+      const workersForGroup = allWorkersByGroup.get(g)!;
+      // Per-group deps: only what this group's workers need
+      const runtimeDepsGroup = await collectRuntimeDependenciesForWorkers(
+        workersForGroup.map((w) => w.filePath),
+        process.cwd()
+      );
+      const filteredDepsGroup = filterDepsForJobStore(runtimeDepsGroup, jobStoreType);
+      const dependenciesGroup = buildDependenciesMap(process.cwd(), filteredDepsGroup);
+      const packageJsonGroup = {
+        name: 'ai-router-workers',
+        version: '1.0.0',
+        description: `Auto-generated serverless workers (${g})`,
+        private: true,
+        dependencies: dependenciesGroup,
+        scripts: { build: "echo 'Already compiled.'" },
+        devDependencies: {
+          serverless: '^3.38.0',
+          'serverless-offline': '^13.3.3',
+          '@aws-sdk/client-sqs': '^3.700.0',
+        },
+      };
+      fs.writeFileSync(path.join(groupDir, 'package.json'), JSON.stringify(packageJsonGroup, null, 2));
+      if (fs.existsSync(microfoxJsonPath)) {
+        fs.copyFileSync(microfoxJsonPath, path.join(groupDir, 'microfox.json'));
+      }
+      for (const w of workersForGroup) {
+        const src = path.join(serverlessDir, w.handlerPath + '.js');
+        const dest = path.join(groupDir, w.handlerPath + '.js');
+        if (fs.existsSync(src)) {
+          fs.mkdirSync(path.dirname(dest), { recursive: true });
+          fs.copyFileSync(src, dest);
+        }
+      }
+      const serviceNameGroup = getServiceNameFromProjectId(projectId, g);
+      let calleeIdsGroup = await collectCalleeWorkerIds(workersForGroup, process.cwd());
+      calleeIdsGroup = mergeQueueCallees(calleeIdsGroup, queues, workers);
+      const configUser = generateServerlessConfig(workersForGroup, stage, region, envVars, serviceNameGroup, calleeIdsGroup, [], {
+        userGroupOnly: true,
+        projectId,
+        allWorkers: workers,
+        externalPackages: getExternalPackages(microfoxConfig, g),
+        microfoxConfig,
+        group: g,
+      });
+      fs.writeFileSync(path.join(groupDir, 'serverless.yml'), yaml.dump(configUser, { lineWidth: -1 }));
+      // Per-group env: only keys referenced by this group's workers + allowedPrefixes
+      const { runtimeKeys: runtimeEnvKeysGroup, buildtimeKeys: buildtimeEnvKeysGroup } =
+        await collectEnvUsageForWorkers(workersForGroup.map((w) => w.filePath), process.cwd());
+      const referencedEnvKeysGroup = new Set<string>([
+        ...Array.from(runtimeEnvKeysGroup),
+        ...Array.from(buildtimeEnvKeysGroup),
+      ]);
+      const safeEnvGroup: Record<string, string> = { ENVIRONMENT: 'prod', STAGE: 'prod', NODE_ENV: 'prod' };
+      for (const [k, v] of Object.entries(envVars)) {
+        if (k.startsWith('AWS_')) continue;
+        if (allowedPrefixes.some((p) => k.startsWith(p)) || referencedEnvKeysGroup.has(k)) safeEnvGroup[k] = v;
+      }
+      fs.writeFileSync(path.join(groupDir, 'env.json'), JSON.stringify(safeEnvGroup, null, 2));
+    }
+
+    // In multi-group layout we only want handlers/generated inside per-group dirs.
+    // Root-level handlers/ and generated/ were used as a build staging area; clean them up now.
+    const rootHandlersDir = path.join(serverlessDir, 'handlers');
+    const rootGeneratedDir = path.join(serverlessDir, 'generated');
+    try {
+      if (fs.existsSync(rootHandlersDir)) {
+        fs.rmSync(rootHandlersDir, { recursive: true, force: true });
+      }
+      if (fs.existsSync(rootGeneratedDir)) {
+        fs.rmSync(rootGeneratedDir, { recursive: true, force: true });
+      }
+    } catch {
+      // Best-effort cleanup; ignore failures so build doesn't break.
+    }
+
+    console.log(chalk.green(`✓ Multi-group build: core + ${userGroups.join(', ')}`));
+    return;
+  }
+
+  generateWorkersConfigHandler(serverlessDir, workers, serviceName, queues, externalPackages);
+  generateDocsHandler(serverlessDir, serviceName, stage, region, externalPackages);
+  generateTriggerHandler(serverlessDir, serviceName, externalPackages);
 
   for (const queue of queues) {
-    generateQueueHandler(serverlessDir, queue, serviceName);
+    generateQueueHandler(serverlessDir, queue, serviceName, externalPackages);
   }
 
   let calleeIds = await collectCalleeWorkerIds(workers, process.cwd());
   calleeIds = mergeQueueCallees(calleeIds, queues, workers);
-  const config = generateServerlessConfig(workers, stage, region, envVars, serviceName, calleeIds, queues);
+  const config = generateServerlessConfig(workers, stage, region, envVars, serviceName, calleeIds, queues, { externalPackages, microfoxConfig });
 
   // Always generate env.json now as serverless.yml relies on it.
   // Microfox deploys APIs on prod by default; when microfox.json exists, default ENVIRONMENT/STAGE to "prod".
@@ -2350,8 +2827,9 @@ async function deploy(args: any) {
 
   const serverlessDir = path.join(process.cwd(), '.serverless-workers');
   const yamlPath = path.join(serverlessDir, 'serverless.yml');
+  const hasPerGroupLayout = fs.existsSync(path.join(serverlessDir, 'core', 'serverless.yml'));
 
-  if (!fs.existsSync(yamlPath)) {
+  if (!fs.existsSync(yamlPath) && !hasPerGroupLayout) {
     console.error(chalk.red('❌ serverless.yml not found. Run "build" first.'));
     process.exit(1);
   }
@@ -2375,14 +2853,20 @@ async function deploy(args: any) {
     if (fs.existsSync(microfoxJsonPath)) {
       console.log(chalk.blue('ℹ️  Found microfox.json, deploying via Microfox Cloud...'));
 
-      // Copy microfox.json to .serverless-workers directory
-      fs.copyFileSync(microfoxJsonPath, path.join(serverlessDir, 'microfox.json'));
+      // Copy microfox.json to .serverless-workers directory (required for Microfox CLI to detect per-group layout)
+      try {
+        fs.copyFileSync(microfoxJsonPath, path.join(serverlessDir, 'microfox.json'));
+      } catch {}
 
-      // Load and filter environment variables
-      const envVars = loadEnvVars();
-      // env.json is already generated by build()
+      const skipCore = args.skipCore ?? args['skip-core'] ?? false;
+      const hasPerGroupDirs = fs.existsSync(path.join(serverlessDir, 'core', 'serverless.yml'));
+      const pushArgs = ['microfox@latest', 'push'];
+      if (hasPerGroupDirs && skipCore) {
+        pushArgs.push('--skip-group', 'core');
+        console.log(chalk.blue('ℹ️  Skipping core group (--skip-core)'));
+      }
 
-      execSync('npx microfox@latest push', {
+      execSync('npx ' + pushArgs.join(' '), {
         cwd: serverlessDir,
         stdio: 'inherit'
       });
@@ -2418,6 +2902,7 @@ export const pushCommand = new Command()
   .option('--service-name <name>', 'Override serverless service name (defaults to ai-router-workers-<stage>)')
   .option('--skip-deploy', 'Skip deployment, only build', false)
   .option('--skip-install', 'Skip npm install in serverless directory', false)
+  .option('--skip-core', 'When deploying via Microfox, skip deploying the core group', false)
   .action(async (options) => {
     await build(options);
     await deploy(options);

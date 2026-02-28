@@ -1,5 +1,5 @@
 /**
- * ffprobe worker (from ffmpeg-worker-example) – analyze media files.
+ * ffprobe worker – analyze media files.
  * Group: media – extracts metadata (duration, resolution, fps, etc.) using ffprobe.
  *
  * Lambda: attach ffmpeg Layer, set FFPROBE_PATH=/opt/bin/ffprobe if needed.

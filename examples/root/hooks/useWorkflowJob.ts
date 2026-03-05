@@ -188,6 +188,28 @@ export function useWorkflowJob(
           if (autoPoll) {
             setPolling(true);
             const deadline = Date.now() + pollTimeoutMs;
+            let intervalId: ReturnType<typeof setInterval> | null = null;
+            const terminalHitRef = { current: false };
+            const timeoutId = setTimeout(() => {
+              if (intervalId != null) clearInterval(intervalId);
+              if (timeoutRef.current === timeoutId) timeoutRef.current = null;
+              if (intervalRef.current === intervalId) intervalRef.current = null;
+              setPolling(false);
+              setError(new Error('Poll timeout'));
+              setStatus('failed');
+            }, pollTimeoutMs);
+            timeoutRef.current = timeoutId;
+
+            const clearThisPolling = () => {
+              if (intervalId != null) {
+                clearInterval(intervalId);
+                if (intervalRef.current === intervalId) intervalRef.current = null;
+              }
+              clearTimeout(timeoutId);
+              if (timeoutRef.current === timeoutId) timeoutRef.current = null;
+              setPolling(false);
+            };
+
             const poll = async () => {
               if (!mountedRef.current) return;
               try {
@@ -197,21 +219,22 @@ export function useWorkflowJob(
                 const job = await r.json();
                 if (!r.ok) {
                   if (Date.now() >= deadline) {
-                    clearPolling();
-                    const err = new Error('Poll timeout');
-                    setError(err);
+                    clearThisPolling();
+                    setError(new Error('Poll timeout'));
                     setStatus('failed');
-                    onError?.(err);
+                    onError?.(new Error('Poll timeout'));
                   }
                   return;
                 }
                 setStatus((job.status as WorkflowJobStatus) ?? 'running');
                 setOutput(job as WorkerJobResult);
                 if (job.status === 'completed') {
-                  clearPolling();
+                  terminalHitRef.current = true;
+                  clearThisPolling();
                   onComplete?.(job as WorkerJobResult);
                 } else if (job.status === 'failed') {
-                  clearPolling();
+                  terminalHitRef.current = true;
+                  clearThisPolling();
                   const err = new Error(
                     job?.error?.message ?? 'Job failed'
                   );
@@ -219,14 +242,13 @@ export function useWorkflowJob(
                   setStatus('failed');
                   onError?.(err);
                 } else if (Date.now() >= deadline) {
-                  clearPolling();
-                  const err = new Error('Poll timeout');
-                  setError(err);
-                  onError?.(err);
+                  clearThisPolling();
+                  setError(new Error('Poll timeout'));
+                  onError?.(new Error('Poll timeout'));
                 }
               } catch (e) {
                 if (mountedRef.current) {
-                  clearPolling();
+                  clearThisPolling();
                   const err = e instanceof Error ? e : new Error(String(e));
                   setError(err);
                   setStatus('failed');
@@ -235,12 +257,9 @@ export function useWorkflowJob(
               }
             };
             await poll();
-            intervalRef.current = setInterval(poll, pollIntervalMs);
-            timeoutRef.current = setTimeout(() => {
-              clearPolling();
-              setError(new Error('Poll timeout'));
-              setStatus('failed');
-            }, pollTimeoutMs);
+            if (terminalHitRef.current) return;
+            intervalId = setInterval(() => void poll(), pollIntervalMs);
+            intervalRef.current = intervalId;
           }
         } else {
           const body: Record<string, unknown> = {
@@ -263,6 +282,28 @@ export function useWorkflowJob(
           if (autoPoll) {
             setPolling(true);
             const deadline = Date.now() + pollTimeoutMs;
+            let intervalId: ReturnType<typeof setInterval> | null = null;
+            const terminalHitRef = { current: false };
+            const timeoutId = setTimeout(() => {
+              if (intervalId != null) clearInterval(intervalId);
+              if (timeoutRef.current === timeoutId) timeoutRef.current = null;
+              if (intervalRef.current === intervalId) intervalRef.current = null;
+              setPolling(false);
+              setError(new Error('Poll timeout'));
+              setStatus('failed');
+            }, pollTimeoutMs);
+            timeoutRef.current = timeoutId;
+
+            const clearThisPolling = () => {
+              if (intervalId != null) {
+                clearInterval(intervalId);
+                if (intervalRef.current === intervalId) intervalRef.current = null;
+              }
+              clearTimeout(timeoutId);
+              if (timeoutRef.current === timeoutId) timeoutRef.current = null;
+              setPolling(false);
+            };
+
             const poll = async () => {
               if (!mountedRef.current) return;
               try {
@@ -272,7 +313,7 @@ export function useWorkflowJob(
                 const job = await r.json();
                 if (!r.ok) {
                   if (Date.now() >= deadline) {
-                    clearPolling();
+                    clearThisPolling();
                     setError(new Error('Poll timeout'));
                     setStatus('failed');
                   }
@@ -282,20 +323,21 @@ export function useWorkflowJob(
                 setStatus(st as WorkflowJobStatus);
                 setOutput(job as QueueJobResult);
                 if (TERMINAL_STATUSES.includes(st)) {
-                  clearPolling();
+                  terminalHitRef.current = true;
+                  clearThisPolling();
                   onComplete?.(job as QueueJobResult);
                   if (st === 'failed') {
                     setError(new Error('Queue job failed'));
                     onError?.(new Error('Queue job failed'));
                   }
                 } else if (Date.now() >= deadline) {
-                  clearPolling();
+                  clearThisPolling();
                   setError(new Error('Poll timeout'));
                   setStatus('failed');
                 }
               } catch (e) {
                 if (mountedRef.current) {
-                  clearPolling();
+                  clearThisPolling();
                   const err = e instanceof Error ? e : new Error(String(e));
                   setError(err);
                   setStatus('failed');
@@ -304,12 +346,9 @@ export function useWorkflowJob(
               }
             };
             await poll();
-            intervalRef.current = setInterval(poll, pollIntervalMs);
-            timeoutRef.current = setTimeout(() => {
-              clearPolling();
-              setError(new Error('Poll timeout'));
-              setStatus('failed');
-            }, pollTimeoutMs);
+            if (terminalHitRef.current) return;
+            intervalId = setInterval(() => void poll(), pollIntervalMs);
+            intervalRef.current = intervalId;
           }
         }
       } catch (e) {

@@ -12,40 +12,11 @@ export default function WorkflowsPage() {
       <div className="mb-8">
         <h1 className="text-4xl font-bold mb-2">Workflow Examples</h1>
         <p className="text-muted-foreground">
-          Orchestration, workers, and queues — one example for each.
+          Workers, and queues — one example for each.
         </p>
       </div>
 
-      <div className="grid md:grid-cols-3 gap-6">
-        {/* Orchestration (ai-workflow) */}
-        <Card>
-          <CardHeader>
-            <div className="flex items-center justify-between">
-              <CardTitle className="flex items-center gap-2">
-                <Workflow className="w-5 h-5" />
-                Orchestration
-              </CardTitle>
-              <Badge variant="secondary">@microfox/ai-workflow</Badge>
-            </div>
-            <CardDescription>
-              Multi-step orchestration with parallel agents, HITL approval, worker step, and conditionals.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <ul className="text-sm space-y-1 list-disc list-inside text-muted-foreground">
-              <li>Parallel content generation</li>
-              <li>Analyzer + HITL approval</li>
-              <li>Worker + conditional branch</li>
-            </ul>
-            <Button asChild>
-              <Link href="/workflows/orchestration-demo">
-                <Zap className="w-4 h-4 mr-2" />
-                Orchestration demo
-              </Link>
-            </Button>
-          </CardContent>
-        </Card>
-
+      <div className="grid md:grid-cols-2 gap-6">
         {/* Worker demo */}
         <Card>
           <CardHeader>

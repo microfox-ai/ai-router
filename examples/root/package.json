@@ -14,7 +14,6 @@
     "@hookform/resolvers": "^5.2.2",
     "@microfox/ai-router": "*",
     "@microfox/ai-worker": "*",
-    "@microfox/ai-workflow": "*",
     "@microfox/puppeteer-sls": "^1.2.10",
     "@microfox/brave": "^1.2.3",
     "@microfox/db-upstash": "^1.1.8",
@@ -85,7 +84,6 @@
     "tailwind-merge": "^3.3.1",
     "unified": "^11.0.5",
     "vaul": "^1.1.2",
-    "workflow": "^4.0.1-beta.41",
     "zod": "^4.1.11"
   },
   "devDependencies": {

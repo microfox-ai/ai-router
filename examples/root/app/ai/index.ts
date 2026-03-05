@@ -11,10 +11,6 @@ import { braveResearchAgent } from './agents/braveResearch';
 import { summarizeAgent } from './agents/summarize';
 import { systemAgent } from './agents/system';
 import { thinkerAgent } from './agents/thinker';
-import { contentGeneratorAgent } from './agents/content-generator';
-import { analyzerAgent } from './agents/analyzer';
-import { emitterAgent } from './agents/emitter';
-import { reflectAgent } from './agents/reflect';
 import { contextLimiter } from './middlewares/contextLimiter';
 import { onlyTextParts } from './middlewares/onlyTextParts';
 
@@ -28,10 +24,6 @@ const aiMainRouter = aiRouter
   .agent('/summarize', summarizeAgent)
   .agent('/research', braveResearchAgent)
   .agent('/thinker', thinkerAgent)
-  .agent('/content-generator', contentGeneratorAgent)
-  .agent('/analyzer', analyzerAgent)
-  .agent('/emitter', emitterAgent)
-  .agent('/reflect', reflectAgent)
   // Mount workflow router as sub-router
   // .agent('/workflows', workflowRouter)
   .before('/', contextLimiter(5))

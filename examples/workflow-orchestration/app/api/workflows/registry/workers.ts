@@ -9,13 +9,29 @@
  * - getQueueRegistry(): returns QueueRegistry from config (for dispatchQueue)
  */
 
-import type { WorkerAgent, WorkerQueueRegistry } from '@microfox/ai-worker';
+import {
+  defaultMapChainContinueFromPrevious,
+  defaultMapChainPassthrough,
+  type MapStepInputContext,
+  type WorkerAgent,
+  type WorkerQueueRegistry,
+  type SmartRetryConfig,
+} from '@microfox/ai-worker';
 
 /** Queue step config (matches WorkerQueueStep from @microfox/ai-worker). */
 export interface QueueStepConfig {
   workerId: string;
   delaySeconds?: number;
   mapInputFromPrev?: string;
+  requiresApproval?: boolean;
+  chainStrategy?: 'passthrough' | 'continueFromPrevious' | 'custom';
+  hitl?: unknown;
+  /**
+   * Smart retry config for this step. Overrides worker-level retry config.
+   * Retries run in-process so ctx.retryContext is available for self-correction.
+   * @example { maxAttempts: 3, on: ['rate-limit', 'json-parse'] }
+   */
+  retry?: SmartRetryConfig;
 }
 
 /** Queue config from workers/config API (matches WorkerQueueConfig structure). */
@@ -183,21 +199,27 @@ function getQueueModuleContext(): { keys(): string[]; (key: string): unknown } |
  * Auto-discover queue modules from app/ai/queues/*.queue.ts (no per-queue registration).
  * Uses require.context when available (Next.js/webpack).
  */
-function buildQueueModules(): Record<string, Record<string, (initial: unknown, prevOutputs: unknown[]) => unknown>> {
+function buildQueueModules(): Record<string, Record<string, (ctx: MapStepInputContext) => unknown>> {
   const ctx = getQueueModuleContext();
   if (!ctx) return {};
-  const out: Record<string, Record<string, (initial: unknown, prevOutputs: unknown[]) => unknown>> = {};
+  const out: Record<string, Record<string, (ctx: MapStepInputContext) => unknown>> = {};
   for (const key of ctx.keys()) {
     const mod = ctx(key) as { default?: { id?: string }; [k: string]: unknown };
     const id = mod?.default?.id;
     if (id && typeof id === 'string') {
-      out[id] = mod as Record<string, (initial: unknown, prevOutputs: unknown[]) => unknown>;
+      out[id] = mod as Record<string, (ctx: MapStepInputContext) => unknown>;
     }
   }
   return out;
 }
 
 const queueModules = buildQueueModules();
+
+function resolveStepHitl(queueId: string, stepIndex: number, stepFromConfig: QueueStepConfig | undefined): unknown {
+  const mod = queueModules[queueId] as { default?: { steps?: Array<{ hitl?: unknown }> } } | undefined;
+  const moduleStep = mod?.default?.steps?.[stepIndex];
+  return moduleStep?.hitl ?? stepFromConfig?.hitl;
+}
 
 /**
  * Returns a registry compatible with dispatchQueue. Queue definitions come from
@@ -212,15 +234,44 @@ export async function getQueueRegistry(): Promise<WorkerQueueRegistry> {
     getQueueById(queueId: string) {
       return queues.find((q) => q.id === queueId);
     },
-    invokeMapInput(
-      queueId: string,
-      stepIndex: number,
-      initialInput: unknown,
-      previousOutputs: Array<{ stepIndex: number; workerId: string; output: unknown }>
-    ): unknown {
+    getStepAt(queueId: string, stepIndex: number) {
+      const queue = queues.find((q) => q.id === queueId);
+      const step = queue?.steps?.[stepIndex];
+      const hitl = resolveStepHitl(queueId, stepIndex, step);
+      return step
+        ? {
+            mapInputFromPrev: step.mapInputFromPrev,
+            chainStrategy: step.chainStrategy,
+            ...(hitl !== undefined ? { hitl } : {}),
+          }
+        : undefined;
+    },
+    invokeMapInput(queueId: string, stepIndex: number, context: MapStepInputContext): unknown {
       const queue = queues.find((q) => q.id === queueId);
       const step = queue?.steps?.[stepIndex];
       const fnName = step?.mapInputFromPrev;
+      const chainStrategy = step?.chainStrategy;
+      const { initialInput, previousOutputs } = context;
+      const isResume =
+        context &&
+        typeof context === 'object' &&
+        context.pendingStepInput != null &&
+        context.hitlInput !== undefined;
+
+      if (isResume && fnName) {
+        const mod = queueModules[queueId];
+        if (mod && typeof mod[fnName] === 'function') {
+          return (mod[fnName] as (c: MapStepInputContext) => unknown)(context);
+        }
+      }
+
+      if (!isResume && chainStrategy === 'passthrough') {
+        return defaultMapChainPassthrough(context);
+      }
+      if (!isResume && chainStrategy === 'continueFromPrevious') {
+        return defaultMapChainContinueFromPrevious(context);
+      }
+
       if (!fnName) {
         return previousOutputs.length > 0 ? previousOutputs[previousOutputs.length - 1].output : initialInput;
       }
@@ -228,7 +279,7 @@ export async function getQueueRegistry(): Promise<WorkerQueueRegistry> {
       if (!mod || typeof mod[fnName] !== 'function') {
         return previousOutputs.length > 0 ? previousOutputs[previousOutputs.length - 1].output : initialInput;
       }
-      return mod[fnName](initialInput, previousOutputs);
+      return (mod[fnName] as (c: MapStepInputContext) => unknown)(context);
     },
   };
   return registry as WorkerQueueRegistry;

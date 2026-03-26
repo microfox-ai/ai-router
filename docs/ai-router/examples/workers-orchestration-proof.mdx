@@ -75,12 +75,12 @@ const { jobId: fireJobId } = await ctx.dispatchWorker('demo', { mode: 'echo', me
 
 ### Results-aggregator worker (`results-aggregator.worker.ts`)
 
-Consumes process output (e.g. from queue step 1) and produces a summary report. Used as queue step 2 with `mapInputFromPrev`.
+Consumes process output (e.g. from queue step 1) and produces a summary report. Used as queue step 2 with a `chain` function that maps the previous step's output.
 
 ## UI and demos
 
 - **Worker demo** (`/workflows/worker-demo`) – Trigger **demo** in echo mode or run **Run dispatch demo** to prove `ctx.dispatchWorker` with await true/false.
-- **Queue demo** (`/workflows/queue-demo`) – Runs queue **demo-data-processor**: step 1 = demo (process), step 2 = results-aggregator (with delay and mapInputFromPrev).
+- **Queue demo** (`/workflows/queue-demo`) – Runs queue **demo-data-processor**: step 1 = demo (process), step 2 = results-aggregator (with `delaySeconds` and a `chain` function mapping the previous output).
 - **Orchestration demo** (`/workflows/orchestration-demo`) – Uses **demo** (process) after HITL approval, plus agents.
 
 ## Interpreting the result
@@ -94,6 +94,6 @@ Together, the minimal worker set demonstrates:
 - worker steps **awaited** in orchestration and queue chains,
 - **ctx.dispatchWorker** with **await: true** (block for result) and **await: false** (fire-and-forget),
 - **jobStore** progress and status updates,
-- **mapInputFromPrev** and **delaySeconds** in queues,
+- **chain** functions and **delaySeconds** in queues,
 - and HITL + conditionals in orchestration.
 

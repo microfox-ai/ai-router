@@ -134,7 +134,7 @@ npx ai-worker new data-processor --dir app/workers
 
 **Generated queue file** (e.g. `app/ai/queues/cost-usage.queue.ts`):
 
-- Uses `defineWorkerQueue` with `id` and `steps: [{ workerId: 'first-worker' }, ...]`. Replace `first-worker` (and add steps) with your real worker IDs, then run `npx ai-worker push` to build and deploy.
+- Uses `defineWorkerQueue` with `id` and a `steps` array. Includes commented-out examples for `chain` (input mapping), `requiresApproval`/`resume` (HITL), and `delaySeconds`. Replace `first-worker` with your real worker IDs and run `npx ai-worker push`.
 
 ### `boilerplate`
 
@@ -154,26 +154,31 @@ npx ai-worker boilerplate [options]
 
 **What it creates:**
 
-1. **Job store adapters** (`app/api/workflows/stores/`):
-   - `jobStore.ts` - Main job store interface
+1. **Auth helper** (`app/api/workflows/auth.ts`):
+   - `getClientId(req)` stub — replace with your actual session/JWT logic to attach a userId to every worker job
+
+2. **Job store adapters** (`app/api/workflows/stores/`):
+   - `jobStore.ts` - Main job store interface (adapter selection based on `WORKER_DATABASE_TYPE`)
    - `mongoAdapter.ts` - MongoDB adapter
    - `redisAdapter.ts` - Upstash Redis adapter
-   - `queueJobStore.ts` - Queue job tracking (optional)
+   - `queueJobStore.ts` - Queue job tracking
 
-2. **Workers HTTP API** (`app/api/workflows/workers/[...slug]/route.ts`):
-   - POST trigger worker (calls trigger API directly; no registry required)
-   - GET job status
-   - POST webhook callback
-   - POST job update
+3. **Workers HTTP API** (`app/api/workflows/workers/[...slug]/route.ts`):
+   - POST `/workers/:workerId` – trigger a worker (calls trigger API; no registry required)
+   - GET `/workers/:workerId/:jobId` – job status
+   - POST `/workers/:workerId/webhook` – webhook callback
+   - POST `/workers/:workerId/update` – job update (called by Lambda)
+   - POST `/workers/:workerId/job` – create job record before polling
 
-3. **Queues API** (`app/api/workflows/queues/[...slug]/route.ts`):
-   - POST /queues/:queueId – trigger a queue (calls queue-start API; no registry required; pass first-worker input)
-   - GET /queues/:queueId/:jobId – get queue job status
-   - GET /queues or GET /queues?queueId=... – list queue jobs
-   - POST /queues/:queueId/update – update queue job step
-   - POST /queues/:queueId/webhook – webhook for queue completion
+4. **Queues API** (`app/api/workflows/queues/[...slug]/route.ts`):
+   - POST `/queues/:queueId` – trigger a queue (calls queue-start API; no registry required; pass first-worker input)
+   - GET `/queues/:queueId/:jobId` – get queue job status
+   - GET `/queues` or GET `/queues?queueId=...` – list queue jobs
+   - POST `/queues/:queueId/update` – update queue job step (called by Lambda)
+   - POST `/queues/:queueId/webhook` – webhook for queue completion
+   - POST `/queues/:queueId/approve` – HITL approve/reject a paused step (see [HITL Queues](../advanced/hitl-queues))
 
-4. **Configuration** (`microfox.config.ts`):
+5. **Configuration** (`microfox.config.ts`):
    - Merges `workflowSettings.jobStore` block (if file exists)
    - Creates minimal config file if missing
 

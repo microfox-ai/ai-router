@@ -29,6 +29,7 @@ type Doc = {
   error?: { message: string; stack?: string; name?: string };
   metadata?: Record<string, any>;
   internalJobs?: InternalJobEntry[];
+  userId?: string;
   createdAt: string;
   updatedAt: string;
   completedAt?: string;
@@ -96,7 +97,8 @@ export function createMongoJobStore(
   workerId: string,
   jobId: string,
   input: any,
-  metadata: Record<string, any>
+  metadata: Record<string, any>,
+  userId?: string
 ): JobStore {
   return {
     update: async (update: JobStoreUpdate): Promise<void> => {
@@ -139,6 +141,7 @@ export function createMongoJobStore(
             output: update.output,
             error: update.error,
             metadata: metadataUpdate,
+            ...(userId ? { userId } : {}),
             createdAt: now,
             updatedAt: now,
             completedAt: set.completedAt,
@@ -225,7 +228,8 @@ export async function upsertJob(
   jobId: string,
   workerId: string,
   input: any,
-  metadata: Record<string, any>
+  metadata: Record<string, any>,
+  userId?: string
 ): Promise<void> {
   const coll = await getCollection();
   const now = new Date().toISOString();
@@ -239,6 +243,7 @@ export async function upsertJob(
         status: 'queued',
         input: input ?? {},
         metadata: metadata ?? {},
+        ...(userId ? { userId } : {}),
         createdAt: now,
         updatedAt: now,
       },

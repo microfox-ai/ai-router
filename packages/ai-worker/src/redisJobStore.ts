@@ -93,6 +93,7 @@ export async function loadJob(jobId: string): Promise<JobRecord | null> {
     error: parseJson<any>(data.error),
     metadata: parseJson<Record<string, any>>(data.metadata) ?? {},
     internalJobs,
+    ...(data.userId ? { userId: data.userId } : {}),
     createdAt: data.createdAt,
     updatedAt: data.updatedAt,
     completedAt: data.completedAt,
@@ -104,7 +105,8 @@ export function createRedisJobStore(
   workerId: string,
   jobId: string,
   input: any,
-  metadata: Record<string, any>
+  metadata: Record<string, any>,
+  userId?: string
 ): JobStore {
   return {
     update: async (update: JobStoreUpdate): Promise<void> => {
@@ -175,29 +177,22 @@ export async function upsertRedisJob(
   jobId: string,
   workerId: string,
   input: any,
-  metadata: Record<string, any>
+  metadata: Record<string, any>,
+  userId?: string
 ): Promise<void> {
   const redis = getRedis();
   const key = jobKey(jobId);
   const now = new Date().toISOString();
-  const doc: Partial<JobRecord> = {
-    jobId,
-    workerId,
-    status: 'queued',
-    input,
-    metadata,
-    createdAt: now,
-    updatedAt: now,
-  };
   const toSet: Record<string, string> = {
     jobId: jobId,
     workerId: workerId,
-    status: doc.status!,
-    input: JSON.stringify(doc.input ?? {}),
-    metadata: JSON.stringify(doc.metadata ?? {}),
+    status: 'queued',
+    input: JSON.stringify(input ?? {}),
+    metadata: JSON.stringify(metadata ?? {}),
     createdAt: now,
     updatedAt: now,
   };
+  if (userId) toSet.userId = userId;
   await redis.hset(key, toSet);
   if (jobTtlSeconds > 0) {
     await redis.expire(key, jobTtlSeconds);

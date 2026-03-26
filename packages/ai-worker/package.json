@@ -40,6 +40,11 @@
       "import": "./dist/config.mjs",
       "require": "./dist/config.js"
     },
+    "./queue": {
+      "types": "./dist/queue.d.ts",
+      "import": "./dist/queue.mjs",
+      "require": "./dist/queue.js"
+    },
     "./queueJobStore": {
       "types": "./dist/queueJobStore.d.ts",
       "import": "./dist/queueJobStore.mjs",

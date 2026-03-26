@@ -1,5 +1,11 @@
 # @microfox/ai-router
 
+## 2.1.6
+
+### Patch Changes
+
+- 8243849: Changes from PR #59: ai-worker-hitl-and-smart-retry
+
 ## 2.1.5
 
 ### Patch Changes

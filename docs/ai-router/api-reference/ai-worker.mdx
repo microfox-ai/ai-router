@@ -26,6 +26,7 @@ export function createWorker<INPUT_SCHEMA extends ZodType<any>, OUTPUT>(
 - `config.inputSchema: INPUT_SCHEMA` - Zod schema for input validation
 - `config.outputSchema: ZodType<OUTPUT>` - Zod schema for output validation
 - `config.handler: WorkerHandler<z.infer<INPUT_SCHEMA>, OUTPUT>` - Handler function
+- `config.retry?: SmartRetryConfig` - Smart retry configuration (in-process retries on matching errors). See [Smart Retry](#smart-retry).
 - `config.workerConfig?: WorkerConfig` - **Deprecated**: Prefer exporting `workerConfig` separately
 
 **Returns:** `WorkerAgent<INPUT_SCHEMA, OUTPUT>` with a `dispatch()` method
@@ -73,6 +74,8 @@ export interface WorkerAgent<INPUT_SCHEMA extends ZodType<any>, OUTPUT> {
   inputSchema: INPUT_SCHEMA;
   outputSchema: ZodType<OUTPUT>;
   workerConfig?: WorkerConfig;
+  /** Smart retry config set via createWorker({ retry }). */
+  retry?: SmartRetryConfig;
 }
 ```
 
@@ -95,6 +98,8 @@ export interface WorkerHandlerParams<INPUT, OUTPUT> {
     jobId: string;
     workerId: string;
     requestId?: string;
+    /** Propagated from DispatchOptions.userId; attach from getClientId() in your API route. */
+    userId?: string;
     jobStore?: JobStore;
     /** Logger with prefixed levels: [INFO] [workerId] [jobId] message */
     logger: {
@@ -108,6 +113,22 @@ export interface WorkerHandlerParams<INPUT, OUTPUT> {
       input: unknown,
       options?: DispatchWorkerOptions
     ) => Promise<{ jobId: string; messageId?: string; output?: unknown }>;
+    /**
+     * Report LLM token usage after each call. Accumulates across all calls.
+     * Throws TokenBudgetExceededError if maxTokens (from DispatchOptions) is exceeded.
+     * Also persists usage to the job store (metadata.tokenUsage) for observability.
+     */
+    reportTokenUsage: (usage: { inputTokens: number; outputTokens: number }) => Promise<void>;
+    /**
+     * Get the current token usage and remaining budget for this job.
+     * Returns { used, budget: null, remaining: null } when no maxTokens was set.
+     */
+    getTokenBudget: () => { used: number; budget: number | null; remaining: number | null };
+    /**
+     * Populated on retry attempts (attempt >= 2). Undefined on the first attempt.
+     * Use to self-correct: inject lastError.message into the next LLM prompt.
+     */
+    retryContext?: RetryContext;
     [key: string]: any;
   };
 }
@@ -227,6 +248,7 @@ export interface DispatchOptions {
   mode?: 'auto' | 'local' | 'remote'; // Execution mode
   jobId?: string; // Optional job ID (default: generated)
   metadata?: Record<string, any>; // Metadata attached to job
+  userId?: string; // Optional user ID for audit logging (attach from getClientId())
   registry?: WorkerQueueRegistry; // For dispatchQueue
   onCreateQueueJob?: (params: {
     queueJobId: string;
@@ -234,6 +256,13 @@ export interface DispatchOptions {
     firstStep: { workerId: string; workerJobId: string };
     metadata?: Record<string, unknown>;
   }) => Promise<void>;
+  /**
+   * Maximum total tokens (input + output) allowed for this job.
+   * The worker must call ctx.reportTokenUsage() after each LLM call.
+   * Throws TokenBudgetExceededError (never retried) when the limit is reached.
+   * Token usage is stored in metadata.tokenUsage for observability.
+   */
+  maxTokens?: number;
 }
 ```
 
@@ -499,9 +528,83 @@ export interface WorkerQueueConfig {
 }
 
 export interface WorkerQueueStep {
-  workerId: string; // Worker ID
-  delaySeconds?: number; // 0-900, SQS DelaySeconds
-  mapInputFromPrev?: string; // Mapping function name
+  workerId: string;
+  delaySeconds?: number; // 0–900, SQS DelaySeconds
+
+  /**
+   * Called when the queue advances to this step after the previous step completes.
+   * Built-in shortcuts: 'passthrough' | 'continueFromPrevious'
+   * When omitted, the previous output is passed as-is.
+   */
+  chain?: ((ctx: ChainContext) => unknown) | 'passthrough' | 'continueFromPrevious';
+
+  /**
+   * Called when this step resumes after a human approves a HITL pause.
+   * Returns the final domain input for the worker handler.
+   * Default: shallow merge of pendingInput + reviewerInput.
+   */
+  resume?: (ctx: HitlResumeContext<any>) => unknown;
+
+  /**
+   * When true, queue execution pauses before dispatching this step.
+   * A human must POST to /queues/:queueId/approve to continue.
+   */
+  requiresApproval?: boolean;
+
+  /**
+   * Optional HITL UI metadata consumed by the app UI (not by the worker runtime).
+   * Use defineHitlConfig() for type-safe authoring.
+   */
+  hitl?: HitlStepConfig;
+
+  /**
+   * Smart retry config for this step. Overrides worker-level retry for this step only.
+   * Retries run in-process (same Lambda invocation). ctx.retryContext is populated
+   * on each retry so the handler can self-correct (e.g. inject error into prompt).
+   * TokenBudgetExceededError is never retried.
+   *
+   * @example { maxAttempts: 3, on: ['rate-limit', 'json-parse'] }
+   */
+  retry?: SmartRetryConfig;
+
+  /**
+   * When defined, evaluated after each run to decide whether to re-run this step
+   * (loop) instead of advancing to the next step.
+   */
+  loop?: {
+    shouldContinue: (ctx: LoopContext) => boolean | Promise<boolean>;
+    maxIterations?: number; // Default: 50
+  };
+}
+```
+
+**Chain and Resume Context Types:**
+
+```typescript
+export interface QueueStepOutput {
+  stepIndex: number;
+  workerId: string;
+  output: unknown;
+}
+
+export interface ChainContext {
+  initialInput: unknown;          // Input passed to dispatchQueue
+  previousOutputs: QueueStepOutput[];  // All completed step outputs
+}
+
+export interface HitlResumeContext<T = unknown> {
+  initialInput: unknown;
+  previousOutputs: QueueStepOutput[];
+  reviewerInput: T;               // Payload submitted via approve endpoint
+  pendingInput: Record<string, unknown>; // What chain() produced before pause
+}
+
+export interface LoopContext {
+  output: unknown;                // Current iteration output
+  stepIndex: number;              // Queue definition step index
+  iterationCount: number;         // 0-based iteration count
+  initialInput: unknown;
+  previousOutputs: QueueStepOutput[];
 }
 ```
 
@@ -514,8 +617,24 @@ export default defineWorkerQueue({
   id: 'data-pipeline',
   steps: [
     { workerId: 'data-collector' },
-    { workerId: 'data-processor', delaySeconds: 10 },
-    { workerId: 'data-uploader', mapInputFromPrev: 'mapUploadInput' },
+    {
+      workerId: 'data-processor',
+      delaySeconds: 10,
+      chain: (ctx) => ({
+        data: ctx.previousOutputs.at(-1)?.output,
+        source: (ctx.initialInput as any).source,
+      }),
+    },
+    {
+      workerId: 'review-step',
+      requiresApproval: true,
+      chain: 'passthrough',
+      resume: (ctx) => ({ ...ctx.pendingInput, approved: ctx.reviewerInput }),
+      hitl: defineHitlConfig({
+        taskKey: 'review-data',
+        ui: { type: 'schema-form', title: 'Review processed data' },
+      }),
+    },
   ],
   schedule: 'cron(0 3 * * ? *)', // Daily at 03:00 UTC
 });
@@ -540,6 +659,143 @@ import { dispatchQueue } from '@microfox/ai-worker';
 
 const result = await dispatchQueue('data-pipeline', { source: 's3://bucket/data.json' }, { metadata: { source: 'api' } });
 ```
+
+### `defineHitlConfig(config)`
+
+Type-safe helper for authoring HITL step metadata. The config is attached to `WorkerQueueStep.hitl` and used by the app UI — the worker runtime only reads `requiresApproval`.
+
+```typescript
+export function defineHitlConfig<T extends HitlStepConfig>(config: T): T
+```
+
+**HitlStepConfig:**
+
+```typescript
+export type HitlStepConfig = {
+  taskKey: string;                     // Unique key for this HITL step
+  timeoutSeconds?: number;             // Auto-reject/approve after this duration
+  onTimeout?: 'reject' | 'auto-approve';
+  assignees?: string[];                // User IDs to notify
+  ui: HitlUiSpec;                      // Rendering hint for the frontend
+  inputSchema?: ZodType;              // Reviewer form schema
+};
+
+export type HitlUiSpec =
+  | {
+      type: 'custom';
+      viewId: string;          // Looked up in the app's HITL view registry
+      title?: string;
+      sections?: Array<Record<string, unknown>>;
+      [key: string]: unknown;
+    }
+  | {
+      type: 'schema-form';     // Auto-render a form; falls back to JSON textarea
+      title?: string;
+      description?: string;
+    };
+```
+
+**Example:**
+
+```typescript
+import { defineHitlConfig } from '@microfox/ai-worker/hitlConfig';
+import { z } from 'zod';
+
+const hitl = defineHitlConfig({
+  taskKey: 'review-step',
+  timeoutSeconds: 3600,
+  onTimeout: 'reject',
+  ui: { type: 'schema-form', title: 'Review the output', description: 'Approve or reject the data' },
+  inputSchema: z.object({
+    approved: z.boolean(),
+    comment: z.string().optional(),
+  }),
+});
+```
+
+For custom views (e.g. a specialized UI component), use `type: 'custom'` with a `viewId` registered in `components/hitl/registry.ts`:
+
+```typescript
+const hitl = defineHitlConfig({
+  taskKey: 'calculator-hitl',
+  ui: {
+    type: 'custom',
+    viewId: 'calculator-hitl-v1',
+    title: 'Calculator review',
+    sections: ['calculator-keypad', 'hint'],
+  },
+  inputSchema: calculatorHitlInputSchema,
+});
+```
+
+See [HITL Queues](../advanced/hitl-queues) for the full HITL workflow and frontend integration guide.
+
+### `repeatStep(count, factory)`
+
+Creates `count` copies of a step definition using a factory function. Useful for multi-round HITL workflows without copy-pasting step objects.
+
+```typescript
+export function repeatStep(
+  count: number,
+  factory: (index: number) => WorkerQueueStep
+): WorkerQueueStep[]
+```
+
+**Example:**
+
+```typescript
+import { defineWorkerQueue, repeatStep } from '@microfox/ai-worker/queue';
+
+export default defineWorkerQueue({
+  id: 'multi-review',
+  steps: [
+    { workerId: 'ingest' },
+    ...repeatStep(3, (i) => ({
+      workerId: 'review',
+      chain: 'continueFromPrevious',
+      resume: (ctx) => ({ ...ctx.pendingInput, round: i + 1, reviewerInput: ctx.reviewerInput }),
+      requiresApproval: true,
+      hitl: defineHitlConfig({
+        taskKey: `review-r${i + 1}`,
+        ui: { type: 'schema-form', title: `Review round ${i + 1}` },
+      }),
+    })),
+  ],
+});
+```
+
+### `dispatchQueue` — HITL approve endpoint
+
+When a queue has a step with `requiresApproval: true`, execution pauses at that step. The frontend calls the approve endpoint to resume:
+
+```
+POST /api/workflows/queues/:queueId/approve
+```
+
+**Body:**
+
+```json
+{
+  "queueJobId": "job-123",
+  "stepIndex": 1,
+  "decision": "approve",
+  "input": { "approved": true, "comment": "Looks good" },
+  "reviewerId": "user-456",
+  "comment": "Optional comment"
+}
+```
+
+- `decision`: `"approve"` (default) or `"reject"` — reject marks the step as failed
+- `input`: reviewer form payload, passed to the step's `resume()` function as `reviewerInput`
+- `stepIndex`: the array step index (auto-detected if omitted)
+
+**Response:**
+
+```json
+{ "ok": true, "decision": "approve", "queueJobId": "job-123", "stepIndex": 1, "workerId": "review-step", "status": "running" }
+```
+
+The runtime writes `status: 'running'` to the store **before** dispatching the worker (race-condition guard), then calls `resume()` inside the Lambda to merge `pendingInput` and `reviewerInput` before the handler runs.
 
 ## Config API
 
@@ -607,6 +863,214 @@ export const SQS_MAX_DELAY_SECONDS = 900;
 **Optional:**
 - `DEBUG_WORKER_QUEUES` - Set to `'1'` to enable queue debugging logs
 - `WORKFLOW_APP_BASE_URL` or `QUEUE_JOB_API_URL` - Base URL of your app (for queue job step updates from Lambda)
+
+## Smart Retry
+
+Workers support **in-process smart retry**: when the handler throws a matching error, the runtime retries it within the same Lambda invocation (no SQS re-delivery, job stays `running`). On each retry, `ctx.retryContext` is populated so the handler can self-correct.
+
+### `SmartRetryConfig`
+
+```typescript
+export interface SmartRetryConfig {
+  /** Maximum total attempts including the first (default: 3). */
+  maxAttempts?: number;
+  /** Error patterns that trigger a retry. Non-matching errors fail immediately. */
+  on: RetryPattern[];
+}
+
+export type RetryPattern = BuiltInRetryPattern | CustomRetryPattern;
+
+export type BuiltInRetryPattern =
+  | 'rate-limit'   // HTTP 429, RateLimitError — delays: 10s, 20s, 30s…
+  | 'json-parse'   // SyntaxError, ZodError — immediate, injects ctx.retryContext
+  | 'overloaded'   // HTTP 529, "model is busy" — delays: 15s, 30s…
+  | 'server-error'; // HTTP 5xx, "internal server error" — delays: 5s, 10s…
+
+export interface CustomRetryPattern {
+  /** Regex test against error.message, or a predicate receiving the full error. */
+  match: RegExp | ((err: Error & Record<string, any>) => boolean);
+  /** Delay before the retry. A function receives the retry attempt number. */
+  delayMs?: number | ((attempt: number) => number);
+  /** When true, populates ctx.retryContext.lastError so the handler can self-correct. */
+  injectContext?: boolean;
+}
+```
+
+### `RetryContext`
+
+```typescript
+export interface RetryContext {
+  /** Current attempt number (1-indexed). 2 = first retry. */
+  attempt: number;
+  /** Total max attempts configured. */
+  maxAttempts: number;
+  /** Error from the previous attempt — use to self-correct (inject into prompt). */
+  lastError: {
+    message: string;
+    name: string;
+    stack?: string;
+    /** HTTP status code or error code if present. */
+    code?: string | number;
+  };
+}
+```
+
+### Setting retry on a worker
+
+```typescript
+import { createWorker } from '@microfox/ai-worker';
+
+export default createWorker({
+  id: 'llm-worker',
+  inputSchema, outputSchema,
+  retry: {
+    maxAttempts: 3,
+    on: ['rate-limit', 'json-parse'],
+  },
+  handler: async ({ input, ctx }) => {
+    // ctx.retryContext is undefined on first attempt, populated on retries
+    const errorHint = ctx.retryContext
+      ? `\n\nPrevious attempt failed: "${ctx.retryContext.lastError.message}". Correct your output.`
+      : '';
+
+    const response = await anthropic.messages.create({
+      messages: [{ role: 'user', content: input.prompt + errorHint }],
+    });
+
+    // SyntaxError triggers 'json-parse' retry with ctx.retryContext injected
+    return JSON.parse(response.content[0].text);
+  },
+});
+```
+
+### Setting retry on a queue step
+
+A step's `retry` overrides the worker-level retry for that step only:
+
+```typescript
+defineWorkerQueue({
+  id: 'pipeline',
+  steps: [
+    { workerId: 'ingest' },
+    {
+      workerId: 'llm-extractor',
+      // Override: up to 5 attempts for this step, with progressive delay
+      retry: {
+        maxAttempts: 5,
+        on: [
+          'rate-limit',
+          'json-parse',
+          { match: /quota exceeded/i, delayMs: (attempt) => attempt * 5000 },
+        ],
+      },
+    },
+  ],
+});
+```
+
+### Built-in pattern delays
+
+| Pattern | Delay formula |
+|---------|--------------|
+| `'rate-limit'` | `attempt * 10_000` ms (10s, 20s, 30s…) |
+| `'json-parse'` | `0` ms (immediate; context injected) |
+| `'overloaded'` | `attempt * 15_000` ms (15s, 30s…) |
+| `'server-error'` | `attempt * 5_000` ms (5s, 10s…) |
+
+> **Note**: `TokenBudgetExceededError` is **never retried**, even if matching patterns are configured.
+
+## Token Budget
+
+Pass `maxTokens` in `DispatchOptions` to cap total LLM token usage for a job. The worker calls `ctx.reportTokenUsage()` after each LLM call; when the accumulated total exceeds the budget, `TokenBudgetExceededError` is thrown and the job fails immediately (never retried).
+
+### `TokenBudgetExceededError`
+
+```typescript
+export class TokenBudgetExceededError extends Error {
+  readonly used: number;   // Total tokens used when limit was hit
+  readonly budget: number; // The configured maxTokens limit
+  // name: 'TokenBudgetExceededError'
+}
+```
+
+### `TokenUsage` / `TokenBudgetState`
+
+```typescript
+export interface TokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+}
+
+export interface TokenBudgetState {
+  inputTokens: number;
+  outputTokens: number;
+  /** null when no budget was configured. */
+  budget: number | null;
+}
+```
+
+### Using the token budget
+
+**Dispatching with a budget:**
+
+```typescript
+import { myWorker } from './workers/my-worker';
+
+// Set a budget of 50,000 total tokens for this job
+const result = await myWorker.dispatch(input, {
+  maxTokens: 50_000,
+  metadata: { source: 'api' },
+});
+```
+
+**Reporting usage in the handler:**
+
+```typescript
+handler: async ({ input, ctx }) => {
+  for (let i = 0; i < input.steps; i++) {
+    const response = await anthropic.messages.create({ /* ... */ });
+
+    // Report usage — throws TokenBudgetExceededError if over budget
+    await ctx.reportTokenUsage({
+      inputTokens: response.usage.input_tokens,
+      outputTokens: response.usage.output_tokens,
+    });
+
+    // Check remaining budget before proceeding
+    const { used, budget, remaining } = ctx.getTokenBudget();
+    ctx.logger.info(`Step ${i + 1} complete`, { used, remaining });
+
+    if (remaining !== null && remaining < 2000) {
+      ctx.logger.warn('Low token budget — stopping early', { remaining });
+      return partialResult(i);
+    }
+  }
+
+  return finalResult();
+},
+```
+
+**Token usage is stored in the job record:**
+
+After each `reportTokenUsage()` call, the runtime writes the accumulated state to `metadata.tokenUsage`:
+
+```json
+{
+  "jobId": "job-xxx",
+  "status": "completed",
+  "metadata": {
+    "tokenUsage": {
+      "inputTokens": 12400,
+      "outputTokens": 3600,
+      "budget": 50000
+    }
+  }
+}
+```
+
+### Without a budget
+
+When `maxTokens` is not set, `ctx.reportTokenUsage()` still accumulates and stores usage, but `TokenBudgetExceededError` is never thrown. `ctx.getTokenBudget()` returns `{ used, budget: null, remaining: null }`.
 
 ## Execution Modes
 

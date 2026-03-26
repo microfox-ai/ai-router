@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { dispatchWorker } from '@microfox/ai-worker';
+import { getClientId } from '../../auth';
 
 /**
  * Worker execution endpoint.
@@ -56,6 +57,7 @@ export async function POST(
     }
 
     const { input, await: shouldAwait = false, jobId: providedJobId } = body;
+    const userId = await getClientId(req);
 
     console.log('[Worker] Dispatching worker:', {
       workerId,
@@ -109,6 +111,7 @@ export async function POST(
         {
           jobId,
           ...(webhookUrl ? { webhookUrl } : {}),
+          ...(userId ? { userId } : {}),
           metadata: { source: 'workflow-orchestration' },
         }
       );

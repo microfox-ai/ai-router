@@ -15,7 +15,7 @@ import { getWorkflowDb } from './mongoAdapter';
 export interface QueueJobStep {
   workerId: string;
   workerJobId: string;
-  status: 'queued' | 'running' | 'completed' | 'failed';
+  status: 'queued' | 'running' | 'awaiting_approval' | 'completed' | 'failed';
   input?: unknown;
   output?: unknown;
   error?: { message: string };
@@ -201,7 +201,7 @@ export async function updateQueueStep(
   queueJobId: string,
   stepIndex: number,
   update: {
-    status?: 'queued' | 'running' | 'completed' | 'failed';
+    status?: 'queued' | 'running' | 'awaiting_approval' | 'completed' | 'failed';
     input?: unknown;
     output?: unknown;
     error?: { message: string };
@@ -209,6 +209,46 @@ export async function updateQueueStep(
     completedAt?: string;
   }
 ): Promise<void> {
+  if (preferRedis()) {
+    const redis = getRedis();
+    const key = queueKey(queueJobId);
+    const existing = await loadQueueJobRedis(queueJobId);
+    if (!existing) {
+      throw new Error(`Queue job ${queueJobId} not found`);
+    }
+    const step = existing.steps[stepIndex];
+    if (!step) {
+      throw new Error(`Queue job ${queueJobId} has no step at index ${stepIndex}`);
+    }
+    const now = new Date().toISOString();
+    const mergedStep: QueueJobStep = {
+      ...step,
+      ...(update.status !== undefined && { status: update.status }),
+      ...(update.input !== undefined && { input: update.input }),
+      ...(update.output !== undefined && { output: update.output }),
+      ...(update.error !== undefined && { error: update.error }),
+      startedAt: update.startedAt ?? (update.status === 'running' ? now : step.startedAt),
+      completedAt:
+        update.completedAt ??
+        (['completed', 'failed'].includes(update.status ?? '') ? now : step.completedAt),
+    };
+    const steps = [...existing.steps];
+    steps[stepIndex] = mergedStep;
+    const toSet: Record<string, string> = {
+      steps: JSON.stringify(steps),
+      updatedAt: now,
+    };
+    if (update.status === 'failed') {
+      toSet.status = 'failed';
+      if (!existing.completedAt) toSet.completedAt = now;
+    } else if (update.status === 'completed' && stepIndex === steps.length - 1) {
+      toSet.status = 'completed';
+      if (!existing.completedAt) toSet.completedAt = now;
+    }
+    await redis.hset(key, toSet);
+    return;
+  }
+
   const collection = await getCollection();
   const now = new Date().toISOString();
   const setKey = `steps.${stepIndex}`;
@@ -251,6 +291,25 @@ export async function appendQueueStep(
   queueJobId: string,
   step: { workerId: string; workerJobId: string }
 ): Promise<void> {
+  if (preferRedis()) {
+    const redis = getRedis();
+    const key = queueKey(queueJobId);
+    const existing = await loadQueueJobRedis(queueJobId);
+    if (!existing) {
+      throw new Error(`Queue job ${queueJobId} not found`);
+    }
+    const steps = [...(existing.steps || []), {
+      workerId: step.workerId,
+      workerJobId: step.workerJobId,
+      status: 'queued' as const,
+    }];
+    await redis.hset(key, {
+      steps: JSON.stringify(steps),
+      updatedAt: new Date().toISOString(),
+    });
+    return;
+  }
+
   const collection = await getCollection();
   const now = new Date().toISOString();
   await collection.updateOne(

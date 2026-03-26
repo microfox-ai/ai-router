@@ -4,7 +4,7 @@ import { execSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { pathToFileURL } from 'url';
-import { builtinModules } from 'module';
+import { builtinModules, createRequire } from 'module';
 import { glob } from 'glob';
 import * as yaml from 'js-yaml';
 import chalk from 'chalk';
@@ -265,6 +265,123 @@ function readJsonFile<T = any>(filePath: string): T | null {
   }
 }
 
+type MicrofoxConfigSource = 'microfox.json' | 'microfox.config.ts';
+
+interface ResolvedMicrofoxConfig {
+  source: MicrofoxConfigSource;
+  config: Record<string, any>;
+}
+
+function sanitizeMicrofoxConfig(raw: unknown): Record<string, any> | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  let cloned: Record<string, any>;
+  try {
+    cloned = JSON.parse(JSON.stringify(raw));
+  } catch {
+    return null;
+  }
+  const envProjectId = process.env.MICROFOX_PROJECT_ID?.trim();
+  if (!cloned.projectId && envProjectId) {
+    cloned.projectId = envProjectId;
+  }
+  return cloned;
+}
+
+function getMicrofoxConfigFromStudioConfig(studioConfig: any): Record<string, any> | null {
+  const workflowSettings = studioConfig?.workflowSettings;
+  const candidates: unknown[] = [
+    workflowSettings?.deploymentConfig,
+    workflowSettings?.deploymentConfigs,
+    workflowSettings?.microfoxConfig,
+    workflowSettings?.microfox,
+  ];
+
+  for (const candidate of candidates) {
+    const sanitized = sanitizeMicrofoxConfig(candidate);
+    if (sanitized) return sanitized;
+  }
+
+  // Allow a projectId-only setup from workflowSettings + env.
+  const projectId =
+    (typeof workflowSettings?.projectId === 'string' && workflowSettings.projectId.trim()) ||
+    process.env.MICROFOX_PROJECT_ID?.trim();
+  if (projectId) {
+    return { projectId };
+  }
+  return null;
+}
+
+function loadStudioConfigFromTs(projectRoot: string): any | null {
+  const configPath = path.join(projectRoot, 'microfox.config.ts');
+  if (!fs.existsSync(configPath)) return null;
+
+  try {
+    const source = fs.readFileSync(configPath, 'utf-8');
+    const transformed = esbuild.transformSync(source, {
+      loader: 'ts',
+      format: 'cjs',
+      platform: 'node',
+      target: 'node18',
+      sourcemap: false,
+    });
+    const moduleRef: { exports: any } = { exports: {} };
+    const projectRequire = createRequire(pathToFileURL(configPath).href);
+    const evaluator = new Function(
+      'exports',
+      'require',
+      'module',
+      '__filename',
+      '__dirname',
+      'process',
+      transformed.code
+    );
+    evaluator(
+      moduleRef.exports,
+      projectRequire,
+      moduleRef,
+      configPath,
+      path.dirname(configPath),
+      process
+    );
+
+    const exported = moduleRef.exports;
+    return exported?.StudioConfig ?? exported?.default?.StudioConfig ?? exported?.default ?? null;
+  } catch (error) {
+    console.warn(
+      chalk.yellow(
+        `⚠️  Failed to load microfox.config.ts (${error instanceof Error ? error.message : String(error)})`
+      )
+    );
+    return null;
+  }
+}
+
+function resolveMicrofoxConfig(projectRoot: string): ResolvedMicrofoxConfig | null {
+  const microfoxJsonPath = path.join(projectRoot, 'microfox.json');
+  if (fs.existsSync(microfoxJsonPath)) {
+    const raw = readJsonFile<Record<string, any>>(microfoxJsonPath);
+    if (raw) {
+      const sanitized = sanitizeMicrofoxConfig(raw);
+      if (sanitized) {
+        return { source: 'microfox.json', config: sanitized };
+      }
+    } else {
+      console.warn(chalk.yellow('⚠️  Failed to parse microfox.json, checking microfox.config.ts fallback'));
+    }
+  }
+
+  const studioConfig = loadStudioConfigFromTs(projectRoot);
+  const fromStudio = getMicrofoxConfigFromStudioConfig(studioConfig);
+  if (fromStudio) {
+    return { source: 'microfox.config.ts', config: fromStudio };
+  }
+  return null;
+}
+
+function writeMicrofoxJson(targetPath: string, config: Record<string, any>): void {
+  fs.writeFileSync(targetPath, JSON.stringify(config, null, 2));
+}
+
 function findMonorepoRoot(startDir: string): string {
   let dir = path.resolve(startDir);
   // Walk up until we find a package.json with "workspaces" or we hit filesystem root.
@@ -397,7 +514,13 @@ function buildDependenciesMap(projectRoot: string, deps: Set<string>): Record<st
 interface QueueStepInfo {
   workerId: string;
   delaySeconds?: number;
-  mapInputFromPrev?: string;
+  requiresApproval?: boolean;
+  /** True when the step has a `chain` function or built-in string (detected by scanner). */
+  hasChain?: boolean;
+  /** True when the step has a `resume` function (detected by scanner). */
+  hasResume?: boolean;
+  // HITL metadata is resolved from queue module default export at runtime.
+  hitl?: unknown;
 }
 
 interface QueueInfo {
@@ -678,19 +801,70 @@ async function scanQueues(aiPath: string = 'app/ai'): Promise<QueueInfo[]> {
       const queueId = idMatch[1];
 
       const steps: QueueStepInfo[] = [];
-      const stepsMatch = content.match(/steps:\s*\[([\s\S]*?)\]/);
-      if (stepsMatch) {
-        const stepsStr = stepsMatch[1];
-        // Match step objects: { workerId: 'x', delaySeconds?: N, mapInputFromPrev?: 'y' }
-        // Allow optional comment line between properties; comment before } only (lookahead); no trailing \s*
-        const stepRegex = /\{\s*workerId:\s*['"]([^'"]+)['"](?:,\s*(?:\/\/[^\r\n]*\r?\n\s*)?delaySeconds:\s*(\d+))?(?:,\s*(?:\/\/[^\r\n]*\r?\n\s*)?mapInputFromPrev:\s*['"]([^'"]+)['"])?\s*,?\s*(?:\/\/[^\r\n]*\r?\n\s*)?(?=\s*\})\s*\},?/g;
-        let m;
-        while ((m = stepRegex.exec(stepsStr)) !== null) {
-          steps.push({
-            workerId: m[1],
-            delaySeconds: m[2] ? parseInt(m[2], 10) : undefined,
-            mapInputFromPrev: m[3],
-          });
+      const stepsAnchor = content.match(/steps:\s*\[/);
+      if (stepsAnchor && typeof stepsAnchor.index === 'number') {
+        const openBracketIdx = content.indexOf('[', stepsAnchor.index);
+        let stepsStr = '';
+        if (openBracketIdx >= 0) {
+          let bracketDepth = 0;
+          let startContent = -1;
+          let endContent = -1;
+          for (let i = openBracketIdx; i < content.length; i++) {
+            const ch = content[i];
+            if (ch === '[') {
+              bracketDepth += 1;
+              if (bracketDepth === 1) {
+                startContent = i + 1;
+              }
+            } else if (ch === ']') {
+              bracketDepth = Math.max(0, bracketDepth - 1);
+              if (bracketDepth === 0) {
+                endContent = i;
+                break;
+              }
+            }
+          }
+          if (startContent >= 0 && endContent > startContent) {
+            stepsStr = content.slice(startContent, endContent);
+          }
+        }
+        if (stepsStr.trim()) {
+          // Parse top-level step objects so nested config blocks (e.g. hitl.ui)
+          // do not break queue discovery.
+          const topLevelStepObjects: string[] = [];
+          let depth = 0;
+          let start = -1;
+          for (let i = 0; i < stepsStr.length; i++) {
+            const ch = stepsStr[i];
+            if (ch === '{') {
+              if (depth === 0) start = i;
+              depth += 1;
+            } else if (ch === '}') {
+              depth = Math.max(0, depth - 1);
+              if (depth === 0 && start >= 0) {
+                topLevelStepObjects.push(stepsStr.slice(start, i + 1));
+                start = -1;
+              }
+            }
+          }
+          for (const stepObj of topLevelStepObjects) {
+            const workerMatch = stepObj.match(/workerId:\s*['"]([^'"]+)['"]/);
+            if (!workerMatch) continue;
+            const delayMatch = stepObj.match(/delaySeconds:\s*(\d+)/);
+            const approvalMatch = stepObj.match(/requiresApproval:\s*(true|false)/);
+            // Detect presence of chain/resume/loop keys (function refs or built-in strings).
+            const hasChain = /\bchain\s*:/.test(stepObj);
+            const hasResume = /\bresume\s*:/.test(stepObj);
+            const hasLoop = /\bloop\s*:/.test(stepObj);
+            steps.push({
+              workerId: workerMatch[1],
+              delaySeconds: delayMatch ? parseInt(delayMatch[1], 10) : undefined,
+              requiresApproval: approvalMatch ? approvalMatch[1] === 'true' : undefined,
+              ...(hasChain ? { hasChain: true } : {}),
+              ...(hasResume ? { hasResume: true } : {}),
+              ...(hasLoop ? { hasLoop: true } : {}),
+            });
+          }
         }
       }
 
@@ -720,7 +894,7 @@ async function scanQueues(aiPath: string = 'app/ai'): Promise<QueueInfo[]> {
 
 /**
  * Generates the queue registry module for runtime lookup.
- * For queues with mapInputFromPrev, imports the .queue.ts module so mapping can use any previous step or initial input.
+ * Imports queue modules so chain/resume function references can be called at runtime.
  */
 function generateQueueRegistry(queues: QueueInfo[], outputDir: string, projectRoot: string): void {
   const generatedDir = path.join(outputDir, 'generated');
@@ -731,11 +905,8 @@ function generateQueueRegistry(queues: QueueInfo[], outputDir: string, projectRo
   const relToRoot = path.relative(generatedDir, projectRoot).replace(/\\/g, '/');
   const queueModulesLines: string[] = [];
   const queueModulesEntries: string[] = [];
-  const queuesWithMapping = queues.filter(
-    (q) => q.steps?.some((s) => s.mapInputFromPrev)
-  );
-  for (let i = 0; i < queuesWithMapping.length; i++) {
-    const q = queuesWithMapping[i];
+  // Import ALL queue modules so repeatStep-expanded steps are accessible at runtime.
+  for (const q of queues) {
     const relPath = (relToRoot + '/' + q.filePath.replace(/\\/g, '/')).replace(/\.ts$/, '');
     const safeId = q.id.replace(/[^a-zA-Z0-9]/g, '');
     queueModulesLines.push(`const queueModule_${safeId} = require('${relPath}');`);
@@ -757,6 +928,11 @@ const queueModules = {};
  * Auto-generated queue registry. DO NOT EDIT.
  * Generated by @microfox/ai-worker-cli from .queue.ts files.
  */
+const {
+  defaultMapChainPassthrough,
+  defaultMapChainContinueFromPrevious,
+} = require('@microfox/ai-worker');
+
 ${queueModulesBlock}
 
 const QUEUES = ${JSON.stringify(queues.map((q) => ({ id: q.id, steps: q.steps, schedule: q.schedule })), null, 2)};
@@ -765,23 +941,99 @@ export function getQueueById(queueId) {
   return QUEUES.find((q) => q.id === queueId);
 }
 
-export function getNextStep(queueId, stepIndex) {
-  const queue = getQueueById(queueId);
-  if (!queue || !queue.steps || stepIndex < 0 || stepIndex >= queue.steps.length - 1) {
-    return undefined;
-  }
-  const step = queue.steps[stepIndex + 1];
-  return step ? { workerId: step.workerId, delaySeconds: step.delaySeconds, mapInputFromPrev: step.mapInputFromPrev } : undefined;
+function resolveModuleStep(queueId, stepIndex) {
+  const mod = queueModules[queueId];
+  return mod && mod.default && Array.isArray(mod.default.steps)
+    ? mod.default.steps[stepIndex]
+    : undefined;
 }
 
-export function invokeMapInput(queueId, stepIndex, initialInput, previousOutputs) {
-  const queue = getQueueById(queueId);
-  const step = queue?.steps?.[stepIndex];
-  const fnName = step?.mapInputFromPrev;
-  if (!fnName) return previousOutputs.length ? previousOutputs[previousOutputs.length - 1].output : initialInput;
+function resolveStepHitl(queueId, stepIndex, stepFromConfig) {
+  const moduleStep = resolveModuleStep(queueId, stepIndex);
+  const hitl = moduleStep && moduleStep.hitl != null ? moduleStep.hitl : stepFromConfig?.hitl;
+  return hitl !== undefined ? hitl : undefined;
+}
+
+function getModuleStepCount(queueId) {
   const mod = queueModules[queueId];
-  if (!mod || typeof mod[fnName] !== 'function') return previousOutputs.length ? previousOutputs[previousOutputs.length - 1].output : initialInput;
-  return mod[fnName](initialInput, previousOutputs);
+  return (mod && mod.default && Array.isArray(mod.default.steps))
+    ? mod.default.steps.length
+    : 0;
+}
+
+function resolveStepData(queueId, stepIndex) {
+  const queue = getQueueById(queueId);
+  const staticStep = queue?.steps?.[stepIndex];
+  const moduleStep = resolveModuleStep(queueId, stepIndex);
+  if (!staticStep && !moduleStep) return undefined;
+  const workerId = staticStep?.workerId ?? moduleStep?.workerId;
+  if (!workerId) return undefined;
+  const hitl = resolveStepHitl(queueId, stepIndex, staticStep);
+  return {
+    workerId,
+    delaySeconds: staticStep?.delaySeconds ?? moduleStep?.delaySeconds,
+    requiresApproval: staticStep?.requiresApproval ?? (moduleStep?.requiresApproval === true),
+    hasChain: staticStep?.hasChain ?? (moduleStep?.chain !== undefined),
+    hasResume: staticStep?.hasResume ?? (moduleStep?.resume !== undefined),
+    hasLoop: staticStep?.hasLoop ?? (moduleStep?.loop !== undefined),
+    ...(hitl !== undefined ? { hitl } : {}),
+  };
+}
+
+export function getNextStep(queueId, stepIndex) {
+  const queue = getQueueById(queueId);
+  const staticCount = queue?.steps?.length ?? 0;
+  const moduleCount = getModuleStepCount(queueId);
+  const totalSteps = Math.max(staticCount, moduleCount);
+  if (stepIndex < 0 || stepIndex >= totalSteps - 1) return undefined;
+  return resolveStepData(queueId, stepIndex + 1);
+}
+
+export function getStepAt(queueId, stepIndex) {
+  return resolveStepData(queueId, stepIndex);
+}
+
+/**
+ * Build the next-step input when the queue advances normally (no HITL resume).
+ * Calls the step's chain function, or a built-in strategy, or passes through by default.
+ */
+export function invokeChain(queueId, stepIndex, context) {
+  const moduleStep = resolveModuleStep(queueId, stepIndex);
+  const chain = moduleStep?.chain;
+  if (typeof chain === 'function') return chain(context);
+  if (chain === 'passthrough') return defaultMapChainPassthrough(context);
+  if (chain === 'continueFromPrevious') return defaultMapChainContinueFromPrevious(context);
+  // Default: pass through the most recent previous output, or initial input.
+  const prevOutputs = context?.previousOutputs ?? [];
+  return prevOutputs.length ? prevOutputs[prevOutputs.length - 1].output : context?.initialInput;
+}
+
+/**
+ * Build the domain input when a HITL step is resumed after human approval.
+ * Calls the step's resume function, or merges pendingInput + reviewerInput by default.
+ */
+export function invokeResume(queueId, stepIndex, context) {
+  const moduleStep = resolveModuleStep(queueId, stepIndex);
+  const resume = moduleStep?.resume;
+  if (typeof resume === 'function') return resume(context);
+  // Default: shallow merge pending domain input with reviewer input.
+  const pending = context?.pendingInput ?? {};
+  const reviewer = context?.reviewerInput;
+  return {
+    ...pending,
+    ...(reviewer !== null && typeof reviewer === 'object' ? reviewer : {}),
+  };
+}
+
+/**
+ * Evaluate whether a looping step should re-run after its output.
+ * Calls the step's loop.shouldContinue function; returns false if none defined.
+ */
+export function invokeLoop(queueId, stepIndex, context) {
+  const moduleStep = resolveModuleStep(queueId, stepIndex);
+  const shouldContinue = moduleStep?.loop?.shouldContinue;
+  if (typeof shouldContinue === 'function') return shouldContinue(context);
+  return false;
 }
 `;
 
@@ -922,7 +1174,10 @@ if (!workerAgent || typeof workerAgent.handler !== 'function') {
 
 const queueRuntime = {
   getNextStep: queueRegistry.getNextStep,
-  invokeMapInput: queueRegistry.invokeMapInput,
+  getStepAt: queueRegistry.getStepAt,
+  invokeChain: queueRegistry.invokeChain,
+  invokeResume: queueRegistry.invokeResume,
+  invokeLoop: queueRegistry.invokeLoop,
   getQueueJob,
 };
 const wrappedHandler = wrapHandlerForQueue(workerAgent.handler, queueRuntime);
@@ -1614,6 +1869,11 @@ import { SQSClient, GetQueueUrlCommand } from '@aws-sdk/client-sqs';
 
 // Worker IDs and queue definitions embedded at build time.
 const WORKER_IDS: string[] = ${JSON.stringify(workers.map(w => w.id), null, 2)};
+const WORKER_GROUPS: Record<string, string> = ${JSON.stringify(
+    Object.fromEntries(workers.map((w) => [w.id, w.group || 'default'])),
+    null,
+    2
+  )};
 const QUEUES = ${JSON.stringify(queues.map(q => ({ id: q.id, steps: q.steps, schedule: q.schedule })), null, 2)};
 const SERVICE_NAME = ${JSON.stringify(serviceName)};
 
@@ -1649,7 +1909,7 @@ export const handler = async (
   // NOTE: Node 20 Lambda runtime does NOT guarantee 'aws-sdk' v2 is available.
   // We use AWS SDK v3 and bundle it into this handler.
   const sqs = new SQSClient({ region });
-  const workers: Record<string, { queueUrl: string; region: string }> = {};
+  const workers: Record<string, { queueUrl: string; region: string; group: string }> = {};
   const attemptedQueueNames: string[] = [];
   const errors: Array<{ workerId: string; queueName: string; message: string; name?: string }> = [];
   const debug = event.queryStringParameters?.debug === '1' || event.queryStringParameters?.debug === 'true';
@@ -1660,7 +1920,7 @@ export const handler = async (
       const envKey = 'WORKER_QUEUE_URL_' + workerId.replace(/-/g, '_').toUpperCase();
       const fromEnv = process.env[envKey];
       if (fromEnv) {
-        workers[workerId] = { queueUrl: fromEnv, region };
+        workers[workerId] = { queueUrl: fromEnv, region, group: WORKER_GROUPS[workerId] || 'default' };
         return;
       }
 
@@ -1670,7 +1930,11 @@ export const handler = async (
       try {
         const result = await sqs.send(new GetQueueUrlCommand({ QueueName: queueName }));
         if (result?.QueueUrl) {
-          workers[workerId] = { queueUrl: String(result.QueueUrl), region };
+          workers[workerId] = {
+            queueUrl: String(result.QueueUrl),
+            region,
+            group: WORKER_GROUPS[workerId] || 'default',
+          };
         }
       } catch (e) {
         const err = e as any;
@@ -2513,22 +2777,22 @@ async function build(args: any) {
   let serviceName = (args['service-name'] as string | undefined)?.trim() || `ai-router-workers-${stage}`;
   let externalPackages = getExternalPackages(null);
   let microfoxConfig: Record<string, any> | null = null;
+  const resolvedMicrofoxConfig = resolveMicrofoxConfig(process.cwd());
 
-  // Check for microfox.json to customize service name and external packages
-  const microfoxJsonPath = path.join(process.cwd(), 'microfox.json');
-  if (fs.existsSync(microfoxJsonPath)) {
-    try {
-      microfoxConfig = JSON.parse(fs.readFileSync(microfoxJsonPath, 'utf-8'));
-      externalPackages = getExternalPackages(microfoxConfig);
-      if (microfoxConfig.projectId) {
-        // Only override if user did not explicitly provide a service name
-        if (!(args['service-name'] as string | undefined)?.trim()) {
-          serviceName = getServiceNameFromProjectId(microfoxConfig.projectId);
-        }
-        console.log(chalk.blue(`ℹ️  Using service name from microfox.json: ${serviceName}`));
+  // Resolve Microfox deployment config from root microfox.json or workflowSettings in microfox.config.ts.
+  if (resolvedMicrofoxConfig) {
+    microfoxConfig = resolvedMicrofoxConfig.config;
+    externalPackages = getExternalPackages(microfoxConfig);
+    // Keep .serverless-workers root compatible with Microfox CLI expectations.
+    writeMicrofoxJson(path.join(serverlessDir, 'microfox.json'), microfoxConfig);
+    if (microfoxConfig.projectId) {
+      // Only override if user did not explicitly provide a service name
+      if (!(args['service-name'] as string | undefined)?.trim()) {
+        serviceName = getServiceNameFromProjectId(microfoxConfig.projectId);
       }
-    } catch (error) {
-      console.warn(chalk.yellow('⚠️  Failed to parse microfox.json, using default service name'));
+      console.log(
+        chalk.blue(`ℹ️  Using service name from ${resolvedMicrofoxConfig.source}: ${serviceName}`)
+      );
     }
   }
 
@@ -2628,17 +2892,15 @@ async function build(args: any) {
     a === 'default' ? -1 : b === 'default' ? 1 : a.localeCompare(b)
   );
   const isMultiGroup = userGroups.length > 1;
-  let projectId: string | undefined;
-  if (fs.existsSync(microfoxJsonPath)) {
-    try {
-      const microfoxConfig = JSON.parse(fs.readFileSync(microfoxJsonPath, 'utf-8'));
-      projectId = microfoxConfig.projectId;
-    } catch {}
-  }
+  const projectId = microfoxConfig?.projectId;
 
   if (isMultiGroup) {
     if (!projectId) {
-      console.error(chalk.red('❌ Multi-group build requires projectId in microfox.json'));
+      console.error(
+        chalk.red(
+          '❌ Multi-group build requires projectId in microfox.json or microfox.config.ts (workflowSettings.deploymentConfig/projectId), or MICROFOX_PROJECT_ID.'
+        )
+      );
       process.exit(1);
     }
     const allWorkersByGroup = new Map<string, WorkerInfo[]>();
@@ -2666,8 +2928,8 @@ async function build(args: any) {
       },
     };
     fs.writeFileSync(path.join(coreDir, 'package.json'), JSON.stringify(packageJsonCore, null, 2));
-    if (fs.existsSync(microfoxJsonPath)) {
-      fs.copyFileSync(microfoxJsonPath, path.join(coreDir, 'microfox.json'));
+    if (microfoxConfig) {
+      writeMicrofoxJson(path.join(coreDir, 'microfox.json'), microfoxConfig);
     }
     generateQueueRegistry(queues, coreDir, process.cwd());
     const serviceNameCore = getServiceNameFromProjectId(projectId, 'core');
@@ -2711,8 +2973,8 @@ async function build(args: any) {
         },
       };
       fs.writeFileSync(path.join(groupDir, 'package.json'), JSON.stringify(packageJsonGroup, null, 2));
-      if (fs.existsSync(microfoxJsonPath)) {
-        fs.copyFileSync(microfoxJsonPath, path.join(groupDir, 'microfox.json'));
+      if (microfoxConfig) {
+        writeMicrofoxJson(path.join(groupDir, 'microfox.json'), microfoxConfig);
       }
       for (const w of workersForGroup) {
         const src = path.join(serverlessDir, w.handlerPath + '.js');
@@ -2781,8 +3043,10 @@ async function build(args: any) {
   const config = generateServerlessConfig(workers, stage, region, envVars, serviceName, calleeIds, queues, { externalPackages, microfoxConfig });
 
   // Always generate env.json now as serverless.yml relies on it.
-  // Microfox deploys APIs on prod by default; when microfox.json exists, default ENVIRONMENT/STAGE to "prod".
-  const envStage = fs.existsSync(microfoxJsonPath) ? 'prod' : stage;
+  // Backward-compatible behavior: if root microfox.json exists, force prod env stage.
+  // Also force prod when config-based deployment config is present.
+  const hasRootMicrofoxJson = fs.existsSync(path.join(process.cwd(), 'microfox.json'));
+  const envStage = hasRootMicrofoxJson || resolvedMicrofoxConfig ? 'prod' : stage;
   const safeEnvVars: Record<string, string> = {
     ENVIRONMENT: envStage,
     STAGE: envStage,
@@ -2816,6 +3080,7 @@ async function build(args: any) {
 async function deploy(args: any) {
   const stage = args.stage || process.env.STAGE || 'prod';
   const region = args.region || process.env.AWS_REGION || 'us-east-1';
+  const targetGroup = typeof args.group === 'string' ? args.group.trim() : '';
   // Commander passes option names as camelCase (e.g. skipDeploy, skipInstall)
   const skipDeploy = args.skipDeploy ?? args['skip-deploy'] ?? false;
   const skipInstall = args.skipInstall ?? args['skip-install'] ?? false;
@@ -2848,22 +3113,48 @@ async function deploy(args: any) {
       });
     }
 
-    // Check for microfox.json in project root
-    const microfoxJsonPath = path.join(process.cwd(), 'microfox.json');
-    if (fs.existsSync(microfoxJsonPath)) {
-      console.log(chalk.blue('ℹ️  Found microfox.json, deploying via Microfox Cloud...'));
+    // Backward compatibility: if root microfox.json exists, keep legacy Microfox deploy path.
+    // Otherwise fallback to deployment config in microfox.config.ts.
+    const rootMicrofoxJsonPath = path.join(process.cwd(), 'microfox.json');
+    const hasRootMicrofoxJson = fs.existsSync(rootMicrofoxJsonPath);
+    const resolvedMicrofoxConfig = hasRootMicrofoxJson
+      ? null
+      : resolveMicrofoxConfig(process.cwd());
+    if (hasRootMicrofoxJson || resolvedMicrofoxConfig) {
+      if (hasRootMicrofoxJson) {
+        console.log(chalk.blue('ℹ️  Found microfox.json, deploying via Microfox Cloud...'));
+      } else {
+        console.log(
+          chalk.blue(`ℹ️  Found ${resolvedMicrofoxConfig!.source}, deploying via Microfox Cloud...`)
+        );
+      }
 
-      // Copy microfox.json to .serverless-workers directory (required for Microfox CLI to detect per-group layout)
+      // Copy/write microfox.json to .serverless-workers directory (required for Microfox CLI to detect per-group layout)
       try {
-        fs.copyFileSync(microfoxJsonPath, path.join(serverlessDir, 'microfox.json'));
+        if (hasRootMicrofoxJson) {
+          fs.copyFileSync(rootMicrofoxJsonPath, path.join(serverlessDir, 'microfox.json'));
+        } else {
+          writeMicrofoxJson(
+            path.join(serverlessDir, 'microfox.json'),
+            resolvedMicrofoxConfig!.config
+          );
+        }
       } catch {}
 
       const skipCore = args.skipCore ?? args['skip-core'] ?? false;
       const hasPerGroupDirs = fs.existsSync(path.join(serverlessDir, 'core', 'serverless.yml'));
       const pushArgs = ['microfox@latest', 'push'];
+      if (targetGroup) {
+        pushArgs.push(targetGroup);
+        console.log(chalk.blue(`ℹ️  Deploying only group: ${targetGroup}`));
+      }
       if (hasPerGroupDirs && skipCore) {
-        pushArgs.push('--skip-group', 'core');
-        console.log(chalk.blue('ℹ️  Skipping core group (--skip-core)'));
+        if (targetGroup) {
+          console.log(chalk.yellow('⚠️  Ignoring --skip-core because a target group was provided.'));
+        } else {
+          pushArgs.push('--skip-group', 'core');
+          console.log(chalk.blue('ℹ️  Skipping core group (--skip-core)'));
+        }
       }
 
       execSync('npx ' + pushArgs.join(' '), {
@@ -2873,6 +3164,14 @@ async function deploy(args: any) {
       console.log(chalk.green('✓ Deployment triggered via Microfox!'));
       // We don't generate workers map for Microfox push as it handles its own routing
       return;
+    }
+
+    if (targetGroup) {
+      console.log(
+        chalk.yellow(
+          '⚠️  Group argument is only used for Microfox deployments; running standard serverless deploy.'
+        )
+      );
     }
 
     execSync('npx serverless deploy', {
@@ -2896,6 +3195,7 @@ async function deploy(args: any) {
 export const pushCommand = new Command()
   .name('push')
   .description('Build and deploy background workers to AWS')
+  .argument('[group]', 'Deploy only one Microfox group (e.g. "scraper")')
   .option('-s, --stage <stage>', 'Deployment stage', 'prod')
   .option('-r, --region <region>', 'AWS region', 'us-east-1')
   .option('--ai-path <path>', 'Path to AI directory containing workers', 'app/ai')
@@ -2903,8 +3203,9 @@ export const pushCommand = new Command()
   .option('--skip-deploy', 'Skip deployment, only build', false)
   .option('--skip-install', 'Skip npm install in serverless directory', false)
   .option('--skip-core', 'When deploying via Microfox, skip deploying the core group', false)
-  .action(async (options) => {
-    await build(options);
-    await deploy(options);
+  .action(async (group: string | undefined, options: any) => {
+    const args = { ...options, group };
+    await build(args);
+    await deploy(args);
   });
 

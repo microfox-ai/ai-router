@@ -30,7 +30,6 @@ function scaffoldWorker(
 
   const contents = `import { createWorker, type WorkerConfig } from '@microfox/ai-worker';
 import { z } from 'zod';
-import type { WorkerHandlerParams } from '@microfox/ai-worker/handler';
 
 const InputSchema = z.object({
   // TODO: define input fields
@@ -40,28 +39,23 @@ const OutputSchema = z.object({
   // TODO: define output fields
 });
 
-type Input = z.infer<typeof InputSchema>;
-type Output = z.infer<typeof OutputSchema>;
-
 export const workerConfig: WorkerConfig = {
   timeout: ${timeout},
   memorySize: ${memorySize},
 ${scheduleLine}};
 
-export default createWorker<typeof InputSchema, Output>({
+export default createWorker({
   id: '${id}',
   inputSchema: InputSchema,
   outputSchema: OutputSchema,
-  async handler({ input, ctx }: WorkerHandlerParams<Input, Output>) {
-    const { jobId, workerId, jobStore, dispatchWorker, logger } = ctx;
-    logger.info('start', { jobId, workerId });
-
-    await jobStore?.update({ status: 'running' });
+  handler: async ({ input, ctx }) => {
+    ctx.logger.info('start');
+    await ctx.jobStore?.update({ status: 'running' });
 
     // TODO: implement your business logic here
-    const result: Output = {} as any;
+    const result = {} as z.infer<typeof OutputSchema>;
 
-    await jobStore?.update({ status: 'completed', output: result });
+    await ctx.jobStore?.update({ status: 'completed', output: result });
     return result;
   },
 });
@@ -79,17 +73,26 @@ function scaffoldQueue(projectRoot: string, id: string, options: { dir?: string 
   const fileSafeId = id.trim().replace(/[^a-zA-Z0-9_-]+/g, '-');
   const filePath = path.join(dir, `${fileSafeId}.queue.ts`);
 
-  const contents = `import { defineWorkerQueue } from '@microfox/ai-worker/queue';
+  const contents = `import { defineWorkerQueue } from '@microfox/ai-worker';
+// To add HITL: import { defineWorkerQueue, defineHitlConfig, type ChainContext, type HitlResumeContext } from '@microfox/ai-worker';
 
 /**
  * Worker queue: ${id}
- * Steps run in sequence. Each step's output can be mapped to the next step's input.
+ *
+ * Steps run in sequence. Each step can:
+ *   - chain: map the previous step's output to this step's input
+ *   - requiresApproval: pause for human review (HITL) before dispatching
+ *   - resume: merge the reviewer's payload with the pending input
+ *   - hitl: attach UI metadata (defineHitlConfig) for the HITL panel
+ *   - loop: re-run this step until a condition is met (combine with requiresApproval for interactive loops)
+ *   - delaySeconds: delay dispatch via SQS DelaySeconds (0–900)
  */
 export default defineWorkerQueue({
   id: '${id}',
   steps: [
     { workerId: 'first-worker' },
-    // Add more steps: { workerId: 'second-worker' }, { workerId: 'third-worker', delaySeconds: 10 }
+    // { workerId: 'second-worker', chain: (ctx) => ctx.previousOutputs.at(-1)?.output },
+    // { workerId: 'review-step', requiresApproval: true, chain: 'passthrough', resume: (ctx) => ({ ...ctx.pendingInput, ...ctx.reviewerInput }) },
   ],
   // Optional: run on a schedule (CLI will generate a queue-starter Lambda)
   // schedule: 'cron(0 3 * * ? *)',

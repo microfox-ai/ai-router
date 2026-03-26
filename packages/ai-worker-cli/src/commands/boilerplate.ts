@@ -6,6 +6,34 @@ import ora from 'ora';
 
 // Templates embedded from examples/root
 const TEMPLATES = {
+  'auth.ts': `import type { NextRequest } from 'next/server';
+
+/**
+ * Returns the ID of the currently authenticated user for the given request.
+ *
+ * Replace this stub with your actual auth logic, for example:
+ *   - Parse a JWT from the Authorization header
+ *   - Read a session cookie (e.g. NextAuth, Clerk, Supabase)
+ *   - Call your auth provider's SDK
+ *
+ * Returning \`undefined\` means no userId is attached to the worker job.
+ *
+ * @example with NextAuth
+ * \`\`\`ts
+ * import { getServerSession } from 'next-auth';
+ * import { authOptions } from '@/app/api/auth/[...nextauth]/route';
+ * export async function getClientId(req: NextRequest): Promise<string | undefined> {
+ *   const session = await getServerSession(authOptions);
+ *   return session?.user?.id;
+ * }
+ * \`\`\`
+ */
+export async function getClientId(_req: NextRequest): Promise<string | undefined> {
+  // TODO: implement your auth logic here
+  return undefined;
+}
+`,
+
   'stores/jobStore.ts': `/**
  * Job store for tracking worker job status and results.
  *
@@ -749,7 +777,7 @@ import { getWorkflowDb } from './mongoAdapter';
 export interface QueueJobStep {
   workerId: string;
   workerJobId: string;
-  status: 'queued' | 'running' | 'completed' | 'failed';
+  status: 'queued' | 'running' | 'awaiting_approval' | 'completed' | 'failed';
   input?: unknown;
   output?: unknown;
   error?: { message: string };
@@ -935,7 +963,7 @@ export async function updateQueueStep(
   queueJobId: string,
   stepIndex: number,
   update: {
-    status?: 'queued' | 'running' | 'completed' | 'failed';
+    status?: 'queued' | 'running' | 'awaiting_approval' | 'completed' | 'failed';
     input?: unknown;
     output?: unknown;
     error?: { message: string };
@@ -943,6 +971,46 @@ export async function updateQueueStep(
     completedAt?: string;
   }
 ): Promise<void> {
+  if (preferRedis()) {
+    const redis = getRedis();
+    const key = queueKey(queueJobId);
+    const existing = await loadQueueJobRedis(queueJobId);
+    if (!existing) {
+      throw new Error(\`Queue job \${queueJobId} not found\`);
+    }
+    const step = existing.steps[stepIndex];
+    if (!step) {
+      throw new Error(\`Queue job \${queueJobId} has no step at index \${stepIndex}\`);
+    }
+    const now = new Date().toISOString();
+    const mergedStep: QueueJobStep = {
+      ...step,
+      ...(update.status !== undefined && { status: update.status }),
+      ...(update.input !== undefined && { input: update.input }),
+      ...(update.output !== undefined && { output: update.output }),
+      ...(update.error !== undefined && { error: update.error }),
+      startedAt: update.startedAt ?? (update.status === 'running' ? now : step.startedAt),
+      completedAt:
+        update.completedAt ??
+        (['completed', 'failed'].includes(update.status ?? '') ? now : step.completedAt),
+    };
+    const steps = [...existing.steps];
+    steps[stepIndex] = mergedStep;
+    const toSet: Record<string, string> = {
+      steps: JSON.stringify(steps),
+      updatedAt: now,
+    };
+    if (update.status === 'failed') {
+      toSet.status = 'failed';
+      if (!existing.completedAt) toSet.completedAt = now;
+    } else if (update.status === 'completed' && stepIndex === steps.length - 1) {
+      toSet.status = 'completed';
+      if (!existing.completedAt) toSet.completedAt = now;
+    }
+    await redis.hset(key, toSet);
+    return;
+  }
+
   const collection = await getCollection();
   const now = new Date().toISOString();
   const setKey = \`steps.\${stepIndex}\`;
@@ -985,6 +1053,25 @@ export async function appendQueueStep(
   queueJobId: string,
   step: { workerId: string; workerJobId: string }
 ): Promise<void> {
+  if (preferRedis()) {
+    const redis = getRedis();
+    const key = queueKey(queueJobId);
+    const existing = await loadQueueJobRedis(queueJobId);
+    if (!existing) {
+      throw new Error(\`Queue job \${queueJobId} not found\`);
+    }
+    const steps = [...(existing.steps || []), {
+      workerId: step.workerId,
+      workerJobId: step.workerJobId,
+      status: 'queued' as const,
+    }];
+    await redis.hset(key, {
+      steps: JSON.stringify(steps),
+      updatedAt: new Date().toISOString(),
+    });
+    return;
+  }
+
   const collection = await getCollection();
   const now = new Date().toISOString();
   await collection.updateOne(
@@ -1095,13 +1182,24 @@ export async function listQueueJobs(
  * - getQueueRegistry(): returns QueueRegistry from config (for dispatchQueue)
  */
 
-import type { WorkerAgent, WorkerQueueRegistry } from '@microfox/ai-worker';
+import {
+  defaultMapChainContinueFromPrevious,
+  defaultMapChainPassthrough,
+  type ChainContext,
+  type LoopContext,
+  type WorkerAgent,
+  type WorkerQueueRegistry,
+} from '@microfox/ai-worker';
 
 /** Queue step config (matches WorkerQueueStep from @microfox/ai-worker). */
 export interface QueueStepConfig {
   workerId: string;
   delaySeconds?: number;
-  mapInputFromPrev?: string;
+  requiresApproval?: boolean;
+  hasChain?: boolean;
+  hasResume?: boolean;
+  hasLoop?: boolean;
+  hitl?: unknown;
 }
 
 /** Queue config from workers/config API (matches WorkerQueueConfig structure). */
@@ -1265,19 +1363,21 @@ function getQueueModuleContext(): { keys(): string[]; (key: string): unknown } |
   }
 }
 
+type QueueModuleMap = Record<string, { default?: { steps?: Array<{ chain?: unknown; resume?: unknown; hitl?: unknown; loop?: { shouldContinue?: unknown } }> } }>;
+
 /**
  * Auto-discover queue modules from app/ai/queues/*.queue.ts (no per-queue registration).
  * Uses require.context when available (Next.js/webpack).
  */
-function buildQueueModules(): Record<string, Record<string, (initial: unknown, prevOutputs: unknown[]) => unknown>> {
+function buildQueueModules(): QueueModuleMap {
   const ctx = getQueueModuleContext();
   if (!ctx) return {};
-  const out: Record<string, Record<string, (initial: unknown, prevOutputs: unknown[]) => unknown>> = {};
+  const out: QueueModuleMap = {};
   for (const key of ctx.keys()) {
-    const mod = ctx(key) as { default?: { id?: string }; [k: string]: unknown };
+    const mod = ctx(key) as { default?: { id?: string } };
     const id = mod?.default?.id;
     if (id && typeof id === 'string') {
-      out[id] = mod as Record<string, (initial: unknown, prevOutputs: unknown[]) => unknown>;
+      out[id] = mod as QueueModuleMap[string];
     }
   }
   return out;
@@ -1285,9 +1385,17 @@ function buildQueueModules(): Record<string, Record<string, (initial: unknown, p
 
 const queueModules = buildQueueModules();
 
+function resolveModuleStep(queueId: string, stepIndex: number) {
+  return queueModules[queueId]?.default?.steps?.[stepIndex];
+}
+
+function resolveStepHitl(queueId: string, stepIndex: number, stepFromConfig: QueueStepConfig | undefined): unknown {
+  return resolveModuleStep(queueId, stepIndex)?.hitl ?? stepFromConfig?.hitl;
+}
+
 /**
  * Returns a registry compatible with dispatchQueue. Queue definitions come from
- * GET /workers/config; mapInputFromPrev is resolved from app/ai/queues/*.queue.ts
+ * GET /workers/config; chain/resume functions are resolved from app/ai/queues/*.queue.ts
  * automatically (no manual registration per queue).
  */
 export async function getQueueRegistry(): Promise<WorkerQueueRegistry> {
@@ -1298,23 +1406,40 @@ export async function getQueueRegistry(): Promise<WorkerQueueRegistry> {
     getQueueById(queueId: string) {
       return queues.find((q) => q.id === queueId);
     },
-    invokeMapInput(
-      queueId: string,
-      stepIndex: number,
-      initialInput: unknown,
-      previousOutputs: Array<{ stepIndex: number; workerId: string; output: unknown }>
-    ): unknown {
+    getStepAt(queueId: string, stepIndex: number) {
       const queue = queues.find((q) => q.id === queueId);
       const step = queue?.steps?.[stepIndex];
-      const fnName = step?.mapInputFromPrev;
-      if (!fnName) {
-        return previousOutputs.length > 0 ? previousOutputs[previousOutputs.length - 1].output : initialInput;
-      }
-      const mod = queueModules[queueId];
-      if (!mod || typeof mod[fnName] !== 'function') {
-        return previousOutputs.length > 0 ? previousOutputs[previousOutputs.length - 1].output : initialInput;
-      }
-      return mod[fnName](initialInput, previousOutputs);
+      const hitl = resolveStepHitl(queueId, stepIndex, step);
+      return step
+        ? {
+            workerId: step.workerId,
+            requiresApproval: step.requiresApproval,
+            hasChain: step.hasChain,
+            hasResume: step.hasResume,
+            ...(hitl !== undefined ? { hitl } : {}),
+          }
+        : undefined;
+    },
+    invokeChain(queueId: string, stepIndex: number, context: ChainContext): unknown {
+      const moduleStep = resolveModuleStep(queueId, stepIndex);
+      const chain = moduleStep?.chain;
+      if (typeof chain === 'function') return (chain as (c: ChainContext) => unknown)(context);
+      if (chain === 'passthrough') return defaultMapChainPassthrough(context);
+      if (chain === 'continueFromPrevious') return defaultMapChainContinueFromPrevious(context);
+      const { initialInput, previousOutputs } = context;
+      return previousOutputs.length > 0 ? previousOutputs[previousOutputs.length - 1].output : initialInput;
+    },
+    invokeResume(queueId: string, stepIndex: number, context: { initialInput: unknown; previousOutputs: unknown[]; reviewerInput: unknown; pendingInput: Record<string, unknown> }): unknown {
+      const moduleStep = resolveModuleStep(queueId, stepIndex);
+      const resume = moduleStep?.resume;
+      if (typeof resume === 'function') return (resume as (c: typeof context) => unknown)(context);
+      return { ...context.pendingInput, ...(context.reviewerInput !== null && typeof context.reviewerInput === 'object' ? context.reviewerInput as object : {}) };
+    },
+    invokeLoop(queueId: string, stepIndex: number, context: LoopContext): boolean {
+      const moduleStep = resolveModuleStep(queueId, stepIndex);
+      const shouldContinue = moduleStep?.loop?.shouldContinue;
+      if (typeof shouldContinue === 'function') return !!(shouldContinue as (c: LoopContext) => boolean)(context);
+      return false;
     },
   };
   return registry as WorkerQueueRegistry;
@@ -1329,37 +1454,16 @@ export function clearConfigCache(): void {
 `,
 
   'workers/[...slug]/route.ts': `import { NextRequest, NextResponse } from 'next/server';
+import { dispatchWorker } from '@microfox/ai-worker';
+import { getClientId } from '../../auth';
 
 /**
  * Worker execution endpoint.
  *
- * POST /api/workflows/workers/:workerId - Execute a worker
+ * POST /api/workflows/workers/:workerId - Execute a worker (calls trigger API directly; no registry).
  * GET /api/workflows/workers/:workerId/:jobId - Get worker job status
  * POST /api/workflows/workers/:workerId/webhook - Webhook callback for completion notifications
- *
- * This endpoint allows workers to be called like workflows, enabling
- * them to be used in orchestration.
- *
- * Workers are auto-discovered from app/ai directory (any .worker.ts files) or
- * can be imported and registered manually via registerWorker().
  */
-
-// Worker auto-discovery is implemented in ../registry/workers
-// - Create worker registry module: app/api/workflows/registry/workers.ts
-// - Scan app/ai/**/*.worker.ts files at startup or lazily on first access
-// - Use glob pattern: 'app/ai/**/*.worker.ts'
-// - Extract worker ID from file: const worker = await import(filePath); worker.id
-// - Cache workers in memory or persistent store
-// - Support hot-reload in development
-// - Export: scanWorkers(), getWorker(workerId), listWorkers()
-
-/**
- * Get a worker by ID.
- */
-async function getWorkerById(workerId: string): Promise<any | null> {
-  const workersModule = await import('../../registry/workers') as { getWorker: (workerId: string) => Promise<any | null> };
-  return await workersModule.getWorker(workerId);
-}
 
 export async function POST(
   req: NextRequest,
@@ -1408,37 +1512,13 @@ export async function POST(
     }
 
     const { input, await: shouldAwait = false, jobId: providedJobId } = body;
+    const userId = await getClientId(req);
 
     console.log('[Worker] Dispatching worker:', {
       workerId,
       shouldAwait,
       hasInput: !!input,
     });
-
-    // Get the worker using registry system
-    let worker;
-    try {
-      worker = await getWorkerById(workerId);
-    } catch (getWorkerError: any) {
-      console.error('[Worker] Error getting worker:', {
-        workerId,
-        error: getWorkerError?.message || String(getWorkerError),
-      });
-      return NextResponse.json(
-        { error: \`Failed to get worker: \${getWorkerError?.message || String(getWorkerError)}\` },
-        { status: 500 }
-      );
-    }
-
-    if (!worker) {
-      console.warn('[Worker] Worker not found:', {
-        workerId,
-      });
-      return NextResponse.json(
-        { error: \`Worker "\${workerId}" not found. Make sure it's exported from a .worker.ts file.\` },
-        { status: 404 }
-      );
-    }
 
     // Webhook optional. Job updates use MongoDB only; never pass jobStoreUrl.
     const webhookBase = process.env.WORKFLOW_WEBHOOK_BASE_URL;
@@ -1477,15 +1557,19 @@ export async function POST(
       // Continue even if job store fails - worker dispatch can still proceed
     }
 
-    // Dispatch the worker. Job updates use MongoDB only; webhook only if configured.
+    // Dispatch via trigger API (no registry). Unknown workerId will fail at trigger API.
     let dispatchResult;
     try {
-      dispatchResult = await worker.dispatch(input || {}, {
-        mode: 'auto',
-        jobId,
-        ...(webhookUrl ? { webhookUrl } : {}),
-        metadata: { source: 'workflow-orchestration' },
-      });
+      dispatchResult = await dispatchWorker(
+        workerId,
+        (input || {}) as Record<string, unknown>,
+        {
+          jobId,
+          ...(webhookUrl ? { webhookUrl } : {}),
+          ...(userId ? { userId } : {}),
+          metadata: { source: 'workflow-orchestration' },
+        }
+      );
       console.log('[Worker] Worker dispatched successfully:', {
         jobId: dispatchResult.jobId,
         workerId,
@@ -1497,7 +1581,10 @@ export async function POST(
         error: dispatchError?.message || String(dispatchError),
         stack: process.env.NODE_ENV === 'development' ? dispatchError?.stack : undefined,
       });
-      throw new Error(\`Failed to dispatch worker: \${dispatchError?.message || String(dispatchError)}\`);
+      return NextResponse.json(
+        { error: \`Failed to dispatch worker: \${dispatchError?.message || String(dispatchError)}\` },
+        { status: 502 }
+      );
     }
 
     const finalJobId = dispatchResult.jobId || jobId;
@@ -1809,8 +1896,8 @@ async function handleWebhook(req: NextRequest, workerId: string) {
 `,
 
   'queues/[...slug]/route.ts': `import { NextRequest, NextResponse } from 'next/server';
-import { dispatchQueue } from '@microfox/ai-worker';
-import { getQueueRegistry } from '../../registry/workers';
+import { dispatchQueue, dispatchWorker } from '@microfox/ai-worker';
+import { getClientId } from '../../auth';
 import {
   getQueueJob,
   listQueueJobs,
@@ -1818,25 +1905,19 @@ import {
   updateQueueStep,
   appendQueueStep,
 } from '../../stores/queueJobStore';
-
 export const dynamic = 'force-dynamic';
 
 const LOG = '[Queues]';
 
 /**
- * Queue execution endpoint (mirrors workers route structure).
+ * Queue execution endpoint.
  *
- * POST /api/workflows/queues/:queueId - Trigger a queue (no registry import needed in app code)
+ * POST /api/workflows/queues/:queueId - Trigger a queue (calls queue-start API; no registry).
  * GET  /api/workflows/queues/:queueId/:jobId - Get queue job status
  * GET  /api/workflows/queues - List queue jobs (query: queueId?, limit?)
  * POST /api/workflows/queues/:queueId/update - Update queue job step (for Lambda/callers)
  * POST /api/workflows/queues/:queueId/webhook - Webhook for queue completion
- *
- * Callers can trigger a queue with a simple POST; registry is resolved inside this route.
  */
-async function getRegistry() {
-  return getQueueRegistry();
-}
 
 export async function POST(
   req: NextRequest,
@@ -1854,6 +1935,9 @@ export async function POST(
     if (action === 'webhook') {
       return handleQueueWebhook(req, queueId);
     }
+    if (action === 'approve') {
+      return handleQueueApprove(req, queueId);
+    }
 
     if (!queueId) {
       return NextResponse.json(
@@ -1869,21 +1953,12 @@ export async function POST(
       body = {};
     }
     const { input = {}, metadata, jobId: providedJobId } = body;
-
-    const registry = await getRegistry();
-    const queue = registry.getQueueById(queueId);
-    if (!queue) {
-      console.warn(\`\${LOG} Queue not found: \${queueId}\`);
-      return NextResponse.json(
-        { error: \`Queue "\${queueId}" not found. Ensure workers are deployed and config is available.\` },
-        { status: 404 }
-      );
-    }
+    const userId = await getClientId(req);
 
     const result = await dispatchQueue(queueId, input as Record<string, unknown>, {
-      registry,
       metadata: metadata ?? { source: 'queues-api' },
       ...(typeof providedJobId === 'string' && providedJobId.trim() ? { jobId: providedJobId.trim() } : {}),
+      ...(userId ? { userId } : {}),
     });
 
     console.log(\`\${LOG} Queue triggered\`, {
@@ -2019,6 +2094,21 @@ async function handleQueueJobUpdate(req: NextRequest, queueId: string) {
     return NextResponse.json({ ok: true, action: 'complete' });
   }
 
+  if (action === 'awaiting_approval') {
+    if (typeof stepIndex !== 'number' || !workerJobId) {
+      return NextResponse.json(
+        { error: 'awaiting_approval requires stepIndex and workerJobId' },
+        { status: 400 }
+      );
+    }
+    await updateQueueStep(id, stepIndex, {
+      status: 'awaiting_approval',
+      ...(input !== undefined && { input }),
+    });
+    console.log(\`\${LOG} Step awaiting approval\`, { queueJobId: id, stepIndex, workerJobId });
+    return NextResponse.json({ ok: true, action: 'awaiting_approval' });
+  }
+
   if (action === 'fail') {
     if (typeof stepIndex !== 'number' || !workerJobId) {
       return NextResponse.json(
@@ -2036,9 +2126,161 @@ async function handleQueueJobUpdate(req: NextRequest, queueId: string) {
   }
 
   return NextResponse.json(
-    { error: \`Unknown action: \${action}. Use start|complete|fail|append\` },
+    { error: \`Unknown action: \${action}. Use start|awaiting_approval|complete|fail|append\` },
     { status: 400 }
   );
+}
+
+/**
+ * Prototype + runtime endpoint for HITL queue approval/rejection.
+ * POST /api/workflows/queues/:queueId/approve
+ */
+async function handleQueueApprove(req: NextRequest, queueId: string) {
+  if (!queueId) {
+    return NextResponse.json({ error: 'Queue ID is required' }, { status: 400 });
+  }
+  const body = await req.json().catch(() => ({}));
+  const {
+    queueJobId,
+    jobId,
+    stepIndex,
+    decision = 'approve',
+    input,
+    comment,
+    reviewerId,
+  } = body ?? {};
+
+  const id = queueJobId ?? jobId;
+  if (!id) {
+    return NextResponse.json(
+      { error: 'queueJobId or jobId is required in request body' },
+      { status: 400 }
+    );
+  }
+
+  const queueJob = await getQueueJob(id);
+  if (!queueJob) {
+    return NextResponse.json({ error: 'Queue job not found' }, { status: 404 });
+  }
+  if (queueJob.queueId !== queueId) {
+    return NextResponse.json({ error: 'Queue job does not belong to this queue' }, { status: 400 });
+  }
+
+  const targetStepIndex =
+    typeof stepIndex === 'number'
+      ? stepIndex
+      : queueJob.steps.findIndex((s) => s.status === 'awaiting_approval');
+  if (targetStepIndex < 0) {
+    return NextResponse.json(
+      { error: 'No awaiting_approval step found for this queue job' },
+      { status: 400 }
+    );
+  }
+
+  const targetStep = queueJob.steps[targetStepIndex];
+  if (!targetStep) {
+    return NextResponse.json({ error: 'Invalid stepIndex' }, { status: 400 });
+  }
+  if (targetStep.status !== 'awaiting_approval') {
+    if (
+      decision === 'approve' &&
+      (targetStep.status === 'running' || targetStep.status === 'completed')
+    ) {
+      return NextResponse.json({
+        ok: true,
+        idempotent: true,
+        decision: 'approve',
+        queueJobId: id,
+        queueId,
+        stepIndex: targetStepIndex,
+        workerId: targetStep.workerId,
+        workerJobId: targetStep.workerJobId,
+        status: targetStep.status,
+      });
+    }
+    if (decision === 'reject' && targetStep.status === 'failed') {
+      return NextResponse.json({
+        ok: true,
+        idempotent: true,
+        decision: 'reject',
+        queueJobId: id,
+        queueId,
+        stepIndex: targetStepIndex,
+        status: 'failed',
+      });
+    }
+    return NextResponse.json(
+      { error: \`Step \${targetStepIndex} is not awaiting approval\` },
+      { status: 400 }
+    );
+  }
+
+  if (decision === 'reject') {
+    await updateQueueStep(id, targetStepIndex, {
+      status: 'failed',
+      error: { message: comment || 'Rejected by reviewer' },
+      completedAt: new Date().toISOString(),
+    });
+    return NextResponse.json({
+      ok: true,
+      decision,
+      queueJobId: id,
+      queueId,
+      stepIndex: targetStepIndex,
+      status: 'failed',
+    });
+  }
+
+  const pendingInput =
+    targetStep.input && typeof targetStep.input === 'object'
+      ? (targetStep.input as Record<string, unknown>)
+      : {};
+  const reviewerInput =
+    input && typeof input === 'object'
+      ? (input as Record<string, unknown>)
+      : {};
+
+  const decisionMeta = {
+    decision: 'approve' as const,
+    reviewerId: reviewerId ?? null,
+    comment: comment ?? null,
+    reviewedAt: new Date().toISOString(),
+  };
+
+  const dispatchInput = {
+    ...pendingInput,
+    __hitlInput: reviewerInput,
+    __hitlDecision: decisionMeta,
+  };
+  const stepInputForStore = dispatchInput;
+
+  await dispatchWorker(targetStep.workerId, dispatchInput, {
+    jobId: targetStep.workerJobId,
+    metadata: {
+      source: 'queue-hitl-approve',
+      queueId,
+      queueJobId: id,
+      stepIndex: targetStepIndex,
+      reviewerId: reviewerId ?? null,
+    },
+  });
+
+  await updateQueueStep(id, targetStepIndex, {
+    status: 'running',
+    startedAt: new Date().toISOString(),
+    input: stepInputForStore,
+  });
+
+  return NextResponse.json({
+    ok: true,
+    decision: 'approve',
+    queueJobId: id,
+    queueId,
+    stepIndex: targetStepIndex,
+    workerId: targetStep.workerId,
+    workerJobId: targetStep.workerJobId,
+    status: 'running',
+  });
 }
 
 /**
@@ -2110,6 +2352,7 @@ export type WorkflowJobStatus =
   | 'idle'
   | 'queued'
   | 'running'
+  | 'awaiting_approval'
   | 'completed'
   | 'failed'
   | 'partial';
@@ -2147,6 +2390,35 @@ export interface QueueJobResult {
   updatedAt: string;
   completedAt?: string;
 }
+
+export interface QueueHitlTask {
+  taskId: string;
+  queueJobId: string;
+  queueId: string;
+  stepIndex: number;
+  workerId: string;
+  status: 'awaiting_input' | 'approved' | 'rejected' | 'expired';
+  progress?: {
+    completedSteps: number;
+    totalSteps: number;
+    percent: number;
+  };
+  previousOutputs?: Array<{
+    stepIndex: number;
+    workerId: string;
+    output: unknown;
+  }>;
+  uiSpec?: Record<string, unknown>;
+  inputSchema?: Record<string, unknown>;
+  contextSnapshot?: Record<string, unknown>;
+}
+
+export type QueueHitlDecisionPayload = {
+  decision: 'approve' | 'reject';
+  input?: Record<string, unknown>;
+  comment?: string;
+  reviewerId?: string;
+};
 
 export type WorkflowJobOutput = WorkerJobResult | QueueJobResult;
 
@@ -2208,6 +2480,15 @@ export interface UseWorkflowJobReturn {
   polling: boolean;
   /** Reset state so you can trigger again */
   reset: () => void;
+  /**
+   * Derived HITL task from queue output when a step is awaiting approval.
+   * Undefined when not in HITL wait state.
+   */
+  hitlTask?: QueueHitlTask | null;
+  /**
+   * Submit approval/rejection and optional reviewer input for HITL queue steps.
+   */
+  submitHitlDecision?: (payload: QueueHitlDecisionPayload) => Promise<void>;
 }
 
 export function useWorkflowJob(
@@ -2239,6 +2520,33 @@ export function useWorkflowJob(
   const [error, setError] = useState<Error | null>(null);
   const [loading, setLoading] = useState(false);
   const [polling, setPolling] = useState(false);
+
+  const deriveHitlTask = useCallback((job: QueueJobResult | null): QueueHitlTask | null => {
+    if (!job || !Array.isArray(job.steps)) return null;
+    const waitingStepIndex = job.steps.findIndex((s) => s.status === 'awaiting_approval');
+    if (waitingStepIndex < 0) return null;
+    const waitingStep = job.steps[waitingStepIndex];
+    const previousOutputs = job.steps
+      .slice(0, waitingStepIndex)
+      .map((s, idx) => ({ stepIndex: idx, workerId: s.workerId, output: s.output }));
+    const completedSteps = job.steps.filter((s) => s.status === 'completed').length;
+    const totalSteps = job.steps.length;
+    const percent = totalSteps > 0 ? Math.round((completedSteps / totalSteps) * 100) : 0;
+    const meta = (job.metadata ?? {}) as Record<string, any>;
+    return {
+      taskId: String(meta.hitlTaskId ?? \`\${job.id}:\${waitingStepIndex}\`),
+      queueJobId: job.id,
+      queueId: job.queueId,
+      stepIndex: waitingStepIndex,
+      workerId: waitingStep.workerId,
+      status: 'awaiting_input',
+      progress: { completedSteps, totalSteps, percent },
+      previousOutputs,
+      uiSpec: (waitingStep.input as any)?.hitl?.uiSpec ?? meta.hitlUiSpec ?? {},
+      inputSchema: (waitingStep.input as any)?.hitl?.inputSchema ?? meta.hitlInputSchema ?? {},
+      contextSnapshot: (waitingStep.input as any)?.hitl?.contextSnapshot ?? meta.hitlContextSnapshot ?? {},
+    };
+  }, []);
 
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -2366,7 +2674,24 @@ export function useWorkflowJob(
 
           if (autoPoll) {
             setPolling(true);
-            const deadline = Date.now() + pollTimeoutMs;
+            // Deadline resets on each awaiting_approval poll — timeout only counts
+            // active processing time, not time spent waiting for human decisions.
+            let deadline = Date.now() + pollTimeoutMs;
+            let intervalId: ReturnType<typeof setInterval> | null = null;
+            const terminalHitRef = { current: false };
+
+            const clearThisPolling = () => {
+              if (intervalId != null) {
+                clearInterval(intervalId);
+                if (intervalRef.current === intervalId) intervalRef.current = null;
+              }
+              if (timeoutRef.current != null) {
+                clearTimeout(timeoutRef.current);
+                timeoutRef.current = null;
+              }
+              setPolling(false);
+            };
+
             const poll = async () => {
               if (!mountedRef.current) return;
               try {
@@ -2376,7 +2701,7 @@ export function useWorkflowJob(
                 const job = await r.json();
                 if (!r.ok) {
                   if (Date.now() >= deadline) {
-                    clearPolling();
+                    clearThisPolling();
                     setError(new Error('Poll timeout'));
                     setStatus('failed');
                   }
@@ -2386,20 +2711,25 @@ export function useWorkflowJob(
                 setStatus(st as WorkflowJobStatus);
                 setOutput(job as QueueJobResult);
                 if (TERMINAL_STATUSES.includes(st)) {
-                  clearPolling();
+                  terminalHitRef.current = true;
+                  clearThisPolling();
                   onComplete?.(job as QueueJobResult);
                   if (st === 'failed') {
                     setError(new Error('Queue job failed'));
                     onError?.(new Error('Queue job failed'));
                   }
+                } else if (st === 'awaiting_approval') {
+                  // Reset the deadline while waiting for human input — the timeout
+                  // should only count active processing time, not human decision time.
+                  deadline = Date.now() + pollTimeoutMs;
                 } else if (Date.now() >= deadline) {
-                  clearPolling();
+                  clearThisPolling();
                   setError(new Error('Poll timeout'));
                   setStatus('failed');
                 }
               } catch (e) {
                 if (mountedRef.current) {
-                  clearPolling();
+                  clearThisPolling();
                   const err = e instanceof Error ? e : new Error(String(e));
                   setError(err);
                   setStatus('failed');
@@ -2408,12 +2738,9 @@ export function useWorkflowJob(
               }
             };
             await poll();
-            intervalRef.current = setInterval(poll, pollIntervalMs);
-            timeoutRef.current = setTimeout(() => {
-              clearPolling();
-              setError(new Error('Poll timeout'));
-              setStatus('failed');
-            }, pollTimeoutMs);
+            if (terminalHitRef.current) return;
+            intervalId = setInterval(() => void poll(), pollIntervalMs);
+            intervalRef.current = intervalId;
           }
         }
       } catch (e) {
@@ -2437,6 +2764,32 @@ export function useWorkflowJob(
     ]
   );
 
+  const submitHitlDecision = useCallback(
+    async (payload: QueueHitlDecisionPayload) => {
+      if (options.type !== 'queue' || !jobId) {
+        throw new Error('submitHitlDecision is only available for queue jobs');
+      }
+      const response = await fetch(api(\`/queues/\${options.queueId}/approve\`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          queueJobId: jobId,
+          ...payload,
+        }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body?.error ?? \`Failed to submit HITL decision (\${response.status})\`);
+      }
+    },
+    [options, jobId, api]
+  );
+
+  const hitlTask =
+    options.type === 'queue'
+      ? deriveHitlTask((output && 'steps' in output ? (output as QueueJobResult) : null))
+      : null;
+
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -2454,6 +2807,12 @@ export function useWorkflowJob(
     loading,
     polling,
     reset,
+    ...(options.type === 'queue'
+      ? {
+          hitlTask,
+          submitHitlDecision,
+        }
+      : {}),
   };
 }
 `,
@@ -2490,6 +2849,17 @@ const WORKFLOW_SETTINGS_SNIPPET = `  // Workflow + worker runtime configuration 
           'worker:jobs:',
         ttlSeconds:
           Number(process.env.WORKER_JOBS_TTL_SECONDS ?? 60 * 60 * 24 * 7),
+      },
+    },
+    // Optional: Microfox deployment config (alternative to root microfox.json)
+    deploymentConfig: {
+      projectId: process.env.MICROFOX_PROJECT_ID,
+      publish: {
+        subdomain: process.env.MICROFOX_SUBDOMAIN,
+      },
+      deployment: {
+        apiMode: process.env.MICROFOX_API_MODE || 'staging',
+        apiVersion: process.env.MICROFOX_API_VERSION || 'v2',
       },
     },
   },`;
@@ -2589,6 +2959,76 @@ ${WORKFLOW_SETTINGS_SNIPPET}
   return true;
 }
 
+// Packages the boilerplate templates require, with minimum versions from examples/root
+const REQUIRED_DEPENDENCIES: Record<string, string> = {
+  '@microfox/ai-worker': 'latest',
+  '@upstash/redis': '^1.35.3',
+  mongodb: '^6.12.0',
+  zod: '^4.1.11',
+};
+
+function parseVersionTuple(v: string): [number, number, number] | null {
+  const clean = v.replace(/^[\^~>=< ]+/, '').split(/[-+]/)[0];
+  const parts = clean.split('.').map(Number);
+  if (parts.length < 3 || parts.some((n) => isNaN(n))) return null;
+  return [parts[0], parts[1], parts[2]];
+}
+
+function isVersionLessThan(current: string, required: string): boolean {
+  if (current === '*' || current === 'latest' || required === '*' || required === 'latest')
+    return false;
+  const a = parseVersionTuple(current);
+  const b = parseVersionTuple(required);
+  if (!a || !b) return false;
+  for (let i = 0; i < 3; i++) {
+    if (a[i] < b[i]) return true;
+    if (a[i] > b[i]) return false;
+  }
+  return false;
+}
+
+function updatePackageJsonDeps(projectRoot: string): { added: string[]; updated: string[] } {
+  const pkgPath = path.join(projectRoot, 'package.json');
+  const added: string[] = [];
+  const updated: string[] = [];
+
+  if (!fs.existsSync(pkgPath)) return { added, updated };
+
+  let pkg: Record<string, any>;
+  try {
+    pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+  } catch {
+    return { added, updated };
+  }
+
+  if (!pkg.dependencies) pkg.dependencies = {};
+
+  for (const [dep, requiredVersion] of Object.entries(REQUIRED_DEPENDENCIES)) {
+    const currentInDeps = pkg.dependencies?.[dep] as string | undefined;
+    const currentInDev = pkg.devDependencies?.[dep] as string | undefined;
+    const current = currentInDeps ?? currentInDev;
+
+    if (!current) {
+      pkg.dependencies[dep] = requiredVersion;
+      added.push(`${dep}@${requiredVersion}`);
+    } else if (isVersionLessThan(current, requiredVersion)) {
+      // Update in whichever section it already lives
+      if (currentInDeps !== undefined) {
+        pkg.dependencies[dep] = requiredVersion;
+      } else if (pkg.devDependencies) {
+        pkg.devDependencies[dep] = requiredVersion;
+      }
+      updated.push(`${dep}: ${current} → ${requiredVersion}`);
+    }
+  }
+
+  if (added.length > 0 || updated.length > 0) {
+    fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n', 'utf-8');
+  }
+
+  return { added, updated };
+}
+
 export const boilerplateCommand = new Command()
   .name('boilerplate')
   .description('Create or update worker boilerplate files (job store, API routes, config)')
@@ -2630,6 +3070,9 @@ export const boilerplateCommand = new Command()
         }
       }
 
+      // Update package.json dependencies
+      const { added: depsAdded, updated: depsUpdated } = updatePackageJsonDeps(projectRoot);
+
       spinner.succeed('Boilerplate files created');
 
       if (filesCreated.length > 0) {
@@ -2640,6 +3083,20 @@ export const boilerplateCommand = new Command()
       if (filesSkipped.length > 0) {
         console.log(chalk.yellow('\n⚠ Skipped existing files (use --force to overwrite):'));
         filesSkipped.forEach((f) => console.log(chalk.gray(`  - ${f}`)));
+      }
+
+      if (depsAdded.length > 0) {
+        console.log(chalk.green('\n✓ Added dependencies to package.json:'));
+        depsAdded.forEach((d) => console.log(chalk.gray(`  - ${d}`)));
+      }
+
+      if (depsUpdated.length > 0) {
+        console.log(chalk.green('\n✓ Updated dependencies in package.json:'));
+        depsUpdated.forEach((d) => console.log(chalk.gray(`  - ${d}`)));
+      }
+
+      if (depsAdded.length > 0 || depsUpdated.length > 0) {
+        console.log(chalk.yellow('\n  Run npm install (or yarn/pnpm install) to install the updated dependencies.'));
       }
 
       console.log(

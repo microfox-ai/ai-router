@@ -12,26 +12,21 @@
 import {
   defaultMapChainContinueFromPrevious,
   defaultMapChainPassthrough,
-  type MapStepInputContext,
+  type ChainContext,
+  type LoopContext,
   type WorkerAgent,
   type WorkerQueueRegistry,
-  type SmartRetryConfig,
 } from '@microfox/ai-worker';
 
 /** Queue step config (matches WorkerQueueStep from @microfox/ai-worker). */
 export interface QueueStepConfig {
   workerId: string;
   delaySeconds?: number;
-  mapInputFromPrev?: string;
   requiresApproval?: boolean;
-  chainStrategy?: 'passthrough' | 'continueFromPrevious' | 'custom';
+  hasChain?: boolean;
+  hasResume?: boolean;
+  hasLoop?: boolean;
   hitl?: unknown;
-  /**
-   * Smart retry config for this step. Overrides worker-level retry config.
-   * Retries run in-process so ctx.retryContext is available for self-correction.
-   * @example { maxAttempts: 3, on: ['rate-limit', 'json-parse'] }
-   */
-  retry?: SmartRetryConfig;
 }
 
 /** Queue config from workers/config API (matches WorkerQueueConfig structure). */
@@ -195,19 +190,21 @@ function getQueueModuleContext(): { keys(): string[]; (key: string): unknown } |
   }
 }
 
+type QueueModuleMap = Record<string, { default?: { steps?: Array<{ chain?: unknown; resume?: unknown; hitl?: unknown; loop?: { shouldContinue?: unknown } }> } }>;
+
 /**
  * Auto-discover queue modules from app/ai/queues/*.queue.ts (no per-queue registration).
  * Uses require.context when available (Next.js/webpack).
  */
-function buildQueueModules(): Record<string, Record<string, (ctx: MapStepInputContext) => unknown>> {
+function buildQueueModules(): QueueModuleMap {
   const ctx = getQueueModuleContext();
   if (!ctx) return {};
-  const out: Record<string, Record<string, (ctx: MapStepInputContext) => unknown>> = {};
+  const out: QueueModuleMap = {};
   for (const key of ctx.keys()) {
-    const mod = ctx(key) as { default?: { id?: string }; [k: string]: unknown };
+    const mod = ctx(key) as { default?: { id?: string } };
     const id = mod?.default?.id;
     if (id && typeof id === 'string') {
-      out[id] = mod as Record<string, (ctx: MapStepInputContext) => unknown>;
+      out[id] = mod as QueueModuleMap[string];
     }
   }
   return out;
@@ -215,15 +212,17 @@ function buildQueueModules(): Record<string, Record<string, (ctx: MapStepInputCo
 
 const queueModules = buildQueueModules();
 
+function resolveModuleStep(queueId: string, stepIndex: number) {
+  return queueModules[queueId]?.default?.steps?.[stepIndex];
+}
+
 function resolveStepHitl(queueId: string, stepIndex: number, stepFromConfig: QueueStepConfig | undefined): unknown {
-  const mod = queueModules[queueId] as { default?: { steps?: Array<{ hitl?: unknown }> } } | undefined;
-  const moduleStep = mod?.default?.steps?.[stepIndex];
-  return moduleStep?.hitl ?? stepFromConfig?.hitl;
+  return resolveModuleStep(queueId, stepIndex)?.hitl ?? stepFromConfig?.hitl;
 }
 
 /**
  * Returns a registry compatible with dispatchQueue. Queue definitions come from
- * GET /workers/config; mapInputFromPrev is resolved from app/ai/queues/*.queue.ts
+ * GET /workers/config; chain/resume functions are resolved from app/ai/queues/*.queue.ts
  * automatically (no manual registration per queue).
  */
 export async function getQueueRegistry(): Promise<WorkerQueueRegistry> {
@@ -240,46 +239,34 @@ export async function getQueueRegistry(): Promise<WorkerQueueRegistry> {
       const hitl = resolveStepHitl(queueId, stepIndex, step);
       return step
         ? {
-            mapInputFromPrev: step.mapInputFromPrev,
-            chainStrategy: step.chainStrategy,
+            workerId: step.workerId,
+            requiresApproval: step.requiresApproval,
+            hasChain: step.hasChain,
+            hasResume: step.hasResume,
             ...(hitl !== undefined ? { hitl } : {}),
           }
         : undefined;
     },
-    invokeMapInput(queueId: string, stepIndex: number, context: MapStepInputContext): unknown {
-      const queue = queues.find((q) => q.id === queueId);
-      const step = queue?.steps?.[stepIndex];
-      const fnName = step?.mapInputFromPrev;
-      const chainStrategy = step?.chainStrategy;
+    invokeChain(queueId: string, stepIndex: number, context: ChainContext): unknown {
+      const moduleStep = resolveModuleStep(queueId, stepIndex);
+      const chain = moduleStep?.chain;
+      if (typeof chain === 'function') return (chain as (c: ChainContext) => unknown)(context);
+      if (chain === 'passthrough') return defaultMapChainPassthrough(context);
+      if (chain === 'continueFromPrevious') return defaultMapChainContinueFromPrevious(context);
       const { initialInput, previousOutputs } = context;
-      const isResume =
-        context &&
-        typeof context === 'object' &&
-        context.pendingStepInput != null &&
-        context.hitlInput !== undefined;
-
-      if (isResume && fnName) {
-        const mod = queueModules[queueId];
-        if (mod && typeof mod[fnName] === 'function') {
-          return (mod[fnName] as (c: MapStepInputContext) => unknown)(context);
-        }
-      }
-
-      if (!isResume && chainStrategy === 'passthrough') {
-        return defaultMapChainPassthrough(context);
-      }
-      if (!isResume && chainStrategy === 'continueFromPrevious') {
-        return defaultMapChainContinueFromPrevious(context);
-      }
-
-      if (!fnName) {
-        return previousOutputs.length > 0 ? previousOutputs[previousOutputs.length - 1].output : initialInput;
-      }
-      const mod = queueModules[queueId];
-      if (!mod || typeof mod[fnName] !== 'function') {
-        return previousOutputs.length > 0 ? previousOutputs[previousOutputs.length - 1].output : initialInput;
-      }
-      return (mod[fnName] as (c: MapStepInputContext) => unknown)(context);
+      return previousOutputs.length > 0 ? previousOutputs[previousOutputs.length - 1].output : initialInput;
+    },
+    invokeResume(queueId: string, stepIndex: number, context: { initialInput: unknown; previousOutputs: unknown[]; reviewerInput: unknown; pendingInput: Record<string, unknown> }): unknown {
+      const moduleStep = resolveModuleStep(queueId, stepIndex);
+      const resume = moduleStep?.resume;
+      if (typeof resume === 'function') return (resume as (c: typeof context) => unknown)(context);
+      return { ...context.pendingInput, ...(context.reviewerInput !== null && typeof context.reviewerInput === 'object' ? context.reviewerInput as object : {}) };
+    },
+    invokeLoop(queueId: string, stepIndex: number, context: LoopContext): boolean {
+      const moduleStep = resolveModuleStep(queueId, stepIndex);
+      const shouldContinue = moduleStep?.loop?.shouldContinue;
+      if (typeof shouldContinue === 'function') return !!(shouldContinue as (c: LoopContext) => boolean)(context);
+      return false;
     },
   };
   return registry as WorkerQueueRegistry;

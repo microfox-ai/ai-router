@@ -8,6 +8,7 @@ import {
 } from 'ai';
 import dedent from 'dedent';
 import { braveResearchAgent } from './agents/braveResearch';
+import { smartDemoAgent } from './agents/smart-demo';
 import { summarizeAgent } from './agents/summarize';
 import { systemAgent } from './agents/system';
 import { thinkerAgent } from './agents/thinker';
@@ -24,6 +25,7 @@ const aiMainRouter = aiRouter
   .agent('/summarize', summarizeAgent)
   .agent('/research', braveResearchAgent)
   .agent('/thinker', thinkerAgent)
+  .agent('/smart-demo', smartDemoAgent)
   // Mount workflow router as sub-router
   // .agent('/workflows', workflowRouter)
   .before('/', contextLimiter(5))

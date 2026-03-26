@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -11,6 +11,10 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Loader2, XCircle, Play, RefreshCw, ArrowRight, Clock } from 'lucide-react';
 import { useWorkflowJob } from '@/hooks/useWorkflowJob';
 import type { QueueJobResult } from '@/hooks/useWorkflowJob';
+import {
+  demoDataProcessorHitlInputSchema,
+  type DemoDataProcessorHitlInput,
+} from '@/app/ai/queues/demo-data-processor.queue';
 
 /**
  * Queue ID to trigger.
@@ -24,6 +28,8 @@ const QUEUE_ID = 'demo-data-processor';
 export default function QueueDemoPage() {
   const [operation, setOperation] = useState<'analyze' | 'transform' | 'validate'>('analyze');
   const [dataSize, setDataSize] = useState('10');
+  const [isSubmittingDecision, setIsSubmittingDecision] = useState(false);
+  const [hitlFormState, setHitlFormState] = useState<Partial<DemoDataProcessorHitlInput>>({});
 
   const {
     trigger,
@@ -34,6 +40,8 @@ export default function QueueDemoPage() {
     loading,
     polling,
     reset,
+    hitlTask,
+    submitHitlDecision,
   } = useWorkflowJob({
     type: 'queue',
     queueId: QUEUE_ID,
@@ -54,10 +62,48 @@ export default function QueueDemoPage() {
       data,
       operation,
       batchSize: Math.min(5, Math.ceil(size / 2)),
+      // Prototype-only context payload to show how UI could be bootstrapped.
+      // Final architecture will produce this snapshot in runtime.
+      hitlContext: {
+        requestedBy: 'queue-demo-page',
+        requestedAt: new Date().toISOString(),
+      },
     });
   };
 
+  const handleSubmitDecision = async () => {
+    if (!submitHitlDecision || !hitlTask) return;
+    setIsSubmittingDecision(true);
+    try {
+      const parsed = demoDataProcessorHitlInputSchema.safeParse(hitlFormState);
+      if (!parsed.success) {
+        console.error('HITL validation:', parsed.error.flatten());
+        return;
+      }
+      await submitHitlDecision({
+        decision: parsed.data.decision === 'reject' ? 'reject' : 'approve',
+        reviewerId: 'demo-user-1',
+        comment: parsed.data.reviewNotes,
+        input: parsed.data,
+      });
+    } catch (e) {
+      console.error('Prototype HITL submit failed:', e);
+    } finally {
+      setIsSubmittingDecision(false);
+    }
+  };
+
   const queueJob = output && 'steps' in output ? (output as QueueJobResult) : null;
+
+  useEffect(() => {
+    if (!hitlTask) return;
+    setHitlFormState({
+      decision: 'approve',
+      reviewNotes: '',
+      correctedOperation: undefined,
+      maxItemsToProcess: undefined,
+    });
+  }, [hitlTask]);
 
   return (
     <div className="container mx-auto px-4 py-8 max-w-4xl">
@@ -78,7 +124,7 @@ export default function QueueDemoPage() {
             2s delay
           </Badge>
           <Badge variant="secondary" className="ml-1">
-            mapInputFromPrev
+            chain
           </Badge>
         </div>
       </div>
@@ -180,6 +226,128 @@ export default function QueueDemoPage() {
                     </code>
                   )}
                 </div>
+
+                {hitlTask && (
+                  <div className="rounded-lg border p-4 bg-amber-50 dark:bg-amber-950 border-amber-200 dark:border-amber-800 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="text-sm font-semibold">HITL checkpoint waiting for review</p>
+                        <p className="text-xs text-muted-foreground">
+                          taskId: <code>{hitlTask.taskId}</code> · worker: <code>{hitlTask.workerId}</code>
+                        </p>
+                      </div>
+                      <Badge variant="secondary">awaiting_approval</Badge>
+                    </div>
+
+                    <div className="text-xs text-muted-foreground">
+                      Progress: {hitlTask.progress?.completedSteps ?? 0}/{hitlTask.progress?.totalSteps ?? 0} completed
+                      {' '}({hitlTask.progress?.percent ?? 0}%)
+                    </div>
+
+                    <div className="rounded border bg-background p-2">
+                      <p className="text-xs font-medium mb-1">Previous worker outputs (prototype contract)</p>
+                      <pre className="text-xs whitespace-pre-wrap break-words">
+                        {JSON.stringify(hitlTask.previousOutputs ?? [], null, 2)}
+                      </pre>
+                    </div>
+
+                    <div className="rounded border bg-background p-2">
+                      <p className="text-xs font-medium mb-1">UI spec (developer-defined)</p>
+                      <div className="text-xs text-muted-foreground space-y-1">
+                        <p>viewId: <code>{String((hitlTask.uiSpec as any)?.viewId ?? 'custom')}</code></p>
+                        <p>title: {String((hitlTask.uiSpec as any)?.title ?? 'Untitled HITL')}</p>
+                      </div>
+                    </div>
+
+                    <div className="grid gap-2 md:grid-cols-2">
+                      <div className="space-y-1">
+                        <Label>Decision</Label>
+                        <Select
+                          value={String(hitlFormState.decision ?? 'approve')}
+                          onValueChange={(v: DemoDataProcessorHitlInput['decision']) =>
+                            setHitlFormState((prev) => ({ ...prev, decision: v }))
+                          }
+                        >
+                          <SelectTrigger>
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="approve">approve</SelectItem>
+                            <SelectItem value="reject">reject</SelectItem>
+                            <SelectItem value="needs_changes">needs_changes</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <div className="space-y-1">
+                        <Label>Corrected operation (optional)</Label>
+                        <Select
+                          value={hitlFormState.correctedOperation ?? '__none__'}
+                          onValueChange={(v: string) =>
+                            setHitlFormState((prev) => ({
+                              ...prev,
+                              correctedOperation:
+                                v === '__none__'
+                                  ? undefined
+                                  : (v as NonNullable<DemoDataProcessorHitlInput['correctedOperation']>),
+                            }))
+                          }
+                        >
+                          <SelectTrigger>
+                            <SelectValue placeholder="(unchanged)" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="__none__">(unchanged)</SelectItem>
+                            <SelectItem value="analyze">analyze</SelectItem>
+                            <SelectItem value="transform">transform</SelectItem>
+                            <SelectItem value="validate">validate</SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </div>
+                      <div className="space-y-1 md:col-span-2">
+                        <Label>Review notes (min 10 chars)</Label>
+                        <textarea
+                          value={String(hitlFormState.reviewNotes ?? '')}
+                          onChange={(e) =>
+                            setHitlFormState((prev) => ({ ...prev, reviewNotes: e.target.value }))
+                          }
+                          className="w-full min-h-24 rounded-md border bg-background p-2 text-sm"
+                          placeholder="Explain your review"
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <Label>Max items to process (optional)</Label>
+                        <Input
+                          type="number"
+                          min={1}
+                          value={
+                            hitlFormState.maxItemsToProcess === undefined
+                              ? ''
+                              : String(hitlFormState.maxItemsToProcess)
+                          }
+                          onChange={(e) => {
+                            const raw = e.target.value;
+                            setHitlFormState((prev) => ({
+                              ...prev,
+                              maxItemsToProcess:
+                                raw === '' ? undefined : Math.max(1, Number(raw) || 1),
+                            }));
+                          }}
+                        />
+                      </div>
+                    </div>
+
+                    <Button
+                      onClick={handleSubmitDecision}
+                      disabled={isSubmittingDecision}
+                      className="w-full"
+                    >
+                      {isSubmittingDecision ? (
+                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                      ) : null}
+                      Submit HITL Decision (prototype API)
+                    </Button>
+                  </div>
+                )}
 
                 {queueJob?.steps && queueJob.steps.length > 0 && (
                   <div className="space-y-3">
@@ -289,13 +457,19 @@ export default function QueueDemoPage() {
             <div className="space-y-2">
               <h4 className="font-medium text-sm">Data Passing</h4>
               <p className="text-xs text-muted-foreground">
-                <code className="text-xs">mapInputFromPrev</code> transforms output from one step to input for the next
+                <code className="text-xs">chain</code> transforms output from one step to input for the next
               </p>
             </div>
             <div className="space-y-2">
               <h4 className="font-medium text-sm">Delayed Steps</h4>
               <p className="text-xs text-muted-foreground">
                 <code className="text-xs">delaySeconds</code> adds a 2-second delay before step 2 executes
+              </p>
+            </div>
+            <div className="space-y-2">
+              <h4 className="font-medium text-sm">Prototype HITL UI</h4>
+              <p className="text-xs text-muted-foreground">
+                Demonstrates a headless HITL contract where custom UI can show progress + previous outputs and submit arbitrary reviewer input.
               </p>
             </div>
           </div>

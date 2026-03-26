@@ -171,6 +171,7 @@ type WorkerHandler<INPUT, OUTPUT> = (args: {
   ctx: {
     jobId: string;
     workerId: string;
+    userId?: string;         // From DispatchOptions.userId
     jobStore?: JobStore;
     /** Logger with prefixed levels: [INFO], [WARN], [ERROR], [DEBUG] */
     logger: {
@@ -180,6 +181,16 @@ type WorkerHandler<INPUT, OUTPUT> = (args: {
       debug(message: string, data?: Record<string, unknown>): void;
     };
     dispatchWorker: (workerId: string, input: unknown, options?: DispatchWorkerOptions) => Promise<{ jobId: string; messageId?: string; output?: unknown }>;
+    /** Report LLM token usage after each call. Throws TokenBudgetExceededError if maxTokens exceeded. */
+    reportTokenUsage: (usage: { inputTokens: number; outputTokens: number }) => Promise<void>;
+    /** Get current token usage and remaining budget for this job. */
+    getTokenBudget: () => { used: number; budget: number | null; remaining: number | null };
+    /** Populated on retry attempts (attempt ≥ 2). Undefined on first attempt. */
+    retryContext?: {
+      attempt: number;
+      maxAttempts: number;
+      lastError: { message: string; name: string; stack?: string; code?: string | number };
+    };
   };
 }) => Promise<OUTPUT>;
 ```
@@ -188,6 +199,154 @@ type WorkerHandler<INPUT, OUTPUT> = (args: {
 - `ctx.jobStore` lets you update job status, progress, and output.
 - `ctx.logger` logs with predefined prefixes: `ctx.logger.info('start')` → `[INFO] [workerId] [jobId] start`; use `warn`, `error`, and `debug` (debug only when `DEBUG` or `WORKER_DEBUG` is set) for consistent worker logs.
 - `ctx.dispatchWorker(workerId, input, options?)` lets you call another worker from inside this worker (fire-and-forget or await). See [Worker-to-worker](#worker-to-worker) below.
+- `ctx.reportTokenUsage({ inputTokens, outputTokens })` accumulates LLM usage and throws `TokenBudgetExceededError` when `maxTokens` is exceeded. See [Token Budget](#token-budget) below.
+- `ctx.retryContext` is populated on retries — use it to inject the previous error into your next prompt for self-correction. See [Smart Retry](#smart-retry) below.
+
+## Smart Retry
+
+Workers support **in-process smart retry**: when the handler throws a matching error, the runtime retries it in the same Lambda invocation (no SQS re-delivery, job stays `running`). On each retry, `ctx.retryContext` is populated so the handler can self-correct.
+
+### Configuration
+
+Pass a `retry` config to `createWorker`:
+
+```typescript
+import { createWorker } from '@microfox/ai-worker';
+
+export default createWorker({
+  id: 'my-worker',
+  inputSchema, outputSchema,
+
+  // Retry up to 3 times on rate-limit or JSON parse errors
+  retry: {
+    maxAttempts: 3,
+    on: ['rate-limit', 'json-parse'],
+  },
+
+  handler: async ({ input, ctx }) => {
+    // On retries, ctx.retryContext is populated:
+    if (ctx.retryContext) {
+      ctx.logger.warn(`Retry attempt ${ctx.retryContext.attempt}/${ctx.retryContext.maxAttempts}`, {
+        error: ctx.retryContext.lastError.message,
+      });
+    }
+    // ... handler logic
+  },
+});
+```
+
+### Built-in retry patterns
+
+| Pattern | Matches | Delay |
+|---------|---------|-------|
+| `'rate-limit'` | HTTP 429, `RateLimitError`, "rate limit" in message | 10s, 20s, 30s… |
+| `'json-parse'` | `SyntaxError`, `ZodError`, "json/parse" in message | Immediate (injects `ctx.retryContext`) |
+| `'overloaded'` | HTTP 529, "overloaded/model is busy" in message | 15s, 30s… |
+| `'server-error'` | HTTP 5xx, "internal server error/service unavailable" | 5s, 10s… |
+
+### Custom retry patterns
+
+```typescript
+retry: {
+  maxAttempts: 5,
+  on: [
+    'rate-limit',               // built-in
+    {
+      // Custom: retry on any validation error
+      match: /validation failed/i,
+      delayMs: 2000,
+      injectContext: true,      // populate ctx.retryContext.lastError
+    },
+    {
+      // Custom: retry based on error properties
+      match: (err) => err.code === 'ECONNRESET',
+      delayMs: (attempt) => attempt * 3000,  // progressive delay
+    },
+  ],
+},
+```
+
+### Self-correction pattern (LLM workers)
+
+```typescript
+handler: async ({ input, ctx }) => {
+  // Inject previous error into the prompt for self-correction
+  const errorHint = ctx.retryContext
+    ? `\n\nPrevious attempt failed: "${ctx.retryContext.lastError.message}". Fix your response.`
+    : '';
+
+  const response = await anthropic.messages.create({
+    messages: [{ role: 'user', content: input.prompt + errorHint }],
+    // ...
+  });
+
+  // Throws SyntaxError → matches 'json-parse' → triggers retry with ctx.retryContext
+  return JSON.parse(response.content[0].text);
+},
+```
+
+### Per-queue-step retry
+
+A queue step's `retry` overrides the worker-level retry for that step only:
+
+```typescript
+defineWorkerQueue({
+  id: 'pipeline',
+  steps: [
+    { workerId: 'fast-worker' },
+    {
+      workerId: 'llm-extractor',
+      retry: { maxAttempts: 5, on: ['rate-limit', 'json-parse'] },
+    },
+  ],
+});
+```
+
+> **Note**: `TokenBudgetExceededError` is **never retried**, regardless of which patterns are configured.
+
+## Token Budget
+
+The token budget feature lets you cap LLM usage per job dispatch. Pass `maxTokens` in `DispatchOptions`; the worker calls `ctx.reportTokenUsage()` after each LLM call and the runtime throws `TokenBudgetExceededError` (which terminates the job cleanly, never retried) when the total exceeds the limit.
+
+### Basic usage
+
+```typescript
+// Dispatch with a token budget
+await worker.dispatch(input, {
+  maxTokens: 50_000,   // total input + output tokens allowed for this job
+  metadata: { source: 'api' },
+});
+```
+
+```typescript
+// Inside the handler: report usage after each LLM call
+handler: async ({ input, ctx }) => {
+  const response = await anthropic.messages.create({ /* ... */ });
+
+  // Accumulates usage — throws TokenBudgetExceededError if limit exceeded
+  await ctx.reportTokenUsage({
+    inputTokens: response.usage.input_tokens,
+    outputTokens: response.usage.output_tokens,
+  });
+
+  // Check remaining budget before making more calls
+  const budget = ctx.getTokenBudget();
+  if (budget.remaining !== null && budget.remaining < 1000) {
+    ctx.logger.warn('Low token budget, stopping early', { remaining: budget.remaining });
+    return earlyResult();
+  }
+
+  // ... more LLM calls
+},
+```
+
+### Token usage observability
+
+Token usage is persisted to the job store after each `reportTokenUsage()` call, stored as `metadata.tokenUsage: { inputTokens, outputTokens, budget }`. You can read it from the job record via `GET /api/workflows/workers/:workerId/:jobId`.
+
+### With smart retry
+
+`TokenBudgetExceededError` is never retried — even if you have `'server-error'` or other patterns configured, the job will fail immediately when the budget is exceeded:
 
 ### Lambda deployment (WorkerConfig)
 
@@ -328,7 +487,7 @@ A **worker queue** is an ordered pipeline of workers: step 1 runs, then step 2 (
 
 ### How it works
 
-1. **Definition** – Queues are defined in `.queue.ts` files (or via the workers config API) with an `id` and a `steps` array of `{ workerId, delaySeconds?, mapInputFromPrev? }`.
+1. **Definition** – Queues are defined in `.queue.ts` files with an `id` and a `steps` array. Each step has: `workerId` (required), `delaySeconds?`, `chain?` (input mapping), `resume?` (HITL merge), `requiresApproval?` (pause for human review), `hitl?` (UI metadata), and `loop?` (repeat logic).
 2. **Dispatch** – You POST to the queue-start API (or use `dispatchQueue(queueId, input, options)` from `@microfox/ai-worker`). The **first worker’s input** is passed directly (no mapping for step 0). The queue-start handler creates the queue job record and enqueues the first worker with **queue context** (`__workerQueue`) in the job input.
 3. **Chaining** – When the first worker completes, the runtime (queue-aware wrapper) looks up the next step, maps input from the previous output if configured, and calls `ctx.dispatchWorker(next.workerId, nextInput)`. This repeats until the last step finishes.
 4. **Queue job store** – A single **queue job** record (same MongoDB/Redis store as worker jobs) tracks the whole run. The **queue-start handler** (Lambda) creates/upserts it before enqueuing the first worker, so you can poll `GET /api/workflows/queues/:queueId/:id` for progress.
@@ -372,8 +531,39 @@ Or use `dispatchQueue(queueId, input, { metadata, jobId })` from `@microfox/ai-w
 - **POST /api/workflows/queues/:queueId** – trigger a queue (body: `input?`, `metadata?`, `jobId?`)
 - **GET /api/workflows/queues/:queueId/:jobId** – get queue job status
 - **GET /api/workflows/queues** or **GET /api/workflows/queues?queueId=...** – list queue jobs
+- **POST /api/workflows/queues/:queueId/approve** – HITL: approve or reject a paused step (body: `queueJobId`, `decision`, `input?`, `comment?`, `reviewerId?`)
 
 Optional app logic (e.g. cooldown) can list recent jobs for a queue via the same API or the job store before triggering.
+
+### Human-in-the-loop (HITL) queue steps
+
+A queue step with `requiresApproval: true` pauses after the previous step completes. The queue job status becomes `awaiting_approval` and polling stops advancing until a human submits a decision. Add a `chain` function to shape the input before the pause, a `resume` function to merge the reviewer's payload when resumed, and a `hitl` config for UI metadata. Use `useWorkflowJob`'s `hitlTask` and `submitHitlDecision` helpers on the frontend.
+
+```typescript
+import { defineWorkerQueue, defineHitlConfig } from '@microfox/ai-worker/queue';
+import { z } from 'zod';
+
+export default defineWorkerQueue({
+  id: 'approval-pipeline',
+  steps: [
+    { workerId: 'prepare-data' },
+    {
+      workerId: 'review-step',
+      requiresApproval: true,
+      chain: 'passthrough',
+      resume: (ctx) => ({ ...ctx.pendingInput, decision: ctx.reviewerInput }),
+      hitl: defineHitlConfig({
+        taskKey: 'data-review',
+        ui: { type: 'schema-form', title: 'Review the prepared data' },
+        inputSchema: z.object({ approved: z.boolean(), comment: z.string().optional() }),
+      }),
+    },
+    { workerId: 'finalize' },
+  ],
+});
+```
+
+See [HITL Queues](../advanced/hitl-queues) for the full guide, including looping steps, custom view components, and the approve endpoint contract.
 
 ## Dispatching workers
 
@@ -421,7 +611,13 @@ const { trigger, status, output, ... } = useWorkflowJob({
 });
 ```
 
-**Options (both worker and queue):** `baseUrl`, `pollIntervalMs`, `pollTimeoutMs`, `autoPoll`, `onComplete`, `onError`, `enabled`. **Returned:** `trigger(input?)`, `jobId`, `status` (`idle` | `queued` | `running` | `completed` | `failed` | `partial`), `output`, `error`, `loading`, `polling`, `reset()`.
+**Options (both worker and queue):** `baseUrl`, `pollIntervalMs`, `pollTimeoutMs`, `autoPoll`, `onComplete`, `onError`, `enabled`. **Returned:** `trigger(input?)`, `jobId`, `status` (`idle` | `queued` | `running` | `awaiting_approval` | `completed` | `failed` | `partial`), `output`, `error`, `loading`, `polling`, `reset()`.
+
+**Queue-only HITL helpers:**
+- `hitlTask` – derived `QueueHitlTask` when a step is `awaiting_approval`; has `taskId`, `queueJobId`, `stepIndex`, `workerId`, `progress`, `previousOutputs`, `uiSpec`, `inputSchema`
+- `submitHitlDecision(payload)` – POSTs `{ decision, input?, comment?, reviewerId? }` to the approve endpoint; `decision` is `'approve'` or `'reject'`
+
+When a step is paused, `status === 'awaiting_approval'`, `polling` remains `true`, and the poll timeout resets to give the reviewer unlimited time (the timeout only counts active processing time).
 
 ### From server code
 

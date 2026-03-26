@@ -16,7 +16,7 @@ import { MongoClient, type Collection } from 'mongodb';
 type QueueJobStep = {
   workerId: string;
   workerJobId: string;
-  status: 'queued' | 'running' | 'completed' | 'failed';
+  status: 'queued' | 'running' | 'awaiting_approval' | 'completed' | 'failed';
   input?: unknown;
   output?: unknown;
   error?: { message: string };
@@ -31,6 +31,7 @@ type QueueJobDoc = {
   status: 'running' | 'completed' | 'failed' | 'partial';
   steps: QueueJobStep[];
   metadata?: Record<string, unknown>;
+  userId?: string;
   createdAt: string;
   updatedAt: string;
   completedAt?: string;
@@ -114,7 +115,7 @@ function queueKey(id: string): string {
   return `${queueKeyPrefix}${id}`;
 }
 
-type QueueJobRecord = Omit<QueueJobDoc, '_id'>;
+type QueueJobRecord = Omit<QueueJobDoc, '_id'> & { userId?: string };
 
 /** Hash values from Upstash hgetall may be auto-parsed (array/object) or raw strings. */
 function stepsFromHash(val: unknown): QueueJobStep[] {
@@ -155,6 +156,7 @@ async function loadQueueJobRedis(queueJobId: string): Promise<QueueJobRecord | n
     status: (String(d.status ?? 'running') as QueueJobRecord['status']),
     steps: stepsFromHash(d.steps),
     metadata: metadataFromHash(d.metadata),
+    ...(d.userId ? { userId: String(d.userId) } : {}),
     createdAt: String(d.createdAt ?? new Date().toISOString()),
     updatedAt: String(d.updatedAt ?? new Date().toISOString()),
     completedAt: d.completedAt != null ? String(d.completedAt) : undefined,
@@ -175,9 +177,8 @@ async function saveQueueJobRedis(record: QueueJobRecord): Promise<void> {
     createdAt: record.createdAt || now,
     updatedAt: record.updatedAt || now,
   };
-  if (record.completedAt) {
-    toSet.completedAt = record.completedAt;
-  }
+  if (record.completedAt) toSet.completedAt = record.completedAt;
+  if (record.userId) toSet.userId = record.userId;
   await redis.hset(key, toSet);
   if (queueJobTtlSeconds > 0) {
     await redis.expire(key, queueJobTtlSeconds);
@@ -207,8 +208,9 @@ export async function upsertInitialQueueJob(options: {
   firstWorkerId: string;
   firstWorkerJobId: string;
   metadata?: Record<string, any>;
+  userId?: string;
 }): Promise<void> {
-  const { queueJobId, queueId, firstWorkerId, firstWorkerJobId, metadata } = options;
+  const { queueJobId, queueId, firstWorkerId, firstWorkerJobId, metadata, userId } = options;
   const now = new Date().toISOString();
 
   if (preferMongo()) {
@@ -246,6 +248,7 @@ export async function upsertInitialQueueJob(options: {
           },
         ],
         metadata: metadata ?? {},
+        ...(userId ? { userId } : {}),
         createdAt: now,
         updatedAt: now,
       };
@@ -286,6 +289,7 @@ export async function upsertInitialQueueJob(options: {
           },
         ],
         metadata: metadata ?? {},
+        ...(userId ? { userId } : {}),
         createdAt: now,
         updatedAt: now,
       };
@@ -300,7 +304,7 @@ export async function updateQueueJobStepInStore(options: {
   stepIndex: number;
   workerId: string;
   workerJobId: string;
-  status: 'running' | 'completed' | 'failed';
+  status: 'running' | 'awaiting_approval' | 'completed' | 'failed';
   input?: unknown;
   output?: unknown;
   error?: { message: string };
@@ -428,7 +432,7 @@ export async function appendQueueJobStepInStore(options: {
 
 /**
  * Load a queue job by ID (for mapping context: previous step outputs).
- * Used by wrapHandlerForQueue when invoking mapInputFromPrev with previousOutputs.
+ * Used by wrapHandlerForQueue for chain mapping and HITL resume (`previousOutputs`).
  */
 export async function getQueueJob(queueJobId: string): Promise<{
   id: string;

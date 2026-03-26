@@ -1,64 +1,56 @@
-import { defineWorkerQueue } from '@microfox/ai-worker';
+import {
+  defineHitlConfig,
+  defineWorkerQueue,
+  type ChainContext,
+  type HitlResumeContext,
+  type SmartRetryConfig,
+} from '@microfox/ai-worker';
+import { z } from 'zod';
 
-/**
- * Worker queue: demo-data-processor
- *
- * Multi-step demo queue showcasing all queue features:
- * 1. Sequential step execution
- * 2. Data passing between steps (mapInputFromPrev)
- * 3. Delayed step execution (delaySeconds)
- *
- * Pipeline:
- * - Step 1: demo (process mode) - Processes initial data array
- * - Step 2: results-aggregator - Aggregates and summarizes results (with 2s delay)
- *   Uses mapInputFromPrev to transform data-processor output into aggregator input
- */
-export default defineWorkerQueue({
-  id: 'demo-data-processor',
-  steps: [
-    // Step 1: Process the initial data
-    { workerId: 'demo' },
-    // Step 2: Aggregate results with a delay and data transformation
-    {
-      workerId: 'results-aggregator',
-      delaySeconds: 2, // Wait 2 seconds before starting aggregation
-      mapInputFromPrev: 'mapAggregatorInput', // Transform data-processor output
-    },
-  ],
-  // Every 5 minutes – comment out after testing to avoid unnecessary cron runs
-  // schedule: 'rate(5 minutes)',
+/** Reviewer form — import in UI from this queue file. */
+export const demoDataProcessorHitlInputSchema = z.object({
+  decision: z.enum(['approve', 'reject', 'needs_changes']),
+  reviewNotes: z.string().min(10),
+  correctedOperation: z.enum(['analyze', 'transform', 'validate']).optional(),
+  maxItemsToProcess: z.number().min(1).optional(),
+});
+export type DemoDataProcessorHitlInput = z.infer<typeof demoDataProcessorHitlInputSchema>;
+
+const reviewAggregatedResultsHitl = defineHitlConfig({
+  taskKey: 'review-aggregated-results',
+  timeoutSeconds: 60 * 60 * 24,
+  onTimeout: 'reject',
+  assignees: ['ops-team', 'risk-analyst'],
+  ui: {
+    type: 'custom',
+    viewId: 'queue-demo-hitl-v1',
+    title: 'Review transformed output before finalization',
+    sections: [
+      { type: 'progress' },
+      { type: 'previous-outputs', stepIndex: 0 },
+      { type: 'json-diff', left: 'raw', right: 'transformed' },
+      { type: 'form', schemaRef: 'QueueDemoReviewInput' },
+    ],
+  },
+  inputSchema: demoDataProcessorHitlInputSchema,
 });
 
-/** One previous step's output (for mapping context). */
-export type QueueStepOutput = {
-  stepIndex: number;
-  workerId: string;
-  output: unknown;
+type DemoProcessOutput = {
+  operation: 'analyze' | 'transform' | 'validate';
+  totalItems: number;
+  processed: number;
+  results: unknown[];
+  summary: { success: number; failed: number; duration: string };
 };
 
 /**
- * Mapping function: (initialInput, previousOutputs) → input for this step.
- * Best practice: first param is the original request, second is all prior step outputs.
- * Use previousOutputs[previousOutputs.length - 1]?.output for the immediate previous step; use index i for step i.
+ * Chain: transform data-processor output into aggregator input.
  */
-export function mapAggregatorInput(
-  initialInput: {
-    data: any[];
-    operation: 'analyze' | 'transform' | 'validate';
-    batchSize?: number;
-  },
-  previousOutputs: QueueStepOutput[]
-) {
-  const lastStep = previousOutputs.length > 0 ? previousOutputs[previousOutputs.length - 1] : undefined;
-  const prevOutput = lastStep?.output as {
-    operation: 'analyze' | 'transform' | 'validate';
-    totalItems: number;
-    processed: number;
-    results: any[];
-    summary: { success: number; failed: number; duration: string };
-  } | undefined;
+function chainToAggregator(ctx: ChainContext) {
+  const lastStep = ctx.previousOutputs[ctx.previousOutputs.length - 1];
+  const prevOutput = lastStep?.output as DemoProcessOutput | undefined;
   if (!prevOutput) {
-    throw new Error('mapAggregatorInput expects previous step (demo process) output');
+    throw new Error('chainToAggregator expects previous step (demo process) output');
   }
   return {
     operation: prevOutput.operation,
@@ -68,3 +60,52 @@ export function mapAggregatorInput(
     summary: prevOutput.summary,
   };
 }
+
+/**
+ * Resume: on HITL approval, pass the stored pending domain input as-is.
+ * Reviewer fields (decision, notes) are auditing metadata, not aggregator input.
+ */
+function resumeAggregator(ctx: HitlResumeContext<DemoDataProcessorHitlInput>) {
+  return ctx.pendingInput;
+}
+
+/**
+ * Worker queue: demo-data-processor
+ *
+ * Multi-step demo queue showcasing:
+ * 1. Sequential step execution
+ * 2. Data passing between steps (`chain`)
+ * 3. Delayed step execution (`delaySeconds`)
+ * 4. HITL checkpoint (`requiresApproval` + `resume`)
+ *
+ * Pipeline:
+ * - Step 1: demo (process mode) — Processes initial data array
+ * - Step 2: results-aggregator — Aggregates and summarizes results (with 2s delay,
+ *   HITL approval required before proceeding)
+ */
+// Step 1 retry: transient infra errors only (not json-parse — demo worker doesn't do LLM calls).
+const step1Retry: SmartRetryConfig = { maxAttempts: 3, on: ['rate-limit', 'server-error'] };
+
+// Step 2 retry: rate limits only; ctx.retryContext.lastError available in the aggregator handler.
+const step2Retry: SmartRetryConfig = { maxAttempts: 2, on: ['rate-limit'] };
+
+export default defineWorkerQueue({
+  id: 'demo-data-processor',
+  steps: [
+    {
+      workerId: 'demo',
+      retry: step1Retry,
+    },
+    {
+      workerId: 'results-aggregator',
+      delaySeconds: 2,
+      chain: chainToAggregator,
+      resume: resumeAggregator,
+      requiresApproval: true,
+      hitl: reviewAggregatedResultsHitl,
+      retry: step2Retry,
+    },
+  ],
+  // Every 5 minutes – comment out after testing to avoid unnecessary cron runs
+  // schedule: 'rate(5 minutes)',
+});

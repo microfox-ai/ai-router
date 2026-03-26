@@ -220,6 +220,17 @@ export class AgentDefinitionMissingError extends AiKitError {
   }
 }
 
+export class TokenBudgetExceededError extends AiKitError {
+  public readonly used: number;
+  public readonly budget: number;
+  constructor(used: number, budget: number) {
+    super(`Token budget exceeded: used ${used} tokens (budget: ${budget})`);
+    this.name = 'TokenBudgetExceededError';
+    this.used = used;
+    this.budget = budget;
+  }
+}
+
 // --- Dynamic Parameter Support ---
 
 /**
@@ -364,6 +375,36 @@ export type AiContext<
     input?: Record<string, unknown>,
     options?: DispatchWorkerOptions
   ) => Promise<DispatchWorkerResult>;
+
+  /**
+   * Track token usage for the current request. Call after each LLM API call.
+   * Accumulates across all agents in the request.
+   * Throws TokenBudgetExceededError if the `maxTokens` budget (set in handle()) is exceeded.
+   *
+   * @example
+   * ```ts
+   * const result = await generateObject({ model, schema, prompt });
+   * ctx.trackTokenUsage(result.usage);  // { inputTokens, outputTokens }
+   * ```
+   */
+  trackTokenUsage(usage: { inputTokens: number; outputTokens: number }): void;
+
+  /**
+   * Get the current token usage and remaining budget for this request.
+   * Returns `{ budget: null, remaining: null }` when no maxTokens was set.
+   */
+  getTokenBudget(): { used: number; budget: number | null; remaining: number | null };
+
+  /**
+   * Populated on retry attempts when using `withRetry()`. Contains info about the
+   * previous failure so the handler can self-correct (e.g. inject error into prompt).
+   * `undefined` on the first attempt.
+   */
+  retryContext?: {
+    attempt: number;
+    maxAttempts: number;
+    lastError: { message: string; name: string; stack?: string; code?: string | number };
+  };
 
   _onExecutionStart?: () => void;
   _onExecutionEnd?: () => void;
@@ -936,6 +977,10 @@ export class AiRouter<
         options.path,
         newCallDepth
       ),
+      // Token tracker is shared across all sub-agents (accumulates per request).
+      trackTokenUsage: parentCtx.trackTokenUsage,
+      getTokenBudget: parentCtx.getTokenBudget,
+      retryContext: undefined, // reset per sub-agent; withRetry sets it on its own ctx
       next: undefined as any, // Will be replaced right after
     };
 
@@ -1237,7 +1282,10 @@ export class AiRouter<
       | 'logger'
       | 'executionContext'
       | 'store'
-    >
+      | 'trackTokenUsage'
+      | 'getTokenBudget'
+      | 'retryContext'
+    > & { maxTokens?: number }
   ): Response {
     this.logger?.log(`Handling request for path: ${path}`);
     const self = this; // Reference to the router instance
@@ -1271,11 +1319,17 @@ export class AiRouter<
       | 'logger'
       | 'executionContext'
       | 'store'
-    >,
+      | 'trackTokenUsage'
+      | 'getTokenBudget'
+      | 'retryContext'
+    > & { maxTokens?: number },
     executionCompletionPromise: Promise<void>,
     executionCompletionResolver: (() => void) | null
   ) {
     const self = this;
+    // Extract maxTokens before entering the stream (not part of AiContext shape).
+    const maxTokens = (initialContext as any).maxTokens as number | undefined;
+
     return createUIMessageStream({
       originalMessages: initialContext.request.messages,
       execute: async ({ writer }) => {
@@ -1287,6 +1341,21 @@ export class AiRouter<
         // type of store, we assume it's designed to be shared.
         const store =
           self._store instanceof MemoryStore ? new MemoryStore() : self._store;
+
+        // Per-request token tracker — accumulates across all agents in the request.
+        let tokenUsed = 0;
+        const tokenBudget = maxTokens ?? null;
+        const trackTokenUsage = (usage: { inputTokens: number; outputTokens: number }): void => {
+          tokenUsed += (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0);
+          if (tokenBudget !== null && tokenUsed > tokenBudget) {
+            throw new TokenBudgetExceededError(tokenUsed, tokenBudget);
+          }
+        };
+        const getTokenBudget = () => ({
+          used: tokenUsed,
+          budget: tokenBudget,
+          remaining: tokenBudget !== null ? Math.max(0, tokenBudget - tokenUsed) : null,
+        });
 
         const ctx: AiContext<
           KIT_METADATA,
@@ -1317,6 +1386,9 @@ export class AiRouter<
           },
           next: undefined as any, // Will be replaced right after
           dispatchWorker,
+          trackTokenUsage,
+          getTokenBudget,
+          retryContext: undefined,
           _onExecutionStart: () => {
             self.pendingExecutions++;
             self.logger?.log(
@@ -1418,7 +1490,10 @@ export class AiRouter<
       | 'logger'
       | 'executionContext'
       | 'store'
-    >
+      | 'trackTokenUsage'
+      | 'getTokenBudget'
+      | 'retryContext'
+    > & { maxTokens?: number }
   ): Promise<Response> {
     this.logger?.log(`Handling request for path: ${path}`);
     const self = this; // Reference to the router instance

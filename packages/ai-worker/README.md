@@ -197,6 +197,28 @@ handler: async ({ ctx }) => {
 
 The CLI detects `ctx.dispatchWorker('id', ...)` and adds `WORKER_QUEUE_URL_<ID>` to that Lambda’s env. Local dev uses the HTTP trigger when queue URL is not set.
 
+### Worker queues and HITL (human-in-the-loop)
+
+- **Pause:** When a step has `requiresApproval: true`, `wrapHandlerForQueue` stops **before** dispatching that step, marks the next step `awaiting_approval`, and stores the computed pending input. The target worker does not run until approval.
+- **Resume:** `POST .../approve` should call `dispatchWorker` for **that** step only (same `workerJobId`), passing **`{ ...pendingInput, __hitlInput, __hitlDecision }`**. **`wrapHandlerForQueue`** runs **`mapInputFromPrev`** again with **`hitlInput`** / **`pendingStepInput`** on the context so the worker receives merged domain input (no separate app-side merge module).
+- **Types:** Import **`MapStepInputContext`** from `@microfox/ai-worker` for mapper functions; use `satisfies WorkerQueueConfig<YourInitial, YourStepOutput>` on `defineWorkerQueue({...})` to document contracts.
+
+#### Optional `chainStrategy` on a step
+
+- **`custom`** or **omitted** — one **`mapInputFromPrev`** export handles **both** advancing the chain and HITL resume (legacy behavior).
+- **`passthrough`** — chain path uses **`defaultMapChainPassthrough`**; resume still uses **`mapInputFromPrev`** when `hitlInput` + `pendingStepInput` are present.
+- **`continueFromPrevious`** — chain path uses **`defaultMapChainContinueFromPrevious`**; resume still uses **`mapInputFromPrev`**.
+
+#### Worker input: orchestration envelope
+
+Merge your domain Zod object with **`withQueueOrchestrationEnvelope(domainSchema)`**, or intersect a union with **`queueOrchestrationFieldsSchema`**, so `__workerQueue` / HITL keys are accepted without loosening the whole schema.
+
+#### HITL step metadata (`defineHitlConfig`)
+
+Import **`defineHitlConfig`**, **`HitlStepConfig`**, and **`HitlUiSpec`** from **`@microfox/ai-worker`** and pass the result as **`hitl`** on a queue step (with **`requiresApproval: true`**). This is a typed authoring helper; runtime pause behavior is still driven by **`requiresApproval`**.
+
+Full field semantics and lifecycle are documented in the `queue` module JSDoc (`WorkerQueueStep`, `WorkerQueueConfig`).
+
 ## License
 
 MIT

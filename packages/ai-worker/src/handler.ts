@@ -25,6 +25,10 @@ import {
   upsertInitialQueueJob,
   getQueueJob,
 } from './queueJobStore';
+import type { WorkerQueueContext, ChainContext, HitlResumeContext, QueueStepOutput, LoopContext } from './queue';
+import { QUEUE_ORCHESTRATION_KEYS } from './queue';
+import { type SmartRetryConfig, type RetryContext, executeWithRetry, matchesRetryPattern } from './retryConfig.js';
+import { type TokenUsage, TokenBudgetExceededError, createTokenTracker } from './tokenBudget.js';
 
 export interface JobStoreUpdate {
   status?: 'queued' | 'running' | 'completed' | 'failed';
@@ -48,6 +52,7 @@ export interface JobRecord {
   error?: { message: string; stack?: string };
   metadata?: Record<string, any>;
   internalJobs?: Array<{ jobId: string; workerId: string }>;
+  userId?: string;
   createdAt: string;
   updatedAt: string;
   completedAt?: string;
@@ -133,6 +138,8 @@ export interface WorkerHandlerParams<INPUT, OUTPUT> {
     jobId: string;
     workerId: string;
     requestId?: string;
+    /** ID of the user who triggered this job. Pass via DispatchOptions.userId from your API route. */
+    userId?: string;
     /**
      * Job store interface for updating and retrieving job state.
      * Uses MongoDB directly when configured; never HTTP/origin URL.
@@ -151,9 +158,40 @@ export interface WorkerHandlerParams<INPUT, OUTPUT> {
       input: unknown,
       options?: DispatchWorkerOptions
     ) => Promise<{ jobId: string; messageId?: string; output?: unknown }>;
+    /**
+     * Report token usage after an LLM call. Accumulates across all calls in this job.
+     * Throws TokenBudgetExceededError if the configured maxTokens budget is exceeded.
+     * Also persists usage to the job store for observability.
+     *
+     * @example
+     * ```ts
+     * const result = await anthropic.messages.create({ ... });
+     * await ctx.reportTokenUsage({
+     *   inputTokens: result.usage.input_tokens,
+     *   outputTokens: result.usage.output_tokens,
+     * });
+     * ```
+     */
+    reportTokenUsage: (usage: TokenUsage) => Promise<void>;
+    /**
+     * Get the current token usage and remaining budget for this job.
+     * Returns `{ used, budget: null, remaining: null }` when no maxTokens was set.
+     */
+    getTokenBudget: () => { used: number; budget: number | null; remaining: number | null };
+    /**
+     * Populated on retry attempts (attempt >= 2). Contains info about the previous failure
+     * so the handler can self-correct (e.g. inject the error message into the next prompt).
+     * `undefined` on the first attempt — use `if (ctx.retryContext)` to detect retries.
+     */
+    retryContext?: RetryContext;
     [key: string]: any;
   };
 }
+
+// Re-export retry and token types so consumers can import from '@microfox/ai-worker'
+export type { SmartRetryConfig, RetryContext, BuiltInRetryPattern, CustomRetryPattern, RetryPattern } from './retryConfig.js';
+export type { TokenUsage, TokenBudgetState } from './tokenBudget.js';
+export { TokenBudgetExceededError } from './tokenBudget.js';
 
 export type WorkerHandler<INPUT, OUTPUT> = (
   params: WorkerHandlerParams<INPUT, OUTPUT>
@@ -163,34 +201,169 @@ export type WorkerHandler<INPUT, OUTPUT> = (
 export interface QueueNextStep {
   workerId: string;
   delaySeconds?: number;
-  mapInputFromPrev?: string;
+  requiresApproval?: boolean;
+  /** Whether this step has a `chain` function (or built-in string) defined. */
+  hasChain?: boolean;
+  /** Whether this step has a `resume` function defined. */
+  hasResume?: boolean;
+  /** Optional HITL metadata from queue step config (UI/tooling only). */
+  hitl?: { ui?: unknown } | unknown;
+  /** Smart retry config for this step. Overrides worker-level retry for this step only. */
+  retry?: SmartRetryConfig;
 }
 
-/** One previous step's output (for mapInputFromPrev context). */
-export interface QueueStepOutput {
-  stepIndex: number;
-  workerId: string;
-  output: unknown;
+// QueueStepOutput, ChainContext, HitlResumeContext are imported from './queue'
+// and re-exported via index.ts. No local definitions needed.
+
+/**
+ * @deprecated Use {@link ChainContext} for the normal chain path and
+ * {@link HitlResumeContext} for the HITL resume path instead.
+ * Kept for backwards compatibility with queue files written against the old API.
+ */
+export interface MapStepInputContext {
+  initialInput: unknown;
+  previousOutputs: QueueStepOutput[];
+  /** @deprecated Use HitlResumeContext.reviewerInput instead. */
+  hitlInput?: unknown;
+  /** @deprecated Use HitlResumeContext.pendingInput instead. */
+  pendingStepInput?: Record<string, unknown>;
 }
+
+// Re-export new types so consumers can import from '@microfox/ai-worker/handler'
+export type { ChainContext, HitlResumeContext, QueueStepOutput, LoopContext } from './queue';
 
 /** Runtime helpers for queue-aware wrappers (provided by generated registry). */
 export interface QueueRuntime {
   getNextStep(queueId: string, stepIndex: number): QueueNextStep | undefined;
-  /** Optional: when provided, mapping can use outputs from any previous step. */
+  /** Step config at `stepIndex`. */
+  getStepAt?(queueId: string, stepIndex: number): QueueNextStep | undefined;
+  /** Optional: when provided, mappers can use outputs from any previous step. */
   getQueueJob?(queueJobId: string): Promise<{ steps: Array<{ workerId: string; output?: unknown }> } | null>;
-  /** (initialInput, previousOutputs) – previousOutputs includes outputs for steps 0..stepIndex-1 and current step. */
-  invokeMapInput?(
-    queueId: string,
-    stepIndex: number,
-    initialInput: unknown,
-    previousOutputs: QueueStepOutput[]
-  ): Promise<unknown> | unknown;
+  /**
+   * Build the input for a step when the queue advances normally (no HITL resume).
+   * Calls the step's `chain` function, or the built-in passthrough/continueFromPrevious.
+   */
+  invokeChain?(queueId: string, stepIndex: number, ctx: ChainContext): Promise<unknown> | unknown;
+  /**
+   * Build the domain input for a step when it resumes after HITL approval.
+   * Calls the step's `resume` function, or merges pendingInput + reviewerInput by default.
+   */
+  invokeResume?(queueId: string, stepIndex: number, ctx: HitlResumeContext): Promise<unknown> | unknown;
+  /**
+   * Evaluate whether a looping step should run again.
+   * Calls the step's `loop.shouldContinue` function. Returns false if none defined.
+   */
+  invokeLoop?(queueId: string, stepIndex: number, ctx: LoopContext): Promise<boolean> | boolean;
 }
 
 const WORKER_QUEUE_KEY = '__workerQueue';
+
+/** Build previous step outputs when resuming step `stepIndex` (excludes step `stepIndex` itself). */
+async function loadPreviousOutputsBeforeStep(
+  queueRuntime: QueueRuntime,
+  queueJobId: string | undefined,
+  beforeStepIndex: number
+): Promise<QueueStepOutput[]> {
+  if (!queueJobId || typeof queueRuntime.getQueueJob !== 'function') {
+    return [];
+  }
+  try {
+    const job = await queueRuntime.getQueueJob(queueJobId);
+    if (!job?.steps) return [];
+    return job.steps
+      .slice(0, beforeStepIndex)
+      .map((s, i) => ({ stepIndex: i, workerId: s.workerId, output: s.output }));
+  } catch (e: any) {
+    if (process.env.AI_WORKER_QUEUES_DEBUG === '1') {
+      console.warn('[Worker] getQueueJob failed (resume mapping):', e?.message ?? e);
+    }
+    return [];
+  }
+}
+
+/**
+ * When POST /approve forwards `__hitlInput`, call the step's `resume` function
+ * (via `queueRuntime.invokeResume`) to merge reviewer payload with the pending
+ * domain input. Runs before the user handler so it receives clean merged input.
+ */
+async function maybeApplyHitlResumeMapper<INPUT, OUTPUT>(
+  params: WorkerHandlerParams<INPUT, OUTPUT>,
+  queueRuntime: QueueRuntime
+): Promise<void> {
+  const inputObj = params.input as Record<string, unknown> | null;
+  if (!inputObj || typeof inputObj !== 'object') return;
+  if (!('__hitlInput' in inputObj)) return;
+
+  const wq = inputObj[WORKER_QUEUE_KEY] as WorkerQueueContext | undefined;
+  if (!wq?.id || typeof wq.stepIndex !== 'number') return;
+
+  const queueId = wq.id;
+  const stepIndex = wq.stepIndex;
+  const initialInput = wq.initialInput;
+  const queueJobId = wq.queueJobId;
+  const previousOutputs = await loadPreviousOutputsBeforeStep(queueRuntime, queueJobId, stepIndex);
+
+  // Build pending domain input — strip all envelope keys.
+  const pendingInput: Record<string, unknown> = { ...inputObj };
+  for (const key of QUEUE_ORCHESTRATION_KEYS) {
+    delete pendingInput[key];
+  }
+  delete pendingInput[WORKER_QUEUE_KEY];
+
+  const reviewerInput = inputObj.__hitlInput;
+  const decision = inputObj.__hitlDecision;
+
+  let merged: unknown;
+  if (typeof queueRuntime.invokeResume === 'function') {
+    merged = await queueRuntime.invokeResume(queueId, stepIndex, {
+      initialInput,
+      previousOutputs,
+      reviewerInput,
+      pendingInput,
+    });
+  } else {
+    // Default: shallow merge pendingInput + reviewerInput.
+    merged = {
+      ...pendingInput,
+      ...(reviewerInput !== null && typeof reviewerInput === 'object'
+        ? (reviewerInput as Record<string, unknown>)
+        : {}),
+    };
+  }
+
+  const mergedObj =
+    merged !== null && typeof merged === 'object'
+      ? (merged as Record<string, unknown>)
+      : { value: merged };
+
+  (params as { input: INPUT }).input = {
+    ...mergedObj,
+    [WORKER_QUEUE_KEY]: wq,
+    ...(decision !== undefined ? { __hitlDecision: decision } : {}),
+  } as INPUT;
+}
+
+/** Read embedded queue context from job input or metadata without `as any`. */
+function getWorkerQueueContext(
+  input: unknown,
+  metadata?: Record<string, unknown>
+): WorkerQueueContext | undefined {
+  const fromInput =
+    input !== null && typeof input === 'object' && WORKER_QUEUE_KEY in input
+      ? (input as Record<string, unknown>)[WORKER_QUEUE_KEY]
+      : undefined;
+  const fromMeta =
+    metadata !== undefined && typeof metadata === 'object' && WORKER_QUEUE_KEY in metadata
+      ? (metadata as Record<string, unknown>)[WORKER_QUEUE_KEY]
+      : undefined;
+  const q = fromInput ?? fromMeta;
+  if (q === null || typeof q !== 'object') return undefined;
+  return q as WorkerQueueContext;
+}
+
 async function notifyQueueJobStep(
   queueJobId: string,
-  action: 'start' | 'complete' | 'fail' | 'append',
+  action: 'start' | 'awaiting_approval' | 'complete' | 'fail' | 'append',
   params: {
     stepIndex?: number;
     workerJobId: string;
@@ -224,6 +397,8 @@ async function notifyQueueJobStep(
     const status =
       action === 'start'
         ? 'running'
+        : action === 'awaiting_approval'
+          ? 'awaiting_approval'
         : action === 'complete'
           ? 'completed'
           : action === 'fail'
@@ -250,6 +425,15 @@ async function notifyQueueJobStep(
       status,
     });
   } catch (err: any) {
+    // Append must succeed before we can complete the current step with a "next" step;
+    // otherwise step 0 complete + only 1 row in store marks the whole queue completed.
+    if (action === 'append') {
+      console.error('[Worker] Queue append failed (rethrowing):', {
+        queueJobId,
+        error: err?.message ?? String(err),
+      });
+      throw err;
+    }
     console.warn('[Worker] Queue job update error:', {
       queueJobId,
       action,
@@ -259,42 +443,223 @@ async function notifyQueueJobStep(
 }
 
 /**
- * Wraps a user handler so that when the job has __workerQueue context (from
- * dispatchQueue or queue cron), it dispatches the next worker in the sequence
- * after the handler completes. Uses literal worker IDs so the CLI env injection
- * picks up WORKER_QUEUE_URL_* for next-step workers.
+ * Wraps a user handler so that when the job has `__workerQueue` context (from
+ * `dispatchQueue` or queue cron), it dispatches the next worker in the sequence
+ * **after** the handler completes.
+ *
+ * All queue/HITL envelope keys (`__workerQueue`, `__hitlInput`, `__hitlDecision`,
+ * `__hitlPending`, `hitl`) are **stripped from `params.input` before the user handler
+ * runs** — workers receive clean domain input and do not need to accept these keys
+ * in their Zod schemas.
+ *
+ * **HITL resume:** When `__hitlInput` is present, `invokeResume` is called first to
+ * produce the merged domain input. **Chain advancement:** After a step completes,
+ * `invokeChain` is called to compute the next step's input.
  */
 export function wrapHandlerForQueue<INPUT, OUTPUT>(
   handler: WorkerHandler<INPUT, OUTPUT>,
   queueRuntime: QueueRuntime
-): WorkerHandler<INPUT & { __workerQueue?: { id: string; stepIndex: number; initialInput: unknown; queueJobId?: string } }, OUTPUT> {
+): WorkerHandler<INPUT, OUTPUT> {
   return async (params) => {
-    const queueContext = (params.input as any)?.[WORKER_QUEUE_KEY];
-    const output = await handler(params);
+    // 1. On HITL resume, merge reviewer payload into domain input first.
+    await maybeApplyHitlResumeMapper(params, queueRuntime);
 
-    if (!queueContext || typeof queueContext !== 'object' || !queueContext.id) {
+    const inputObj =
+      params.input !== null && typeof params.input === 'object'
+        ? (params.input as Record<string, unknown>)
+        : {};
+
+    // 2. Save queue context before stripping (needed for chain dispatch after handler).
+    const queueContextRaw = inputObj[WORKER_QUEUE_KEY];
+
+    // Resolve step-level retry config before stripping (uses queueId + stepIndex from envelope).
+    const queueCtxForRetry =
+      queueContextRaw && typeof queueContextRaw === 'object'
+        ? (queueContextRaw as WorkerQueueContext)
+        : undefined;
+    const stepRetryConfig: SmartRetryConfig | undefined =
+      queueCtxForRetry?.id && typeof queueCtxForRetry.stepIndex === 'number' &&
+      typeof queueRuntime.getStepAt === 'function'
+        ? (queueRuntime.getStepAt(queueCtxForRetry.id, queueCtxForRetry.stepIndex) as any)?.retry
+        : undefined;
+
+    // 3. Strip all orchestration keys so the user handler sees only domain input.
+    const domainInput: Record<string, unknown> = { ...inputObj };
+    for (const key of QUEUE_ORCHESTRATION_KEYS) {
+      delete domainInput[key];
+    }
+    delete domainInput[WORKER_QUEUE_KEY];
+    (params as { input: unknown }).input = domainInput;
+
+    // 4. Run user handler with clean domain input (with optional step-level retry).
+    let output: OUTPUT;
+    if (stepRetryConfig && stepRetryConfig.on.length > 0) {
+      output = await executeWithRetry(
+        async (retryCtx) => {
+          (params.ctx as any).retryContext = retryCtx;
+          return handler(params);
+        },
+        stepRetryConfig,
+        (retryCtx, delayMs) => {
+          const logger = (params.ctx as any).logger;
+          if (logger?.warn) {
+            logger.warn(
+              `[queue-retry] Retrying step (attempt ${retryCtx.attempt}/${retryCtx.maxAttempts}): ${retryCtx.lastError.message}`,
+              { delayMs }
+            );
+          } else {
+            console.warn('[queue-retry] Step retry', { attempt: retryCtx.attempt, error: retryCtx.lastError.message, delayMs });
+          }
+        }
+      );
+    } else {
+      output = await handler(params);
+    }
+
+    if (!queueContextRaw || typeof queueContextRaw !== 'object') {
+      return output;
+    }
+    const queueContext = queueContextRaw as WorkerQueueContext;
+    if (!queueContext.id) {
       return output;
     }
 
     const { id: queueId, stepIndex, initialInput, queueJobId } = queueContext;
-    const jobId = (params.ctx as any)?.jobId;
-    const workerId = (params.ctx as any)?.workerId ?? '';
+    // arrayStepIndex tracks the actual steps[] position — differs from stepIndex for loop iterations.
+    const arrayStepIndex = (queueContext as WorkerQueueContext).arrayStepIndex ?? stepIndex;
+    const jobId = params.ctx.jobId;
+    const workerId = params.ctx.workerId ?? '';
 
     const next = queueRuntime.getNextStep(queueId, stepIndex);
     const childJobId = next ? `job-${Date.now()}-${Math.random().toString(36).slice(2, 11)}` : undefined;
+
+    // 5a. Check loop BEFORE appending next step or marking current complete.
+    // This fixes two bugs in the original ordering:
+    //   1. Premature queue completion: if this is the last step and the loop fires,
+    //      marking complete before appending the loop step closes the queue early.
+    //   2. Double-append: if there IS a next step and the loop fires, both the next step
+    //      and the loop step get appended, orphaning the next step.
+    const iterationCount = (queueContext as WorkerQueueContext).iterationCount ?? 0;
+    if (typeof queueRuntime.invokeLoop === 'function') {
+      const currentStep = typeof queueRuntime.getStepAt === 'function'
+        ? queueRuntime.getStepAt(queueId, stepIndex)
+        : undefined;
+      const maxIterations = (currentStep as any)?.loop?.maxIterations ?? 50;
+      if (iterationCount < maxIterations - 1) {
+        let previousOutputsForLoop: QueueStepOutput[] = [];
+        // Capture steps.length before appending so we know the array index of the
+        // new loop step (used for awaiting_approval and as arrayStepIndex next iteration).
+        let stepsLengthBeforeAppend = arrayStepIndex + 1; // fallback
+        if (queueJobId && typeof queueRuntime.getQueueJob === 'function') {
+          try {
+            const job = await queueRuntime.getQueueJob(queueJobId);
+            if (job?.steps) {
+              previousOutputsForLoop = job.steps
+                .slice(0, stepIndex)
+                .map((s, i) => ({ stepIndex: i, workerId: s.workerId, output: s.output }));
+              stepsLengthBeforeAppend = job.steps.length;
+            }
+          } catch { /* ignore */ }
+        }
+        previousOutputsForLoop = previousOutputsForLoop.concat([{ stepIndex, workerId, output }]);
+
+        const shouldLoop = await queueRuntime.invokeLoop(queueId, stepIndex, {
+          output,
+          stepIndex,
+          iterationCount,
+          initialInput,
+          previousOutputs: previousOutputsForLoop,
+        });
+
+        if (shouldLoop) {
+          const loopJobId = `job-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+          // Build loop-iteration input via chain (same step, re-mapped from current output).
+          let loopInput: unknown = output;
+          if (typeof queueRuntime.invokeChain === 'function') {
+            loopInput = await queueRuntime.invokeChain(queueId, stepIndex, {
+              initialInput,
+              previousOutputs: previousOutputsForLoop,
+            });
+          }
+          const loopInputWithQueue = {
+            ...(loopInput !== null && typeof loopInput === 'object'
+              ? (loopInput as Record<string, unknown>)
+              : { value: loopInput }),
+            [WORKER_QUEUE_KEY]: {
+              id: queueId,
+              stepIndex,                           // definition index stays fixed
+              arrayStepIndex: stepsLengthBeforeAppend, // actual index for next iteration
+              initialInput,
+              queueJobId,
+              iterationCount: iterationCount + 1,
+            },
+          };
+
+          // Append loop step FIRST so mark-complete sees it — keeps queue running.
+          if (queueJobId) {
+            await notifyQueueJobStep(queueJobId, 'append', { workerJobId: loopJobId, workerId });
+          }
+          // Now mark current step complete using its actual array index.
+          if (queueJobId && typeof arrayStepIndex === 'number') {
+            await notifyQueueJobStep(queueJobId, 'complete', {
+              queueId,
+              stepIndex: arrayStepIndex,
+              workerJobId: jobId,
+              workerId,
+              output,
+            });
+          }
+
+          if (currentStep?.requiresApproval && queueJobId) {
+            const hitlUiSpec =
+              currentStep.hitl && typeof currentStep.hitl === 'object' && 'ui' in (currentStep.hitl as Record<string, unknown>)
+                ? (currentStep.hitl as Record<string, unknown>).ui
+                : undefined;
+            const pendingInput = {
+              ...loopInputWithQueue,
+              ...(hitlUiSpec !== undefined ? { hitl: { uiSpec: hitlUiSpec } } : {}),
+              __hitlPending: {
+                queueId,
+                queueJobId,
+                stepIndex,
+                workerId,
+                createdAt: new Date().toISOString(),
+              },
+            };
+            // Use stepsLengthBeforeAppend as the array index of the just-appended loop step.
+            await notifyQueueJobStep(queueJobId, 'awaiting_approval', {
+              queueId,
+              stepIndex: stepsLengthBeforeAppend,
+              workerJobId: loopJobId,
+              workerId,
+              input: pendingInput,
+            });
+            return output;
+          }
+
+          await params.ctx.dispatchWorker(workerId, loopInputWithQueue, {
+            await: false,
+            jobId: loopJobId,
+          });
+          return output;
+        }
+      }
+    }
+
+    // No loop fired — normal advance: append next step first, then mark current complete.
     if (next && queueJobId) {
-      // Append next step first so updateQueueJobStepInStore(complete) sees steps.length > 1
+      // Append next step first so complete-step update sees steps.length > 1 (queue not yet done).
       await notifyQueueJobStep(queueJobId, 'append', {
         workerJobId: childJobId!,
         workerId: next.workerId,
       });
     }
 
-    // Notify current step complete (after append when there's next, so queue isn't marked completed yet)
-    if (queueJobId && typeof stepIndex === 'number') {
+    // Notify current step complete using its actual array index.
+    if (queueJobId && typeof arrayStepIndex === 'number') {
       await notifyQueueJobStep(queueJobId, 'complete', {
         queueId,
-        stepIndex,
+        stepIndex: arrayStepIndex,
         workerJobId: jobId,
         workerId,
         output,
@@ -305,8 +670,9 @@ export function wrapHandlerForQueue<INPUT, OUTPUT>(
       return output;
     }
 
+    // 5c. Build next step input via invokeChain (uses the step's chain fn or built-in).
     let nextInput: unknown = output;
-    if (next.mapInputFromPrev && typeof queueRuntime.invokeMapInput === 'function') {
+    if (typeof queueRuntime.invokeChain === 'function') {
       let previousOutputs: QueueStepOutput[] = [];
       if (queueJobId && typeof queueRuntime.getQueueJob === 'function') {
         try {
@@ -316,7 +682,7 @@ export function wrapHandlerForQueue<INPUT, OUTPUT>(
               .slice(0, stepIndex)
               .map((s, i) => ({ stepIndex: i, workerId: s.workerId, output: s.output }));
             previousOutputs = fromStore.concat([
-              { stepIndex, workerId: (params.ctx as any)?.workerId ?? '', output },
+              { stepIndex, workerId: params.ctx.workerId ?? '', output },
             ]);
           }
         } catch (e: any) {
@@ -325,12 +691,10 @@ export function wrapHandlerForQueue<INPUT, OUTPUT>(
           }
         }
       }
-      nextInput = await queueRuntime.invokeMapInput(
-        queueId,
-        stepIndex + 1,
+      nextInput = await queueRuntime.invokeChain(queueId, stepIndex + 1, {
         initialInput,
-        previousOutputs
-      );
+        previousOutputs,
+      });
     }
 
     const nextInputWithQueue = {
@@ -353,6 +717,41 @@ export function wrapHandlerForQueue<INPUT, OUTPUT>(
       });
     }
 
+    if (next.requiresApproval && queueJobId && typeof stepIndex === 'number') {
+      const hitlUiSpec =
+        next.hitl && typeof next.hitl === 'object' && 'ui' in (next.hitl as Record<string, unknown>)
+          ? (next.hitl as Record<string, unknown>).ui
+          : undefined;
+      const pendingInput = {
+        ...nextInputWithQueue,
+        ...(hitlUiSpec !== undefined ? { hitl: { uiSpec: hitlUiSpec } } : {}),
+        __hitlPending: {
+          queueId,
+          queueJobId,
+          stepIndex: stepIndex + 1,
+          workerId: next.workerId,
+          createdAt: new Date().toISOString(),
+        },
+      };
+      await notifyQueueJobStep(queueJobId, 'awaiting_approval', {
+        queueId,
+        stepIndex: stepIndex + 1,
+        workerJobId: childJobId!,
+        workerId: next.workerId,
+        input: pendingInput,
+      });
+      if (debug) {
+        console.log('[Worker] Queue chain paused for HITL approval:', {
+          queueId,
+          queueJobId,
+          nextStep: stepIndex + 1,
+          nextWorkerId: next.workerId,
+          pendingWorkerJobId: childJobId,
+        });
+      }
+      return output;
+    }
+
     await params.ctx.dispatchWorker(next.workerId, nextInputWithQueue, {
       await: false,
       delaySeconds: next.delaySeconds,
@@ -373,6 +772,10 @@ export interface SQSMessageBody {
   jobStoreUrl?: string;
   metadata?: Record<string, any>;
   timestamp: string;
+  /** ID of the user who triggered this job. Forwarded from dispatch options. */
+  userId?: string;
+  /** Maximum total tokens (input + output) for this job. Forwarded from DispatchOptions.maxTokens. */
+  maxTokens?: number;
 }
 
 export interface WebhookPayload {
@@ -425,6 +828,7 @@ function createDispatchWorker(
     const metadata = options?.metadata ?? {};
     const serializedContext: Record<string, any> = {};
     if (parentContext.requestId) serializedContext.requestId = parentContext.requestId;
+    if (parentContext.userId) serializedContext.userId = parentContext.userId;
 
     const messageBody: SQSMessageBody = {
       workerId: calleeWorkerId,
@@ -550,7 +954,8 @@ async function sendWebhook(
  */
 export function createLambdaHandler<INPUT, OUTPUT>(
   handler: WorkerHandler<INPUT, OUTPUT>,
-  outputSchema?: ZodType<OUTPUT>
+  outputSchema?: ZodType<OUTPUT>,
+  options?: { retry?: SmartRetryConfig }
 ): (event: SQSEvent, context: LambdaContext) => Promise<void> {
   return async (event: SQSEvent, lambdaContext: LambdaContext) => {
     const promises = event.Records.map(async (record: SQSRecord) => {
@@ -558,8 +963,10 @@ export function createLambdaHandler<INPUT, OUTPUT>(
       try {
         messageBody = JSON.parse(record.body) as SQSMessageBody;
 
-        const { workerId, jobId, input, context, webhookUrl, metadata = {} } =
+        const { workerId, jobId, input, context, webhookUrl, metadata = {}, userId: messageUserId, maxTokens } =
           messageBody;
+        // userId flows from dispatch options → context.userId → messageBody.userId
+        const userId: string | undefined = (context.userId as string | undefined) ?? messageUserId;
 
         // Idempotency: skip if this job was already completed or failed (e.g. SQS redelivery or duplicate trigger).
         // Only the Lambda that processes a message creates/updates that job's key; parent workers only append to internalJobs and poll – they never write child job documents.
@@ -594,38 +1001,56 @@ export function createLambdaHandler<INPUT, OUTPUT>(
           jobStoreType === 'upstash-redis' &&
           isRedisJobStoreConfigured()
         ) {
-          await upsertRedisJob(jobId, workerId, input, metadata);
-          jobStore = createRedisJobStore(workerId, jobId, input, metadata);
+          await upsertRedisJob(jobId, workerId, input, metadata, userId);
+          jobStore = createRedisJobStore(workerId, jobId, input, metadata, userId);
         } else if (
           jobStoreType === 'mongodb' ||
           isMongoJobStoreConfigured()
         ) {
-          await upsertJob(jobId, workerId, input, metadata);
-          jobStore = createMongoJobStore(workerId, jobId, input, metadata);
+          await upsertJob(jobId, workerId, input, metadata, userId);
+          jobStore = createMongoJobStore(workerId, jobId, input, metadata, userId);
+        }
+
+        // Emit a parseable audit log so log queries can find all jobs by user.
+        // Pattern: [WORKER_USER:<userId>] — grep for this to extract caller userId.
+        if (userId) {
+          console.log(`[WORKER_USER:${userId}]`, { jobId, workerId, timestamp: new Date().toISOString() });
         }
 
         const baseContext = {
           jobId,
           workerId,
           requestId: context.requestId || lambdaContext.awsRequestId,
+          ...(userId ? { userId } : {}),
           ...context,
         };
-        const handlerContext = {
+
+        // Token budget tracker — enforces maxTokens if set, accumulates otherwise.
+        const tokenTracker = createTokenTracker(maxTokens ?? null);
+        const logger = createWorkerLogger(jobId, workerId);
+
+        const handlerContext: any = {
           ...baseContext,
           ...(jobStore ? { jobStore } : {}),
-          logger: createWorkerLogger(jobId, workerId),
-          dispatchWorker: createDispatchWorker(
-            jobId,
-            workerId,
-            baseContext,
-            jobStore
-          ),
+          logger,
+          dispatchWorker: createDispatchWorker(jobId, workerId, baseContext, jobStore),
+          reportTokenUsage: async (usage: TokenUsage) => {
+            tokenTracker.report(usage); // throws TokenBudgetExceededError if over limit
+            const state = tokenTracker.getState();
+            if (jobStore) {
+              await jobStore.update({ metadata: { tokenUsage: state } }).catch((e: any) => {
+                logger.warn('Failed to persist tokenUsage to job store', { error: e?.message });
+              });
+            }
+          },
+          getTokenBudget: () => tokenTracker.getBudgetInfo(),
+          retryContext: undefined as RetryContext | undefined,
         };
 
         if (jobStore) {
           try {
             await jobStore.update({ status: 'running' });
-            const queueCtxForLog = (input as any)?.__workerQueue ?? metadata?.__workerQueue;
+            const queueCtxForLog = getWorkerQueueContext(input, metadata);
             console.log('[Worker] Job status updated to running:', {
               jobId,
               workerId,
@@ -641,7 +1066,7 @@ export function createLambdaHandler<INPUT, OUTPUT>(
           }
         }
 
-        const queueCtx = (input as any)?.__workerQueue ?? metadata?.__workerQueue;
+        const queueCtx = getWorkerQueueContext(input, metadata);
         if (queueCtx?.queueJobId && typeof queueCtx.stepIndex === 'number') {
           // Ensure initial queue job exists (mainly for cron/queue-starter paths)
           if (queueCtx.stepIndex === 0) {
@@ -652,6 +1077,7 @@ export function createLambdaHandler<INPUT, OUTPUT>(
                 firstWorkerId: workerId,
                 firstWorkerJobId: jobId,
                 metadata,
+                userId,
               });
             } catch (e: any) {
               console.warn('[Worker] Failed to upsert initial queue job:', {
@@ -663,7 +1089,9 @@ export function createLambdaHandler<INPUT, OUTPUT>(
           }
           await notifyQueueJobStep(queueCtx.queueJobId, 'start', {
             queueId: queueCtx.id,
-            stepIndex: queueCtx.stepIndex,
+            // Use arrayStepIndex when set — it tracks the actual steps[] position for
+            // looping steps where the definition index stays fixed across iterations.
+            stepIndex: queueCtx.arrayStepIndex ?? queueCtx.stepIndex,
             workerJobId: jobId,
             workerId,
             input,
@@ -672,13 +1100,22 @@ export function createLambdaHandler<INPUT, OUTPUT>(
 
         let output: OUTPUT;
         try {
-          output = await handler({
-            input: input as INPUT,
-            ctx: handlerContext,
-          });
+          const workerRetryConfig = options?.retry;
+          const executeHandler = async (retryCtx: RetryContext | undefined): Promise<OUTPUT> => {
+            handlerContext.retryContext = retryCtx;
+            const result = await handler({ input: input as INPUT, ctx: handlerContext });
+            return outputSchema ? outputSchema.parse(result) : result;
+          };
 
-          if (outputSchema) {
-            output = outputSchema.parse(output);
+          if (workerRetryConfig && workerRetryConfig.on.length > 0) {
+            output = await executeWithRetry(executeHandler, workerRetryConfig, (retryCtx, delayMs) => {
+              logger.warn(
+                `[worker-retry] Retrying handler (attempt ${retryCtx.attempt}/${retryCtx.maxAttempts}): ${retryCtx.lastError.message}`,
+                { delayMs }
+              );
+            });
+          } else {
+            output = await executeHandler(undefined);
           }
         } catch (error: any) {
           const errorPayload: WebhookPayload = {
@@ -712,7 +1149,7 @@ export function createLambdaHandler<INPUT, OUTPUT>(
             }
           }
 
-          const queueCtxFail = (input as any)?.__workerQueue ?? metadata?.__workerQueue;
+          const queueCtxFail = getWorkerQueueContext(input, metadata);
           if (queueCtxFail?.queueJobId && typeof queueCtxFail.stepIndex === 'number') {
             await notifyQueueJobStep(queueCtxFail.queueJobId, 'fail', {
               queueId: queueCtxFail.id,

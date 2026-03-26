@@ -6,6 +6,7 @@ export type WorkflowJobStatus =
   | 'idle'
   | 'queued'
   | 'running'
+  | 'awaiting_approval'
   | 'completed'
   | 'failed'
   | 'partial';
@@ -43,6 +44,35 @@ export interface QueueJobResult {
   updatedAt: string;
   completedAt?: string;
 }
+
+export interface QueueHitlTask {
+  taskId: string;
+  queueJobId: string;
+  queueId: string;
+  stepIndex: number;
+  workerId: string;
+  status: 'awaiting_input' | 'approved' | 'rejected' | 'expired';
+  progress?: {
+    completedSteps: number;
+    totalSteps: number;
+    percent: number;
+  };
+  previousOutputs?: Array<{
+    stepIndex: number;
+    workerId: string;
+    output: unknown;
+  }>;
+  uiSpec?: Record<string, unknown>;
+  inputSchema?: Record<string, unknown>;
+  contextSnapshot?: Record<string, unknown>;
+}
+
+export type QueueHitlDecisionPayload = {
+  decision: 'approve' | 'reject';
+  input?: Record<string, unknown>;
+  comment?: string;
+  reviewerId?: string;
+};
 
 export type WorkflowJobOutput = WorkerJobResult | QueueJobResult;
 
@@ -104,6 +134,15 @@ export interface UseWorkflowJobReturn {
   polling: boolean;
   /** Reset state so you can trigger again */
   reset: () => void;
+  /**
+   * Derived HITL task from queue output when a step is awaiting approval.
+   * Undefined when not in HITL wait state.
+   */
+  hitlTask?: QueueHitlTask | null;
+  /**
+   * Submit approval/rejection and optional reviewer input for HITL queue steps.
+   */
+  submitHitlDecision?: (payload: QueueHitlDecisionPayload) => Promise<void>;
 }
 
 export function useWorkflowJob(
@@ -135,6 +174,33 @@ export function useWorkflowJob(
   const [error, setError] = useState<Error | null>(null);
   const [loading, setLoading] = useState(false);
   const [polling, setPolling] = useState(false);
+
+  const deriveHitlTask = useCallback((job: QueueJobResult | null): QueueHitlTask | null => {
+    if (!job || !Array.isArray(job.steps)) return null;
+    const waitingStepIndex = job.steps.findIndex((s) => s.status === 'awaiting_approval');
+    if (waitingStepIndex < 0) return null;
+    const waitingStep = job.steps[waitingStepIndex];
+    const previousOutputs = job.steps
+      .slice(0, waitingStepIndex)
+      .map((s, idx) => ({ stepIndex: idx, workerId: s.workerId, output: s.output }));
+    const completedSteps = job.steps.filter((s) => s.status === 'completed').length;
+    const totalSteps = job.steps.length;
+    const percent = totalSteps > 0 ? Math.round((completedSteps / totalSteps) * 100) : 0;
+    const meta = (job.metadata ?? {}) as Record<string, any>;
+    return {
+      taskId: String(meta.hitlTaskId ?? `${job.id}:${waitingStepIndex}`),
+      queueJobId: job.id,
+      queueId: job.queueId,
+      stepIndex: waitingStepIndex,
+      workerId: waitingStep.workerId,
+      status: 'awaiting_input',
+      progress: { completedSteps, totalSteps, percent },
+      previousOutputs,
+      uiSpec: (waitingStep.input as any)?.hitl?.uiSpec ?? meta.hitlUiSpec ?? {},
+      inputSchema: (waitingStep.input as any)?.hitl?.inputSchema ?? meta.hitlInputSchema ?? {},
+      contextSnapshot: (waitingStep.input as any)?.hitl?.contextSnapshot ?? meta.hitlContextSnapshot ?? {},
+    };
+  }, []);
 
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -188,28 +254,6 @@ export function useWorkflowJob(
           if (autoPoll) {
             setPolling(true);
             const deadline = Date.now() + pollTimeoutMs;
-            let intervalId: ReturnType<typeof setInterval> | null = null;
-            const terminalHitRef = { current: false };
-            const timeoutId = setTimeout(() => {
-              if (intervalId != null) clearInterval(intervalId);
-              if (timeoutRef.current === timeoutId) timeoutRef.current = null;
-              if (intervalRef.current === intervalId) intervalRef.current = null;
-              setPolling(false);
-              setError(new Error('Poll timeout'));
-              setStatus('failed');
-            }, pollTimeoutMs);
-            timeoutRef.current = timeoutId;
-
-            const clearThisPolling = () => {
-              if (intervalId != null) {
-                clearInterval(intervalId);
-                if (intervalRef.current === intervalId) intervalRef.current = null;
-              }
-              clearTimeout(timeoutId);
-              if (timeoutRef.current === timeoutId) timeoutRef.current = null;
-              setPolling(false);
-            };
-
             const poll = async () => {
               if (!mountedRef.current) return;
               try {
@@ -219,22 +263,21 @@ export function useWorkflowJob(
                 const job = await r.json();
                 if (!r.ok) {
                   if (Date.now() >= deadline) {
-                    clearThisPolling();
-                    setError(new Error('Poll timeout'));
+                    clearPolling();
+                    const err = new Error('Poll timeout');
+                    setError(err);
                     setStatus('failed');
-                    onError?.(new Error('Poll timeout'));
+                    onError?.(err);
                   }
                   return;
                 }
                 setStatus((job.status as WorkflowJobStatus) ?? 'running');
                 setOutput(job as WorkerJobResult);
                 if (job.status === 'completed') {
-                  terminalHitRef.current = true;
-                  clearThisPolling();
+                  clearPolling();
                   onComplete?.(job as WorkerJobResult);
                 } else if (job.status === 'failed') {
-                  terminalHitRef.current = true;
-                  clearThisPolling();
+                  clearPolling();
                   const err = new Error(
                     job?.error?.message ?? 'Job failed'
                   );
@@ -242,13 +285,14 @@ export function useWorkflowJob(
                   setStatus('failed');
                   onError?.(err);
                 } else if (Date.now() >= deadline) {
-                  clearThisPolling();
-                  setError(new Error('Poll timeout'));
-                  onError?.(new Error('Poll timeout'));
+                  clearPolling();
+                  const err = new Error('Poll timeout');
+                  setError(err);
+                  onError?.(err);
                 }
               } catch (e) {
                 if (mountedRef.current) {
-                  clearThisPolling();
+                  clearPolling();
                   const err = e instanceof Error ? e : new Error(String(e));
                   setError(err);
                   setStatus('failed');
@@ -257,9 +301,12 @@ export function useWorkflowJob(
               }
             };
             await poll();
-            if (terminalHitRef.current) return;
-            intervalId = setInterval(() => void poll(), pollIntervalMs);
-            intervalRef.current = intervalId;
+            intervalRef.current = setInterval(poll, pollIntervalMs);
+            timeoutRef.current = setTimeout(() => {
+              clearPolling();
+              setError(new Error('Poll timeout'));
+              setStatus('failed');
+            }, pollTimeoutMs);
           }
         } else {
           const body: Record<string, unknown> = {
@@ -281,26 +328,21 @@ export function useWorkflowJob(
 
           if (autoPoll) {
             setPolling(true);
-            const deadline = Date.now() + pollTimeoutMs;
+            // Deadline resets on each awaiting_approval poll — timeout only counts
+            // active processing time, not time spent waiting for human decisions.
+            let deadline = Date.now() + pollTimeoutMs;
             let intervalId: ReturnType<typeof setInterval> | null = null;
             const terminalHitRef = { current: false };
-            const timeoutId = setTimeout(() => {
-              if (intervalId != null) clearInterval(intervalId);
-              if (timeoutRef.current === timeoutId) timeoutRef.current = null;
-              if (intervalRef.current === intervalId) intervalRef.current = null;
-              setPolling(false);
-              setError(new Error('Poll timeout'));
-              setStatus('failed');
-            }, pollTimeoutMs);
-            timeoutRef.current = timeoutId;
 
             const clearThisPolling = () => {
               if (intervalId != null) {
                 clearInterval(intervalId);
                 if (intervalRef.current === intervalId) intervalRef.current = null;
               }
-              clearTimeout(timeoutId);
-              if (timeoutRef.current === timeoutId) timeoutRef.current = null;
+              if (timeoutRef.current != null) {
+                clearTimeout(timeoutRef.current);
+                timeoutRef.current = null;
+              }
               setPolling(false);
             };
 
@@ -330,6 +372,10 @@ export function useWorkflowJob(
                     setError(new Error('Queue job failed'));
                     onError?.(new Error('Queue job failed'));
                   }
+                } else if (st === 'awaiting_approval') {
+                  // Reset the deadline while waiting for human input — the timeout
+                  // should only count active processing time, not human decision time.
+                  deadline = Date.now() + pollTimeoutMs;
                 } else if (Date.now() >= deadline) {
                   clearThisPolling();
                   setError(new Error('Poll timeout'));
@@ -372,6 +418,32 @@ export function useWorkflowJob(
     ]
   );
 
+  const submitHitlDecision = useCallback(
+    async (payload: QueueHitlDecisionPayload) => {
+      if (options.type !== 'queue' || !jobId) {
+        throw new Error('submitHitlDecision is only available for queue jobs');
+      }
+      const response = await fetch(api(`/queues/${options.queueId}/approve`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          queueJobId: jobId,
+          ...payload,
+        }),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body?.error ?? `Failed to submit HITL decision (${response.status})`);
+      }
+    },
+    [options, jobId, api]
+  );
+
+  const hitlTask =
+    options.type === 'queue'
+      ? deriveHitlTask((output && 'steps' in output ? (output as QueueJobResult) : null))
+      : null;
+
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -389,5 +461,11 @@ export function useWorkflowJob(
     loading,
     polling,
     reset,
+    ...(options.type === 'queue'
+      ? {
+          hitlTask,
+          submitHitlDecision,
+        }
+      : {}),
   };
 }

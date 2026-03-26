@@ -54,5 +54,31 @@ export const StudioConfig = {
           Number(process.env.WORKER_JOBS_TTL_SECONDS ?? 60 * 60 * 24 * 7),
       },
     },
+    deploymentConfig: {
+      projectId: process.env.MICROFOX_PROJECT_ID || '2bd2b78d-320d-48da-946d-53e2a5d06a7a',
+      publish: {
+        subdomain: 'ai-router',
+        agentName: 'ai-router',
+        handles: {
+          agent: '/agent',
+          openapi: '/docs.json',
+          public: '/public',
+        },
+      },
+      deployment: {
+        apiMode: 'staging',
+        apiVersion: 'v2',
+        ignorePatterns: ['.build/**', 'package-lock.json'],
+      },
+      worker: {
+        externalDeps: ['@microfox/puppeteer-sls', '@sparticuz/chromium'],
+        includeNodeModules: false,
+        groups: {
+          scraper: {
+            includeNodeModules: true,
+          },
+        },
+      },
+    },
   },
 };

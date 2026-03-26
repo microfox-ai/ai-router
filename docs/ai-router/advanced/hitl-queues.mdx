@@ -1,0 +1,473 @@
+---
+title: 'HITL Queues'
+sidebarTitle: 'HITL Queues'
+description: "Human-in-the-loop queue steps: pause execution for human review, then resume with the reviewer's decision."
+---
+
+## Overview
+
+**HITL (Human-in-the-Loop)** queue steps let you pause a worker queue at a specific step, display the pending work to a human reviewer in your UI, and resume execution after they approve or reject it.
+
+This is distinct from the `HookStep` in the orchestration/workflow layer — HITL queues run entirely within the `@microfox/ai-worker` queue system (no Vercel workflow runtime required).
+
+**Use cases:**
+- Content moderation (review AI-generated output before publishing)
+- Multi-round refinement (iterate with a human until finalized)
+- Approval workflows (require a manager to sign off before the next step)
+- Data labelling pipelines (human review between automated stages)
+
+## Architecture
+
+```
+dispatchQueue(queueId, input)
+  ↓
+Step N completes → next step has requiresApproval: true
+  ↓
+chain() runs → pending input stored → status: awaiting_approval
+  ↓
+UI polls GET /queues/:id/:jobId → sees awaiting_approval → shows hitlTask
+  ↓
+Human submits decision → POST /queues/:id/approve
+  ↓
+Lambda dispatches step worker with resume() merging pendingInput + reviewerInput
+  ↓
+Worker handler runs (no envelope keys; stripped by runtime)
+  ↓
+loop.shouldContinue()? → re-pause or advance to next step
+```
+
+## Defining a HITL step
+
+A queue step becomes a HITL gate by setting `requiresApproval: true`:
+
+```typescript
+import { defineWorkerQueue, defineHitlConfig } from '@microfox/ai-worker/queue';
+import { z } from 'zod';
+
+const reviewerSchema = z.object({
+  approved: z.boolean(),
+  feedback: z.string().optional(),
+});
+
+export default defineWorkerQueue({
+  id: 'content-pipeline',
+  steps: [
+    { workerId: 'draft-writer' },
+    {
+      workerId: 'editor',
+      requiresApproval: true,
+      // chain: shape input before pausing (what the worker receives if approved immediately)
+      chain: (ctx) => ({
+        draft: ctx.previousOutputs.at(-1)?.output,
+        source: (ctx.initialInput as any).topic,
+      }),
+      // resume: merge pending input + reviewer payload → final handler input
+      resume: (ctx: HitlResumeContext<z.infer<typeof reviewerSchema>>) => ({
+        ...ctx.pendingInput,
+        reviewerFeedback: ctx.reviewerInput.feedback,
+        approved: ctx.reviewerInput.approved,
+      }),
+      hitl: defineHitlConfig({
+        taskKey: 'content-review',
+        timeoutSeconds: 86400,
+        onTimeout: 'reject',
+        ui: { type: 'schema-form', title: 'Review the draft', description: 'Approve or provide feedback' },
+        inputSchema: reviewerSchema,
+      }),
+    },
+    { workerId: 'publisher' },
+  ],
+});
+```
+
+### `chain` — shape input before pausing
+
+Called after the previous step completes. Returns the domain input that will be:
+1. Stored as `pendingInput` in the job store
+2. Passed to `resume()` when the step is approved
+
+```typescript
+chain: (ctx: ChainContext) => unknown
+// or use built-in shortcuts:
+chain: 'passthrough'          // previous output used as-is
+chain: 'continueFromPrevious' // builds { mode: 'continue', current, history } payload
+```
+
+When omitted, the previous step's output is used as-is.
+
+### `resume` — merge reviewer input
+
+Called inside the Lambda **before** the worker handler runs, after the approve endpoint dispatches the step. Receives both the stored pending input and the reviewer's form payload.
+
+```typescript
+resume: (ctx: HitlResumeContext<ReviewerType>) => unknown
+```
+
+`HitlResumeContext` fields:
+- `ctx.initialInput` — original `dispatchQueue` input
+- `ctx.previousOutputs` — all prior step outputs
+- `ctx.pendingInput` — what `chain()` returned (domain fields only; envelope keys stripped)
+- `ctx.reviewerInput` — form payload from the approve endpoint body's `input` field
+
+When `resume` is omitted, the default is a shallow merge: `{ ...pendingInput, ...reviewerInput }`.
+
+### `hitl` — UI metadata
+
+Set via `defineHitlConfig()`. Not read by the worker runtime — consumed entirely by the frontend. Provides `taskKey`, timeout config, `inputSchema` (Zod schema for the reviewer form), and a `ui` spec:
+
+```typescript
+// Schema-form: auto-rendered from inputSchema
+ui: { type: 'schema-form', title: 'Review step', description: 'Approve or reject' }
+
+// Custom view: looked up in components/hitl/registry.ts by viewId
+ui: {
+  type: 'custom',
+  viewId: 'my-custom-view-v1',
+  title: 'Custom review panel',
+  sections: ['section-a', 'section-b'],
+}
+```
+
+## Looping HITL steps
+
+Combine `requiresApproval` with `loop` to let the reviewer trigger another iteration (e.g. a refinement round):
+
+```typescript
+{
+  workerId: 'calculator-step',
+  requiresApproval: true,
+  chain: 'continueFromPrevious',
+  resume: (ctx) => ({
+    mode: 'continue' as const,
+    ...ctx.pendingInput,
+    operator: ctx.reviewerInput.operator,
+    nextNumber: ctx.reviewerInput.nextNumber,
+  }),
+  loop: {
+    // Continue until the worker sets finalized: true OR reviewer doesn't request another round
+    shouldContinue: ({ output }) => !(output as { finalized?: boolean }).finalized,
+    maxIterations: 20,
+  },
+  hitl: defineHitlConfig({
+    taskKey: 'calculator-round',
+    ui: { type: 'custom', viewId: 'calculator-hitl-v1' },
+    inputSchema: z.object({
+      operator: z.enum(['+', '-', '*', '/']),
+      nextNumber: z.number(),
+      continueLoop: z.boolean(),
+    }),
+  }),
+}
+```
+
+**Loop execution order:**
+1. Step runs → `loop.shouldContinue(ctx)` evaluated
+2. If `true`: append a new step entry, mark current complete, pause again (if `requiresApproval`)
+3. If `false`: advance to the next queue step
+
+The `stepIndex` in the queue definition stays fixed across iterations. The `arrayStepIndex` (position in the live store's `steps[]` array) increments with each loop.
+
+### `repeatStep` — multi-round queues without loops
+
+When you have a fixed number of sequential review rounds, `repeatStep` is simpler than a loop:
+
+```typescript
+import { repeatStep } from '@microfox/ai-worker/queue';
+
+steps: [
+  { workerId: 'ingest' },
+  ...repeatStep(3, (i) => ({
+    workerId: 'review',
+    requiresApproval: true,
+    chain: 'continueFromPrevious',
+    resume: (ctx) => ({ ...ctx.pendingInput, round: i + 1 }),
+    hitl: defineHitlConfig({
+      taskKey: `review-round-${i + 1}`,
+      ui: { type: 'schema-form', title: `Round ${i + 1} review` },
+    }),
+  })),
+  { workerId: 'finalize' },
+]
+```
+
+## HTTP API
+
+### Trigger a queue
+
+```http
+POST /api/workflows/queues/:queueId
+Content-Type: application/json
+
+{ "input": {}, "metadata": { "source": "ui" }, "jobId": "optional-custom-id" }
+```
+
+### Poll queue status
+
+```http
+GET /api/workflows/queues/:queueId/:jobId
+```
+
+When a step is paused, the response includes a step with `status: 'awaiting_approval'`:
+
+```json
+{
+  "id": "job-123",
+  "queueId": "content-pipeline",
+  "status": "running",
+  "steps": [
+    { "workerId": "draft-writer", "status": "completed", "output": { "draft": "..." } },
+    {
+      "workerId": "editor",
+      "status": "awaiting_approval",
+      "input": { "draft": "...", "source": "AI" }
+    }
+  ]
+}
+```
+
+### Approve or reject a paused step
+
+```http
+POST /api/workflows/queues/:queueId/approve
+Content-Type: application/json
+
+{
+  "queueJobId": "job-123",
+  "stepIndex": 1,
+  "decision": "approve",
+  "input": { "approved": true, "feedback": "Great draft!" },
+  "reviewerId": "user-456",
+  "comment": "Looks good"
+}
+```
+
+- `decision`: `"approve"` (default) or `"reject"`
+  - `"reject"` marks the step (and queue job) as `failed` with `comment` as the error message
+  - `"approve"` dispatches the worker with the merged payload
+- `input`: reviewer form payload → becomes `ctx.reviewerInput` in `resume()`
+- `stepIndex`: auto-detected from the `awaiting_approval` step if omitted
+- Idempotent: if the step is already `running` or `completed` (double-submit), returns `{ ok: true, idempotent: true }`
+
+**Response:**
+
+```json
+{ "ok": true, "decision": "approve", "queueJobId": "job-123", "stepIndex": 1, "status": "running" }
+```
+
+## Frontend integration
+
+### `useWorkflowJob` — HITL helpers
+
+The `useWorkflowJob` hook (added by CLI boilerplate) exposes HITL helpers for queue jobs:
+
+```tsx
+'use client';
+
+import { useWorkflowJob } from '@/hooks/useWorkflowJob';
+import { HitlTaskPanel } from '@/components/hitl/components/hitl-task-panel';
+
+export function ReviewWorkflow() {
+  const { trigger, status, output, loading, polling, hitlTask, submitHitlDecision } =
+    useWorkflowJob({
+      type: 'queue',
+      queueId: 'content-pipeline',
+    });
+
+  return (
+    <div>
+      <button onClick={() => trigger({ topic: 'AI trends' })} disabled={loading || polling}>
+        Start pipeline
+      </button>
+
+      {status === 'awaiting_approval' && hitlTask && (
+        <HitlTaskPanel
+          task={hitlTask}
+          busy={loading}
+          onSubmitDecision={submitHitlDecision}
+        />
+      )}
+
+      {status === 'completed' && <pre>{JSON.stringify(output, null, 2)}</pre>}
+    </div>
+  );
+}
+```
+
+**Key fields returned by `useWorkflowJob` for queues:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `status` | `WorkflowJobStatus` | Includes `'awaiting_approval'` when paused |
+| `hitlTask` | `QueueHitlTask \| null` | Derived when `awaiting_approval`; `null` otherwise |
+| `submitHitlDecision(payload)` | `(QueueHitlDecisionPayload) => Promise<void>` | POSTs to approve endpoint |
+| `polling` | `boolean` | Remains `true` while waiting for approval |
+
+**`QueueHitlTask` shape:**
+
+```typescript
+interface QueueHitlTask {
+  taskId: string;         // "${queueJobId}:${stepIndex}"
+  queueJobId: string;
+  queueId: string;
+  stepIndex: number;      // Array step index (not definition index for loops)
+  workerId: string;
+  status: 'awaiting_input';
+  progress: {
+    completedSteps: number;
+    totalSteps: number;
+    percent: number;
+  };
+  previousOutputs: Array<{ stepIndex: number; workerId: string; output: unknown }>;
+  uiSpec: Record<string, unknown>;       // From hitl.ui
+  inputSchema: Record<string, unknown>;  // From hitl.inputSchema
+}
+```
+
+**Timeout behavior:** While `status === 'awaiting_approval'`, the poll timeout resets on every poll tick — the timeout only counts active processing time, never human decision time.
+
+### `HitlTaskPanel` — rendering HITL views
+
+Add the `HitlTaskPanel` component to your app (generated by the CLI boilerplate under `components/hitl/`):
+
+```tsx
+import { HitlTaskPanel } from '@/components/hitl/components/hitl-task-panel';
+
+<HitlTaskPanel
+  task={hitlTask}             // QueueHitlTask from useWorkflowJob
+  busy={loading}              // Disables buttons while the approve request is in flight
+  onSubmitDecision={submitHitlDecision}  // From useWorkflowJob
+/>
+```
+
+`HitlTaskPanel` props:
+
+```typescript
+interface HitlTaskPanelProps {
+  task: QueueHitlTask | null | undefined;
+  busy: boolean;
+  onSubmitDecision: (payload: QueueHitlDecisionPayload) => Promise<void>;
+}
+```
+
+The panel resolves the view to render:
+
+1. **`ui.viewId` found in registry**: Renders the matching `HitlViewRenderer` component
+2. **`ui.type === 'schema-form'`**: Falls back to a JSON textarea with Approve/Reject buttons
+3. **Unknown `viewId`**: Same JSON textarea fallback with a hint to call `registerHitlView()`
+4. **No task**: Shows an alert placeholder
+
+### Custom HITL views
+
+Register custom view components by calling `registerHitlView()` in `components/hitl/registry.ts`:
+
+```typescript
+// components/hitl/registry.ts
+import { registerHitlView } from './registry'; // self-import pattern, or call directly
+import { MyCustomView } from './views/my-custom-view';
+
+registerHitlView('my-custom-view-v1', MyCustomView);
+```
+
+A view component uses the `HitlViewProps` type and receives `task`, `busy`, and `onSubmitDecision`:
+
+```tsx
+// components/hitl/views/my-custom-view.tsx
+import type { HitlViewProps } from '../types';
+
+export function MyCustomView({ task, busy, onSubmitDecision }: HitlViewProps) {
+  const prev = task.previousOutputs.at(-1)?.output as any;
+
+  return (
+    <div>
+      <h2>Review: {(task.uiSpec as any).title}</h2>
+      <pre>{JSON.stringify(prev, null, 2)}</pre>
+      <button disabled={busy} onClick={() => onSubmitDecision({ decision: 'approve', input: { approved: true } })}>
+        Approve
+      </button>
+      <button disabled={busy} onClick={() => onSubmitDecision({ decision: 'reject', comment: 'Not ready' })}>
+        Reject
+      </button>
+    </div>
+  );
+}
+```
+
+## Worker handler contract
+
+Workers used in HITL steps write their normal Zod schemas — **no envelope keys needed**. The runtime strips all `__workerQueue`, `__hitlInput`, `__hitlDecision`, `__hitlPending`, and `hitl` fields before calling the handler.
+
+```typescript
+// ✅ Clean schema — no envelope fields
+const InputSchema = z.discriminatedUnion('mode', [
+  z.object({ mode: z.literal('init'), topic: z.string() }),
+  z.object({ mode: z.literal('continue'), draft: z.string(), feedback: z.string().optional() }),
+]);
+
+export default createWorker({
+  id: 'editor',
+  inputSchema: InputSchema,
+  outputSchema: z.object({ draft: z.string(), version: z.number() }),
+  handler: async ({ input, ctx }) => {
+    if (input.mode === 'init') {
+      const draft = await generateDraft(input.topic);
+      return { draft, version: 1 };
+    }
+    const revised = await reviseDraft(input.draft, input.feedback);
+    return { draft: revised, version: 2 };
+  },
+});
+```
+
+## Shared contracts (`*.hitl-shared.ts`)
+
+For teams, define reviewer schemas and UI spec types in a shared file imported by the queue, worker, and UI:
+
+```typescript
+// editor.hitl-shared.ts
+import { z } from 'zod';
+
+export const editorReviewSchema = z.object({
+  approved: z.boolean(),
+  feedback: z.string().optional(),
+  priority: z.enum(['low', 'medium', 'high']).default('medium'),
+});
+
+export type EditorReviewInput = z.infer<typeof editorReviewSchema>;
+```
+
+Then import in the queue:
+```typescript
+import { editorReviewSchema } from './editor.hitl-shared';
+// ...
+hitl: defineHitlConfig({ taskKey: 'editor-review', ui: { type: 'schema-form', title: 'Review draft' }, inputSchema: editorReviewSchema })
+```
+
+And in the view component:
+```typescript
+import type { EditorReviewInput } from '../queues/editor.hitl-shared';
+// onSubmitDecision payload.input is typed as EditorReviewInput
+```
+
+## Full example
+
+See the calculator-session example in the repository:
+
+- **Queue**: `examples/root/app/ai/queues/calculator-session.queue.ts`
+- **Shared contracts**: `examples/root/app/ai/queues/calculator-session.hitl-shared.ts`
+- **Worker**: `examples/root/app/ai/workers/calculator-hitl.worker.ts`
+- **View**: `examples/root/components/hitl/views/calculator-hitl-v1.tsx`
+- **Registry**: `examples/root/components/hitl/registry.ts`
+- **Panel**: `examples/root/components/hitl/components/hitl-task-panel.tsx`
+- **Page**: `examples/root/app/workflows/calculator-hitl/page.tsx`
+- **Queues route**: `examples/root/app/api/workflows/queues/[...slug]/route.ts`
+
+## Common mistakes
+
+| Mistake | Fix |
+|---------|-----|
+| `viewId` doesn't match registry key | Keys are case-sensitive; check `components/hitl/registry.ts` |
+| Worker schema includes `__hitlInput` or `__workerQueue` | Remove them — the runtime strips envelope keys before the handler |
+| Using `busy={polling}` instead of `busy={loading}` | Use `loading` (true only during submit); `polling` stays true while waiting |
+| `stepIndex` mismatch after loops | Use `hitlTask.stepIndex` (array index) not the queue definition index |
+| Forgot to re-deploy after registry change | Run `npx ai-worker push` to redeploy the worker Lambda |
+| `resume()` missing — reviewer input not merged | Add a `resume` function or rely on the default shallow merge |

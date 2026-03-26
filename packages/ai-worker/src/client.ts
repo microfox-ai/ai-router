@@ -10,15 +10,37 @@
 import type { ZodType, z } from 'zod';
 import type { WorkerQueueConfig } from './queue.js';
 
+import type { ChainContext, HitlResumeContext, LoopContext } from './queue.js';
+
 export interface WorkerQueueRegistry {
   getQueueById(queueId: string): WorkerQueueConfig | undefined;
-  /** (initialInput, previousOutputs) for best DX: derive next input from original request and all prior step outputs. */
-  invokeMapInput?: (
+  getStepAt?(queueId: string, stepIndex: number): {
+    workerId?: string;
+    requiresApproval?: boolean;
+    hasChain?: boolean;
+    hasResume?: boolean;
+    hasLoop?: boolean;
+    hitl?: unknown;
+  } | undefined;
+  /** Build next-step input during normal chain advancement (no HITL). */
+  invokeChain?: (
     queueId: string,
     stepIndex: number,
-    initialInput: unknown,
-    previousOutputs: Array<{ stepIndex: number; workerId: string; output: unknown }>
+    ctx: ChainContext
   ) => Promise<unknown> | unknown;
+  /** Build domain input when a HITL step resumes after human approval. */
+  invokeResume?: (
+    queueId: string,
+    stepIndex: number,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ctx: HitlResumeContext<any>
+  ) => Promise<unknown> | unknown;
+  /** Evaluate whether a looping step should run again after its output. */
+  invokeLoop?: (
+    queueId: string,
+    stepIndex: number,
+    ctx: LoopContext
+  ) => Promise<boolean> | boolean;
 }
 
 export interface DispatchOptions {
@@ -35,6 +57,12 @@ export interface DispatchOptions {
    */
   mode?: 'auto' | 'local' | 'remote';
   jobId?: string;
+  /**
+   * The ID of the user who triggered this job.
+   * Call getClientId() in your API route and pass the result here.
+   * If omitted, userId is not stored and not logged.
+   */
+  userId?: string;
   metadata?: Record<string, any>;
   /**
    * In-memory queue registry for dispatchQueue. Required when using dispatchQueue.
@@ -51,6 +79,13 @@ export interface DispatchOptions {
     firstStep: { workerId: string; workerJobId: string };
     metadata?: Record<string, unknown>;
   }) => Promise<void>;
+  /**
+   * Maximum total tokens (input + output) allowed for this job.
+   * The worker must call ctx.reportTokenUsage() after each LLM call.
+   * Throws TokenBudgetExceededError when the limit is reached.
+   * For queues, applies per-step unless overridden on the queue step config.
+   */
+  maxTokens?: number;
 }
 
 export interface DispatchResult {
@@ -69,6 +104,7 @@ export interface SerializedContext {
   traceId?: string;
   [key: string]: any;
 }
+
 
 /**
  * Derives the full /workers/trigger URL from env.
@@ -146,6 +182,10 @@ function serializeContext(ctx: any): SerializedContext {
     serialized.requestId = ctx.requestId;
   }
 
+  if (ctx.userId) {
+    serialized.userId = ctx.userId;
+  }
+
   // Extract any additional serializable metadata
   if (ctx.metadata && typeof ctx.metadata === 'object') {
     Object.assign(serialized, ctx.metadata);
@@ -191,6 +231,10 @@ export async function dispatch<INPUT_SCHEMA extends ZodType<any>>(
   // Serialize context (only safe, JSON-compatible parts)
   const serializedContext = ctx ? serializeContext(ctx) : {};
 
+  // Attach userId if explicitly provided in options or context.
+  const userId = options.userId ?? (ctx?.userId as string | undefined);
+  if (userId) serializedContext.userId = userId;
+
   // Job updates use MongoDB only; never pass jobStoreUrl/origin URL.
   const messageBody = {
     workerId,
@@ -200,6 +244,7 @@ export async function dispatch<INPUT_SCHEMA extends ZodType<any>>(
     webhookUrl: options.webhookUrl,
     metadata: options.metadata || {},
     timestamp: new Date().toISOString(),
+    ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
   };
 
   const headers: Record<string, string> = {
@@ -256,6 +301,8 @@ export async function dispatchWorker(
     options.jobId || `job-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
   const triggerUrl = getWorkersTriggerUrl();
   const serializedContext = ctx ? serializeContext(ctx) : {};
+  const userId = options.userId ?? (ctx?.userId as string | undefined);
+  if (userId) serializedContext.userId = userId;
   const messageBody = {
     workerId,
     jobId,
@@ -264,6 +311,7 @@ export async function dispatchWorker(
     webhookUrl: options.webhookUrl,
     metadata: options.metadata || {},
     timestamp: new Date().toISOString(),
+    ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
   };
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   const triggerKey = process.env.WORKERS_TRIGGER_API_KEY;
@@ -321,6 +369,7 @@ export async function dispatchQueue<InitialInput = any>(
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   const triggerKey = process.env.WORKERS_TRIGGER_API_KEY;
   if (triggerKey) headers['x-workers-trigger-key'] = triggerKey;
+  const userId = options.userId ?? (_ctx?.userId as string | undefined);
   const response = await fetch(queueStartUrl, {
     method: 'POST',
     headers,
@@ -329,6 +378,7 @@ export async function dispatchQueue<InitialInput = any>(
       initialInput: normalizedInput,
       metadata: options.metadata ?? {},
       jobId,
+      ...(userId ? { userId } : {}),
       ...(options.webhookUrl ? { webhookUrl: options.webhookUrl } : {}),
     }),
   });

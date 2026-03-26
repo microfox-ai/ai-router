@@ -5,12 +5,21 @@
 
 import { dispatch, dispatchLocal, getWorkersTriggerUrl, type DispatchOptions, type DispatchResult } from './client.js';
 import { createLambdaHandler, createWorkerLogger, type WorkerHandler, type JobStore, type DispatchWorkerOptions, SQS_MAX_DELAY_SECONDS } from './handler.js';
+import { QUEUE_ORCHESTRATION_KEYS } from './queue.js';
+import { type SmartRetryConfig, type RetryContext, executeWithRetry } from './retryConfig.js';
+import { type TokenUsage, createTokenTracker } from './tokenBudget.js';
 import type { ZodType, z } from 'zod';
 
 export * from './client.js';
 export * from './handler.js';
 export * from './config.js';
 export * from './queue.js';
+export * from './queueInputEnvelope.js';
+export * from './chainMapDefaults.js';
+export * from './hitlConfig.js';
+export * from './retryConfig.js';
+export { TokenBudgetExceededError } from './tokenBudget.js';
+export type { TokenUsage, TokenBudgetState } from './tokenBudget.js';
 
 /**
  * Schedule event configuration for a worker.
@@ -199,6 +208,18 @@ export interface WorkerAgentConfig<INPUT_SCHEMA extends ZodType<any>, OUTPUT> {
   outputSchema: ZodType<OUTPUT>;
   handler: WorkerHandler<z.infer<INPUT_SCHEMA>, OUTPUT>;
   /**
+   * Smart retry configuration for this worker.
+   * Applies whenever this worker runs (Lambda or local mode).
+   * Can be overridden per queue step via WorkerQueueStep.retry.
+   * Retries are in-process so ctx.retryContext is populated on each retry attempt.
+   *
+   * @example
+   * ```ts
+   * retry: { maxAttempts: 3, on: ['rate-limit', 'json-parse'] }
+   * ```
+   */
+  retry?: SmartRetryConfig;
+  /**
    * @deprecated Prefer exporting `workerConfig` as a separate const from your worker file.
    * The CLI will automatically extract it from the export. This parameter is kept for backward compatibility.
    */
@@ -215,6 +236,8 @@ export interface WorkerAgent<INPUT_SCHEMA extends ZodType<any>, OUTPUT> {
   inputSchema: INPUT_SCHEMA;
   outputSchema: ZodType<OUTPUT>;
   workerConfig?: WorkerConfig;
+  /** Smart retry config set on this worker via createWorker({ retry }). */
+  retry?: SmartRetryConfig;
 }
 
 /**
@@ -250,13 +273,14 @@ export interface WorkerAgent<INPUT_SCHEMA extends ZodType<any>, OUTPUT> {
 export function createWorker<INPUT_SCHEMA extends ZodType<any>, OUTPUT>(
   config: WorkerAgentConfig<INPUT_SCHEMA, OUTPUT>
 ): WorkerAgent<INPUT_SCHEMA, OUTPUT> {
-  const { id, inputSchema, outputSchema, handler } = config;
+  const { id, inputSchema, outputSchema, handler, retry: retryConfig } = config;
 
   const agent: WorkerAgent<INPUT_SCHEMA, OUTPUT> = {
     id,
     handler,
     inputSchema,
     outputSchema,
+    retry: retryConfig,
 
     async dispatch(input: z.input<INPUT_SCHEMA>, options: DispatchOptions): Promise<DispatchResult> {
       const mode = options.mode ?? 'auto';
@@ -267,9 +291,19 @@ export function createWorker<INPUT_SCHEMA extends ZodType<any>, OUTPUT>(
       const isLocal = mode === 'local' || (mode === 'auto' && envWantsLocal);
 
       if (isLocal) {
-        // Local mode: run handler immediately
-        // Parse input to apply defaults and get the final parsed type
-        const parsedInput = inputSchema.parse(input);
+        // Local mode: run handler immediately.
+        // Strip queue/HITL orchestration keys before parsing so workers don't need
+        // queueOrchestrationFieldsSchema in their Zod schemas.
+        const rawInputObj =
+          input !== null && typeof input === 'object' ? (input as Record<string, unknown>) : null;
+        const domainInput = rawInputObj
+          ? Object.fromEntries(
+              Object.entries(rawInputObj).filter(
+                ([k]) => k !== '__workerQueue' && !(QUEUE_ORCHESTRATION_KEYS as readonly string[]).includes(k)
+              )
+            )
+          : input;
+        const parsedInput = inputSchema.parse(domainInput);
         const localJobId = options.jobId || `local-${Date.now()}`;
         
         // Try to get direct job store access in local mode (same process as Next.js app)
@@ -559,6 +593,7 @@ export function createWorker<INPUT_SCHEMA extends ZodType<any>, OUTPUT>(
             const metadata = options?.metadata ?? {};
             const serializedContext: Record<string, any> = {};
             if (parentContext.requestId) serializedContext.requestId = parentContext.requestId;
+            if (parentContext.userId) serializedContext.userId = parentContext.userId;
             const messageBody = {
               workerId: calleeWorkerId,
               jobId: childJobId,
@@ -675,17 +710,36 @@ export function createWorker<INPUT_SCHEMA extends ZodType<any>, OUTPUT>(
           }
         }
 
-        const baseContext = { jobId: localJobId, workerId: id };
-        const handlerContext = {
+        const localUserId = options.userId;
+        const baseContext = {
+          jobId: localJobId,
+          workerId: id,
+          ...(localUserId ? { userId: localUserId } : {}),
+        };
+        if (localUserId) {
+          // Parseable audit log matching Lambda pattern for consistent log parsing.
+          console.log(`[WORKER_USER:${localUserId}]`, { jobId: localJobId, workerId: id, mode: 'local', timestamp: new Date().toISOString() });
+        }
+
+        const localLogger = createWorkerLogger(localJobId, id);
+        const tokenTracker = createTokenTracker(options.maxTokens ?? null);
+
+        const handlerContext: any = {
           ...baseContext,
           ...(jobStore ? { jobStore } : {}),
-          logger: createWorkerLogger(localJobId, id),
-          dispatchWorker: createLocalDispatchWorker(
-            localJobId,
-            id,
-            baseContext,
-            jobStore
-          ),
+          logger: localLogger,
+          dispatchWorker: createLocalDispatchWorker(localJobId, id, baseContext, jobStore),
+          reportTokenUsage: async (usage: TokenUsage) => {
+            tokenTracker.report(usage);
+            const state = tokenTracker.getState();
+            if (jobStore) {
+              await jobStore.update({ metadata: { tokenUsage: state } }).catch((e: any) => {
+                localLogger.warn('Failed to persist tokenUsage', { error: e?.message });
+              });
+            }
+          },
+          getTokenBudget: () => tokenTracker.getBudgetInfo(),
+          retryContext: undefined as RetryContext | undefined,
         };
 
         try {
@@ -694,7 +748,19 @@ export function createWorker<INPUT_SCHEMA extends ZodType<any>, OUTPUT>(
             await jobStore.update({ status: 'running' });
           }
 
-          const output = await dispatchLocal(handler, parsedInput, handlerContext);
+          const executeLocal = async (retryCtx: RetryContext | undefined) => {
+            handlerContext.retryContext = retryCtx;
+            return dispatchLocal(handler, parsedInput, handlerContext);
+          };
+
+          const output = retryConfig && retryConfig.on.length > 0
+            ? await executeWithRetry(executeLocal, retryConfig, (retryCtx, delayMs) => {
+                localLogger.warn(
+                  `[worker-retry] Local retry (attempt ${retryCtx.attempt}/${retryCtx.maxAttempts}): ${retryCtx.lastError.message}`,
+                  { delayMs }
+                );
+              })
+            : await executeLocal(undefined);
 
           // Update status to completed before webhook
           if (jobStore) {
@@ -782,5 +848,5 @@ export function createWorker<INPUT_SCHEMA extends ZodType<any>, OUTPUT>(
 export function createLambdaEntrypoint<INPUT_SCHEMA extends ZodType<any>, OUTPUT>(
   agent: WorkerAgent<INPUT_SCHEMA, OUTPUT>
 ) {
-  return createLambdaHandler(agent.handler, agent.outputSchema);
+  return createLambdaHandler(agent.handler, agent.outputSchema, { retry: agent.retry });
 }

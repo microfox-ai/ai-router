@@ -1,5 +1,13 @@
 # @microfox/ai-worker
 
+## 1.0.5
+
+### Patch Changes
+
+- 8243849: Changes from PR #59: ai-worker-hitl-and-smart-retry
+- Updated dependencies [8243849]
+  - @microfox/ai-router@2.1.6
+
 ## 1.0.4
 
 ### Patch Changes

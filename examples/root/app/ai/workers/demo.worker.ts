@@ -71,18 +71,29 @@ const dispatchDemoOutput = z.object({
 
 const outputSchema = z.union([echoOutput, processOutput, dispatchDemoOutput]);
 
+type ProcessOperation = 'analyze' | 'transform' | 'validate';
+
+function asProcessOperation(value: unknown): ProcessOperation {
+  if (value === 'analyze' || value === 'transform' || value === 'validate') {
+    return value;
+  }
+  return 'transform';
+}
+
 /** Config for Lambda (timeout, memory). Extracted by ai-worker-cli when bundling. */
 export const workerConfig = {
   timeout: 300,
   memorySize: 512,
+  group: "test"
 };
 
 export default createWorker({
   id: 'demo',
   inputSchema,
-  outputSchema: outputSchema as any,
+  outputSchema,
   handler: async ({ input, ctx }) => {
-    const raw = input as any;
+    /** Loose shape: queue may attach `__workerQueue`; legacy payloads omit `mode`. */
+    const raw = input as Record<string, unknown>;
     // Queue/schedule often sends {} or { __workerQueue }; treat as process with defaults
     const mode =
       raw.mode ??
@@ -120,9 +131,11 @@ export default createWorker({
     }
 
     // process (mode === 'process' or legacy payload with operation or minimal/queue input)
-    const data = raw.data ?? (raw.content != null ? [raw.content] : []);
-    const operation = raw.operation ?? 'transform';
-    const batchSize = raw.batchSize ?? 10;
+    const dataRaw = raw.data ?? (raw.content != null ? [raw.content] : []);
+    const data = Array.isArray(dataRaw) ? dataRaw : [];
+    const operation = asProcessOperation(raw.operation);
+    const batchSize =
+      typeof raw.batchSize === 'number' && !Number.isNaN(raw.batchSize) ? raw.batchSize : 10;
     const totalItems = data.length;
     let processed = 0;
     const results: any[] = [];

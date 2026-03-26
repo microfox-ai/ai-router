@@ -12,6 +12,7 @@ import { z } from 'zod';
 export const workerConfig = {
   timeout: 300,
   memorySize: 512,
+  group: "test"
 };
 
 export default createWorker({

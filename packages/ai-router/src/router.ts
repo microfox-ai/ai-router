@@ -1261,8 +1261,6 @@ export class AiRouter<
     }
   }
 
-  private pendingExecutions = 0;
-
   /**
    * The main public entry point for the router. It handles an incoming request,
    * sets up the response stream, creates the root context, and starts the execution chain.
@@ -1324,7 +1322,8 @@ export class AiRouter<
       | 'retryContext'
     > & { maxTokens?: number },
     executionCompletionPromise: Promise<void>,
-    executionCompletionResolver: (() => void) | null
+    executionCompletionResolver: (() => void) | null,
+    onExecutionResult?: (result: any) => void
   ) {
     const self = this;
     // Extract maxTokens before entering the stream (not part of AiContext shape).
@@ -1335,6 +1334,7 @@ export class AiRouter<
       execute: async ({ writer }) => {
         const streamWriter = new StreamWriter<KIT_METADATA, TOOLS>(writer);
         const requestId = generateId();
+        let pendingExecutions = 0;
 
         // If the configured store is a MemoryStore, create a new one for each request
         // to prevent state leakage between concurrent requests. If it's a different
@@ -1390,17 +1390,17 @@ export class AiRouter<
           getTokenBudget,
           retryContext: undefined,
           _onExecutionStart: () => {
-            self.pendingExecutions++;
+            pendingExecutions++;
             self.logger?.log(
-              `[AiAgentKit][lifecycle] Execution started. Pending: ${self.pendingExecutions}`
+              `[AiAgentKit][lifecycle] Execution started. Pending: ${pendingExecutions}`
             );
           },
           _onExecutionEnd: () => {
-            self.pendingExecutions--;
+            pendingExecutions = Math.max(0, pendingExecutions - 1);
             self.logger?.log(
-              `[AiAgentKit][lifecycle] Execution ended. Pending: ${self.pendingExecutions}`
+              `[AiAgentKit][lifecycle] Execution ended. Pending: ${pendingExecutions}`
             );
-            if (self.pendingExecutions === 0 && executionCompletionResolver) {
+            if (pendingExecutions === 0 && executionCompletionResolver) {
               self.logger?.log(
                 `[AiAgentKit][lifecycle] All executions finished. Resolving promise.`
               );
@@ -1436,6 +1436,7 @@ export class AiRouter<
 
         try {
           const response = await self._execute(path, ctx);
+          onExecutionResult?.(response);
           const toolDefinition = this.actAsToolDefinitions.get(path);
           if (toolDefinition && !toolDefinition.metadata?.hideUI) {
             ctx.response.writeCustomTool({
@@ -1447,6 +1448,7 @@ export class AiRouter<
           return response;
         } catch (err) {
           ctx.logger.error('Unhandled error in main execution chain', err);
+          throw err;
         } finally {
           ctx._onExecutionEnd();
           self.logger?.log(
@@ -1503,12 +1505,16 @@ export class AiRouter<
     const executionCompletionPromise = new Promise<void>((resolve) => {
       executionCompletionResolver = resolve;
     });
+    let executionResult: unknown = undefined;
 
     const stream = this.handleStream(
       path,
       initialContext,
       executionCompletionPromise,
-      executionCompletionResolver
+      executionCompletionResolver,
+      (result) => {
+        executionResult = result;
+      }
     );
 
     const messageStream = readUIMessageStream({
@@ -1520,31 +1526,55 @@ export class AiRouter<
 
     let finalMessages: UIMessage[] = [];
     const thisMessageId = generateId();
-    for await (const message of messageStream) {
-      if (message.id?.length > 0) {
-        finalMessages.push(message);
-      } else if (finalMessages.find((m) => m.id === thisMessageId)) {
-        finalMessages = finalMessages.map((m) =>
-          m.id === thisMessageId
-            ? {
-              ...m,
-              metadata: {
-                ...(m.metadata ?? {}),
-                ...(message.metadata ?? {}),
-              },
-              parts: clubParts([
-                ...(m.parts ?? []),
-                ...(message.parts ?? []),
-              ]),
-            }
-            : m
-        );
-      } else {
-        finalMessages.push({
-          ...message,
-          id: thisMessageId,
-        });
+    try {
+      for await (const message of messageStream) {
+        if (message.id?.length > 0) {
+          finalMessages.push(message);
+        } else if (finalMessages.find((m) => m.id === thisMessageId)) {
+          finalMessages = finalMessages.map((m) =>
+            m.id === thisMessageId
+              ? {
+                ...m,
+                metadata: {
+                  ...(m.metadata ?? {}),
+                  ...(message.metadata ?? {}),
+                },
+                parts: clubParts([
+                  ...(m.parts ?? []),
+                  ...(message.parts ?? []),
+                ]),
+              }
+              : m
+          );
+        } else {
+          finalMessages.push({
+            ...message,
+            id: thisMessageId,
+          });
+        }
       }
+    } catch (error) {
+      this.logger?.error('Error while aggregating awaited response', error);
+      const message =
+        error instanceof Error ? error.message : 'Failed to resolve agent response';
+      return new Response(
+        JSON.stringify({
+          error: { message },
+        }),
+        {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        }
+      );
+    }
+
+    if (finalMessages.length === 0) {
+      const responseBody = JSON.stringify(
+        executionResult === undefined ? { ok: true } : executionResult
+      );
+      return new Response(responseBody, {
+        headers: { 'Content-Type': 'application/json' },
+      });
     }
     const responseBody = JSON.stringify(finalMessages);
     return new Response(responseBody, {

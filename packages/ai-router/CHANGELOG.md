@@ -1,5 +1,11 @@
 # @microfox/ai-router
 
+## 2.1.7
+
+### Patch Changes
+
+- fdfed29: Changes from PR #61: minor-ai-router-fix-april-2026
+
 ## 2.1.6
 
 ### Patch Changes

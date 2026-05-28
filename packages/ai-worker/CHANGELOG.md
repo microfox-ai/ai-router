@@ -1,5 +1,11 @@
 # @microfox/ai-worker
 
+## 1.0.6
+
+### Patch Changes
+
+- 6d1bac8: Changes from PR #63: minor-fixes-may-2026
+
 ## 1.0.5
 
 ### Patch Changes

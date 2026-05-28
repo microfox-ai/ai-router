@@ -6,7 +6,7 @@
 
 import type { SQSEvent, SQSRecord, Context as LambdaContext } from 'aws-lambda';
 import type { ZodType } from 'zod';
-import { SQSClient, SendMessageCommand } from '@aws-sdk/client-sqs';
+import { SQSClient, SendMessageCommand, GetQueueUrlCommand } from '@aws-sdk/client-sqs';
 import {
   createMongoJobStore,
   upsertJob,
@@ -798,9 +798,22 @@ function sanitizeWorkerIdForEnv(workerId: string): string {
   return workerId.replace(/-/g, '_').toUpperCase();
 }
 
-function getQueueUrlForWorker(calleeWorkerId: string): string | undefined {
+async function resolveQueueUrlForWorker(calleeWorkerId: string): Promise<string | undefined> {
   const key = `WORKER_QUEUE_URL_${sanitizeWorkerIdForEnv(calleeWorkerId)}`;
-  return process.env[key]?.trim() || undefined;
+  const fromEnv = process.env[key]?.trim();
+  if (fromEnv) return fromEnv;
+  const serviceName = process.env.WORKER_SERVICE_NAME;
+  if (!serviceName) return undefined;
+  const stage = process.env.ENVIRONMENT || process.env.STAGE || 'prod';
+  const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-east-1';
+  const queueName = `${serviceName}-${calleeWorkerId}-${stage}`;
+  try {
+    const sqs = new SQSClient({ region });
+    const { QueueUrl } = await sqs.send(new GetQueueUrlCommand({ QueueName: queueName }));
+    return QueueUrl ?? undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -840,7 +853,7 @@ function createDispatchWorker(
       timestamp: new Date().toISOString(),
     };
 
-    const queueUrl = getQueueUrlForWorker(calleeWorkerId);
+    const queueUrl = await resolveQueueUrlForWorker(calleeWorkerId);
 
     if (queueUrl) {
       const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-east-1';
@@ -894,10 +907,10 @@ function createDispatchWorker(
       return { jobId: childJobId, messageId };
     }
 
-    // Fallback: no queue URL (e.g. local dev). Caller (index.ts) should provide in-process dispatch.
+    // No queue URL found — env var missing and WORKER_SERVICE_NAME not set for SQS fallback.
     throw new Error(
-      `WORKER_QUEUE_URL_${sanitizeWorkerIdForEnv(calleeWorkerId)} is not set. ` +
-        'Configure queue URL for worker-to-worker dispatch, or run in local mode.'
+      `Cannot dispatch to worker "${calleeWorkerId}": WORKER_QUEUE_URL_${sanitizeWorkerIdForEnv(calleeWorkerId)} is not set` +
+        ' and WORKER_SERVICE_NAME is not configured for SQS fallback lookup.'
     );
   };
 }

@@ -551,6 +551,8 @@ interface WorkerInfo {
       deadLetterMessageRetentionPeriod?: number;
     };
   };
+  /** JSON Schema derived from the worker's inputSchema (zod) at build time. */
+  inputSchema?: Record<string, any>;
 }
 
 interface ServerlessConfig {
@@ -1059,7 +1061,7 @@ function getWorkersInQueues(queues: QueueInfo[]): Set<string> {
 }
 
 /**
- * Merges queue next-step worker IDs into calleeIds so WORKER_QUEUE_URL_* gets injected.
+ * Merges queue next-step worker IDs into calleeIds for per-function environment injection.
  */
 function mergeQueueCallees(
   calleeIds: Map<string, Set<string>>,
@@ -1083,6 +1085,137 @@ function mergeQueueCallees(
     }
   }
   return merged;
+}
+
+/**
+ * esbuild plugin for schema extraction.
+ *
+ * Intercepts every import so only two things are bundled for real:
+ *   1. The worker source file itself (workerRelPath) — so the InputSchema is created.
+ *   2. zod — so z.object / z.string / etc. are real Zod constructors.
+ *
+ * @microfox/ai-worker gets a targeted stub whose createWorker() correctly
+ * preserves inputSchema on the returned object (the real Zod schema), but
+ * doesn't pull in MongoDB, AWS SDKs, or anything else that throws at init.
+ *
+ * Everything else (project libs like ../../../../lib/mongodb, cloud SDKs,
+ * etc.) becomes a Proxy stub — safe to reference at module level, never called.
+ */
+function createSchemaExtractionPlugin(workerRelPath: string): esbuild.Plugin {
+  const PROXY_STUB = `
+const STUB = new Proxy({}, {
+  get(t, p) { return typeof p === 'symbol' ? t[p] : STUB; },
+  apply() { return STUB; },
+  construct() { return Object.create(STUB); }
+});
+module.exports = STUB;
+`;
+  // Minimal createWorker stub: preserves id/inputSchema/outputSchema/handler so
+  // workerAgent.inputSchema is the real Zod schema after module evaluation.
+  const AI_WORKER_STUB = `
+const STUB = new Proxy({}, {
+  get(t, p) { return typeof p === 'symbol' ? t[p] : STUB; },
+  apply() { return STUB; },
+  construct() { return Object.create(STUB); }
+});
+exports.createWorker = function(config) {
+  return {
+    id: config.id,
+    inputSchema: config.inputSchema,
+    outputSchema: config.outputSchema,
+    handler: config.handler || STUB,
+    dispatch: STUB,
+    retry: config.retry,
+    workerConfig: config.workerConfig,
+  };
+};
+module.exports = new Proxy(exports, {
+  get(t, p) { return p in t ? t[p] : (typeof p === 'symbol' ? t[p] : STUB); }
+});
+`;
+
+  return {
+    name: 'schema-extraction-stub',
+    setup(build) {
+      build.onResolve({ filter: /.*/ }, (args) => {
+        const p = args.path;
+        // Entry point (no importer) → let esbuild resolve it normally.
+        if (!args.importer) return undefined;
+        // Imports from within bundled packages (e.g. zod internal sub-modules)
+        // must resolve normally so the package stays functional.
+        if (args.importer.includes('node_modules')) return undefined;
+        // Let the worker source through so its Zod schemas are evaluated for real.
+        if (p === workerRelPath) return undefined;
+        // Let zod through so z.object / z.string etc. are genuine constructors.
+        if (p === 'zod' || p.startsWith('zod/')) return undefined;
+        // @microfox/ai-worker gets a minimal stub that keeps createWorker functional.
+        if (p === '@microfox/ai-worker' || p.startsWith('@microfox/ai-worker/')) {
+          return { path: p, namespace: 'ai-worker-stub-ns' };
+        }
+        // Everything else (MongoDB, AWS SDKs, project libs, etc.) → generic Proxy stub.
+        return { path: p, namespace: 'stub-ns' };
+      });
+      build.onLoad({ filter: /.*/, namespace: 'ai-worker-stub-ns' }, () => ({
+        contents: AI_WORKER_STUB,
+        loader: 'js',
+      }));
+      build.onLoad({ filter: /.*/, namespace: 'stub-ns' }, () => ({
+        contents: PROXY_STUB,
+        loader: 'js',
+      }));
+    },
+  };
+}
+
+/**
+ * Tries to extract a worker's inputSchema as JSON Schema using a stub-based esbuild bundle
+ * that mocks all heavy dependencies so module init doesn't throw.
+ */
+async function extractSchemaViaStub(
+  worker: WorkerInfo,
+  handlerFile: string,
+  relativeImportPath: string,
+  workerRef: string
+): Promise<Record<string, any> | undefined> {
+  const nonce = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const extractEntry = handlerFile.replace('.js', `.schema-extract-${nonce}.ts`);
+  const extractOut = handlerFile.replace('.js', `.schema-extract-${nonce}.cjs`);
+  try {
+    // The entry calls z.toJSONSchema() *inside* the bundle so the same zod
+    // instance that created the schema converts it — no cross-instance mismatch.
+    fs.writeFileSync(
+      extractEntry,
+      `import * as workerModule from '${relativeImportPath}';
+import { z } from 'zod';
+const workerAgent = ${workerRef};
+const _schema = workerAgent?.inputSchema ?? workerModule?.default?.inputSchema;
+export const exportedSchemaJSON: string | null = (() => {
+  try { return _schema ? JSON.stringify((z as any).toJSONSchema(_schema)) : null; } catch { return null; }
+})();
+`
+    );
+    await esbuild.build({
+      entryPoints: [extractEntry],
+      bundle: true,
+      platform: 'node',
+      target: 'node20',
+      format: 'cjs',
+      outfile: extractOut,
+      plugins: [createSchemaExtractionPlugin(relativeImportPath)],
+      packages: 'bundle',
+      logLevel: 'silent',
+    });
+    const mod = await import(pathToFileURL(path.resolve(extractOut)).href);
+    if (mod.exportedSchemaJSON) {
+      return JSON.parse(mod.exportedSchemaJSON as string) as Record<string, any>;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  } finally {
+    try { if (fs.existsSync(extractEntry)) fs.unlinkSync(extractEntry); } catch {}
+    try { if (fs.existsSync(extractOut)) fs.unlinkSync(extractOut); } catch {}
+  }
 }
 
 /**
@@ -1210,6 +1343,7 @@ export const handler = async (event: any, context: any) => {
 };
 
 export const exportedWorkerConfig = workerModule.workerConfig || workerAgent?.workerConfig;
+export const exportedInputSchema = workerAgent?.inputSchema ?? workerModule?.default?.inputSchema;
 `
       : `
 import { createLambdaHandler } from '@microfox/ai-worker/handler';
@@ -1240,6 +1374,7 @@ export const handler = async (event: any, context: any) => {
 };
 
 export const exportedWorkerConfig = workerModule.workerConfig || workerAgent?.workerConfig;
+export const exportedInputSchema = workerAgent?.inputSchema ?? workerModule?.default?.inputSchema;
 `;
 
     const tempEntryContent = handlerCreation;
@@ -1549,7 +1684,13 @@ export const handler = async (
   console.log(chalk.green(`✓ Generated docs.json handler`));
 }
 
-function generateTriggerHandler(outputDir: string, serviceName: string, externalPackages: string[] = []): void {
+function generateTriggerHandler(
+  outputDir: string,
+  serviceName: string,
+  externalPackages: string[] = [],
+  workers: WorkerInfo[] = [],
+  groupServiceNames: Record<string, string> = {}
+): void {
   const apiDir = path.join(outputDir, 'handlers', 'api');
   const handlerFile = path.join(apiDir, 'workers-trigger.js');
   const tempEntryFile = handlerFile.replace('.js', '.temp.ts');
@@ -1568,6 +1709,12 @@ import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { SQSClient, GetQueueUrlCommand, SendMessageCommand } from '@aws-sdk/client-sqs';
 
 const SERVICE_NAME = ${JSON.stringify(serviceName)};
+const WORKER_GROUPS: Record<string, string> = ${JSON.stringify(
+    Object.fromEntries(workers.map((w) => [w.id, w.group || 'default'])),
+    null,
+    2
+  )};
+const GROUP_SERVICE_NAMES: Record<string, string> = ${JSON.stringify(groupServiceNames, null, 2)};
 
 function jsonResponse(statusCode: number, body: any): APIGatewayProxyResult {
   return {
@@ -1632,7 +1779,10 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
   const sqs = new SQSClient({ region });
   let queueName: string | undefined;
   if (!queueUrl) {
-    queueName = \`\${SERVICE_NAME}-\${workerId}-\${stage}\`;
+    // Use per-group service name so workers in non-core groups resolve their own queue.
+    const workerGroup = WORKER_GROUPS[workerId] || 'default';
+    const workerServiceName = GROUP_SERVICE_NAMES[workerGroup] || SERVICE_NAME;
+    queueName = \`\${workerServiceName}-\${workerId}-\${stage}\`;
     try {
       const urlRes = await sqs.send(new GetQueueUrlCommand({ QueueName: queueName }));
       if (!urlRes.QueueUrl) {
@@ -1847,7 +1997,8 @@ function generateWorkersConfigHandler(
   workers: WorkerInfo[],
   serviceName: string,
   queues: QueueInfo[] = [],
-  externalPackages: string[] = []
+  externalPackages: string[] = [],
+  groupServiceNames: Record<string, string> = {}
 ): void {
   // We'll bundle this one too
   const apiDir = path.join(outputDir, 'handlers', 'api');
@@ -1867,15 +2018,21 @@ function generateWorkersConfigHandler(
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { SQSClient, GetQueueUrlCommand } from '@aws-sdk/client-sqs';
 
-// Worker IDs and queue definitions embedded at build time.
+// Worker IDs, schemas, and queue definitions embedded at build time.
 const WORKER_IDS: string[] = ${JSON.stringify(workers.map(w => w.id), null, 2)};
 const WORKER_GROUPS: Record<string, string> = ${JSON.stringify(
     Object.fromEntries(workers.map((w) => [w.id, w.group || 'default'])),
     null,
     2
   )};
+const WORKER_SCHEMAS: Record<string, unknown> = ${JSON.stringify(
+    Object.fromEntries(workers.filter(w => w.inputSchema).map(w => [w.id, w.inputSchema])),
+    null,
+    2
+  )};
 const QUEUES = ${JSON.stringify(queues.map(q => ({ id: q.id, steps: q.steps, schedule: q.schedule })), null, 2)};
 const SERVICE_NAME = ${JSON.stringify(serviceName)};
+const GROUP_SERVICE_NAMES: Record<string, string> = ${JSON.stringify(groupServiceNames, null, 2)};
 
 export const handler = async (
   event: APIGatewayProxyEvent
@@ -1924,8 +2081,11 @@ export const handler = async (
         return;
       }
 
-      // Fallback: resolve via SQS GetQueueUrl for backward compatibility.
-      const queueName = \`\${SERVICE_NAME}-\${workerId}-\${stage}\`;
+      // Fallback: resolve via SQS GetQueueUrl. Use per-group service name so multi-group
+      // deployments look up the correct queue (e.g. "proj-cost-group-worker-id-prod").
+      const workerGroup = WORKER_GROUPS[workerId] || 'default';
+      const workerServiceName = GROUP_SERVICE_NAMES[workerGroup] || SERVICE_NAME;
+      const queueName = \`\${workerServiceName}-\${workerId}-\${stage}\`;
       attemptedQueueNames.push(queueName);
       try {
         const result = await sqs.send(new GetQueueUrlCommand({ QueueName: queueName }));
@@ -1958,6 +2118,7 @@ export const handler = async (
       stage,
       region,
       workers,
+      schemas: WORKER_SCHEMAS,
       queues: QUEUES,
       ...(debug ? { attemptedQueueNames, errors } : {}),
     }),
@@ -2471,14 +2632,6 @@ function generateServerlessConfigCore(
   const allWorkers = Array.from(allWorkersByGroup.values()).flat();
   const allGroups = Array.from(allWorkersByGroup.keys()).sort();
 
-  const queueUrlEnv: Record<string, string> = {};
-  for (const w of allWorkers) {
-    const svc = getServiceNameFromProjectId(projectId, w.group);
-    const queueNamePart = `${svc}-${w.id}`;
-    const url = `https://sqs.\${aws:region}.amazonaws.com/\${aws:accountId}/${queueNamePart}-\${opt:stage, env:ENVIRONMENT, '${stage}'}`;
-    queueUrlEnv[`WORKER_QUEUE_URL_${sanitizeWorkerIdForEnv(w.id)}`] = url;
-  }
-
   const queueArnPatterns: string[] = allGroups.map((g) => {
     const svc = getServiceNameFromProjectId(projectId, g);
     return `arn:aws:sqs:\${aws:region}:\${aws:accountId}:${svc}-*`;
@@ -2508,12 +2661,10 @@ function generateServerlessConfigCore(
   functions['triggerWorker'] = {
     handler: 'handlers/api/workers-trigger.handler',
     events: [{ http: { path: '/workers/trigger', method: 'POST', cors: true } }],
-    environment: queueUrlEnv,
   };
   functions['workersConfig'] = {
     handler: 'handlers/api/workers-config.handler',
     events: [{ http: { path: 'workers/config', method: 'GET', cors: true } }],
-    environment: queueUrlEnv,
   };
   for (const queue of queues) {
     const queueFileId = queue.id.replace(/[^a-zA-Z0-9-]/g, '-').replace(/-+/g, '-');
@@ -2527,7 +2678,6 @@ function generateServerlessConfigCore(
       timeout: 60,
       memorySize: 128,
       events,
-      environment: queueUrlEnv,
     };
   }
 
@@ -2675,7 +2825,7 @@ export const workersMap = ${JSON.stringify(queueUrls, null, 2)} as const;
 async function build(args: any) {
   const stage = args.stage || process.env.STAGE || 'prod';
   const region = args.region || process.env.AWS_REGION || 'us-east-1';
-  const aiPath = args['ai-path'] || 'app/ai';
+  const aiPath = args.aiPath ?? args['ai-path'] ?? 'app/ai';
 
   console.log(chalk.blue(`📦 Building workers (stage: ${stage}, region: ${region})...`));
 
@@ -2811,6 +2961,16 @@ async function build(args: any) {
     try {
       const handlerFile = path.join(serverlessDir, worker.handlerPath + '.js');
       if (fs.existsSync(handlerFile)) {
+        // Compute paths for stub-based schema extraction (same logic as generateHandlers)
+        const srcContent = fs.readFileSync(worker.filePath, 'utf-8');
+        const isDefaultExport = /export\s+default\s+createWorker/.test(srcContent);
+        const exportMatch = srcContent.match(/export\s+(const|let)\s+(\w+)\s*=\s*createWorker/);
+        const exportName = exportMatch ? exportMatch[2] : 'worker';
+        const workerRef = isDefaultExport ? 'workerModule.default' : `workerModule.${exportName}`;
+        let relImportPath = path.relative(path.dirname(path.resolve(handlerFile)), path.resolve(worker.filePath));
+        if (!relImportPath.startsWith('.')) relImportPath = './' + relImportPath;
+        relImportPath = relImportPath.replace(/\.ts$/, '').split(path.sep).join('/');
+
         // Convert absolute path to file:// URL for ESM import (required on Windows)
         const handlerUrl = pathToFileURL(path.resolve(handlerFile)).href;
 
@@ -2831,6 +2991,31 @@ async function build(args: any) {
           } else {
             worker.workerConfig = worker.workerConfig ?? { timeout: 300, memorySize: 512 };
             console.log(chalk.gray(`  ℹ ${worker.id}: using default config (exportedWorkerConfig not in bundle)`));
+          }
+
+          // Extract inputSchema → convert to JSON Schema and store on WorkerInfo
+          if (module.exportedInputSchema) {
+            try {
+              const { z } = await import('zod');
+              worker.inputSchema = z.toJSONSchema(module.exportedInputSchema) as Record<string, any>;
+              console.log(chalk.gray(`  ✓ ${worker.id}: inputSchema extracted`));
+            } catch {
+              // z.toJSONSchema unavailable (Zod v3?) — fall back to stub extraction
+              const schema = await extractSchemaViaStub(worker, handlerFile, relImportPath, workerRef);
+              if (schema) {
+                worker.inputSchema = schema;
+                console.log(chalk.gray(`  ✓ ${worker.id}: inputSchema extracted via stub`));
+              } else {
+                console.log(chalk.gray(`  ℹ ${worker.id}: inputSchema extraction failed (skipping)`));
+              }
+            }
+          } else {
+            // exportedInputSchema absent in main bundle — try stub extraction
+            const schema = await extractSchemaViaStub(worker, handlerFile, relImportPath, workerRef);
+            if (schema) {
+              worker.inputSchema = schema;
+              console.log(chalk.gray(`  ✓ ${worker.id}: inputSchema extracted via stub`));
+            }
           }
         } catch (importError: any) {
           // If import fails due to runtime errors (e.g., lazy-cache initialization in bundled code),
@@ -2868,6 +3053,13 @@ async function build(args: any) {
             // If fallback also fails, apply defaults
             worker.workerConfig = worker.workerConfig ?? { timeout: 300, memorySize: 512 };
             console.log(chalk.gray(`  ℹ ${worker.id}: using default config (fallback extraction failed)`));
+          }
+
+          // Stub-based schema extraction: mocks heavy SDK imports so createWorker evaluates cleanly
+          const schema = await extractSchemaViaStub(worker, handlerFile, relImportPath, workerRef);
+          if (schema) {
+            worker.inputSchema = schema;
+            console.log(chalk.gray(`  ✓ ${worker.id}: inputSchema extracted via stub`));
           }
         }
       } else {
@@ -2934,9 +3126,10 @@ async function build(args: any) {
     generateQueueRegistry(queues, coreDir, process.cwd());
     const serviceNameCore = getServiceNameFromProjectId(projectId, 'core');
     const coreExternalPackages = getExternalPackages(microfoxConfig, 'core');
-    generateWorkersConfigHandler(coreDir, workers, serviceNameCore, queues, coreExternalPackages);
+    const coreGroupServiceNames = Object.fromEntries(userGroups.map(g => [g, getServiceNameFromProjectId(projectId, g)]));
+    generateWorkersConfigHandler(coreDir, workers, serviceNameCore, queues, coreExternalPackages, coreGroupServiceNames);
     generateDocsHandler(coreDir, serviceNameCore, stage, region, coreExternalPackages);
-    generateTriggerHandler(coreDir, serviceNameCore, coreExternalPackages);
+    generateTriggerHandler(coreDir, serviceNameCore, coreExternalPackages, workers, coreGroupServiceNames);
     for (const queue of queues) {
       generateQueueHandler(coreDir, queue, serviceNameCore, coreExternalPackages);
     }
@@ -3030,9 +3223,10 @@ async function build(args: any) {
     return;
   }
 
-  generateWorkersConfigHandler(serverlessDir, workers, serviceName, queues, externalPackages);
+  const singleGroupServiceNames = Object.fromEntries([...new Set(workers.map(w => w.group || 'default'))].map(g => [g, serviceName]));
+  generateWorkersConfigHandler(serverlessDir, workers, serviceName, queues, externalPackages, singleGroupServiceNames);
   generateDocsHandler(serverlessDir, serviceName, stage, region, externalPackages);
-  generateTriggerHandler(serverlessDir, serviceName, externalPackages);
+  generateTriggerHandler(serverlessDir, serviceName, externalPackages, workers, singleGroupServiceNames);
 
   for (const queue of queues) {
     generateQueueHandler(serverlessDir, queue, serviceName, externalPackages);

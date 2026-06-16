@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { dispatchWorker } from '@microfox/ai-worker';
-import { getClientId } from '../../auth';
+import { authorizeWorkflowRequest } from '../../auth';
 
 /**
  * Worker execution endpoint.
@@ -19,6 +19,14 @@ export async function POST(
     const { slug: slugParam } = await params;
     slug = slugParam || [];
     const [workerId, action] = slug;
+
+    // Every mutating worker route requires a user session, the internal shared
+    // secret (Lambda callbacks), or an explicit public opt-out.
+    const auth = await authorizeWorkflowRequest(req);
+    if (!auth.ok) {
+      return NextResponse.json({ error: auth.error }, { status: auth.status });
+    }
+    const userId = auth.userId;
 
     // Handle webhook endpoint
     if (action === 'webhook') {
@@ -57,7 +65,6 @@ export async function POST(
     }
 
     const { input, await: shouldAwait = false, jobId: providedJobId } = body;
-    const userId = await getClientId(req);
 
     console.log('[Worker] Dispatching worker:', {
       workerId,
@@ -180,9 +187,36 @@ export async function GET(
   try {
     const { slug: slugParam } = await params;
     slug = slugParam || [];
-    const [workerId, jobId] = slug;
+    const [workerId, jobIdOrAction] = slug;
 
-    if (!workerId || !jobId) {
+    if (!workerId) {
+      return NextResponse.json(
+        { error: 'Worker ID is required' },
+        { status: 400 }
+      );
+    }
+
+    // GET /api/workflows/workers/:workerId/schema — return JSON schema of worker input
+    if (jobIdOrAction === 'schema') {
+      return handleGetSchema(workerId);
+    }
+
+    // GET /api/workflows/workers/:workerId/history — list all jobs for a worker
+    if (jobIdOrAction === 'history') {
+      const { listJobsByWorker } = await import('../../stores/jobStore');
+      const jobs = await listJobsByWorker(workerId);
+      // Sort newest first
+      const sorted = [...jobs].sort((a, b) => {
+        const ta = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+        const tb = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+        return tb - ta;
+      });
+      return NextResponse.json({ jobs: sorted }, { status: 200 });
+    }
+
+    const jobId = jobIdOrAction;
+
+    if (!jobId) {
       return NextResponse.json(
         { error: 'Worker ID and job ID are required' },
         { status: 400 }
@@ -257,6 +291,20 @@ export async function GET(
       { status: 500 }
     );
   }
+}
+
+/**
+ * Return the JSON Schema for a worker's input.
+ * Schema is embedded in the workers-config response at CLI build time — no dynamic imports.
+ * GET /api/workflows/workers/:workerId/schema
+ */
+async function handleGetSchema(workerId: string) {
+  const { getWorkerSchema } = await import('../../registry/workers');
+  const schema = await getWorkerSchema(workerId);
+  if (!schema) {
+    return NextResponse.json({ error: `No schema found for worker "${workerId}"` }, { status: 404 });
+  }
+  return NextResponse.json(schema, { status: 200 });
 }
 
 /**

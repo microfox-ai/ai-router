@@ -923,12 +923,20 @@ async function sendWebhook(
   payload: WebhookPayload
 ): Promise<void> {
   try {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'User-Agent': 'ai-router-worker/1.0',
+    };
+    // Present the internal shared secret so the consumer app can authorize this
+    // Lambda→app callback (the webhook route gates on it). Falls back to WORKERS_API_KEY so a
+    // single shared secret covers both surfaces. No-op when neither is set.
+    const internalSecret = process.env.WORKFLOW_INTERNAL_SECRET || process.env.WORKERS_API_KEY;
+    if (internalSecret && internalSecret.trim()) {
+      headers['x-workflow-secret'] = internalSecret.trim();
+    }
     const response = await fetch(webhookUrl, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': 'ai-router-worker/1.0',
-      },
+      headers,
       body: JSON.stringify(payload),
     });
 

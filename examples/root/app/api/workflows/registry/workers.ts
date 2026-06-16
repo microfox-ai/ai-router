@@ -12,6 +12,8 @@
 import {
   defaultMapChainContinueFromPrevious,
   defaultMapChainPassthrough,
+  resolveWorkersConfigKey,
+  resolveWorkersTriggerKey,
   type ChainContext,
   type LoopContext,
   type SmartRetryConfig,
@@ -43,6 +45,8 @@ export interface WorkersConfig {
   stage?: string;
   region?: string;
   workers: Record<string, { queueUrl: string; region: string }>;
+  /** JSON Schemas for each worker's input, keyed by worker ID. Embedded at CLI build time. */
+  schemas?: Record<string, unknown>;
   queues?: QueueConfig[];
 }
 
@@ -82,7 +86,7 @@ export async function fetchWorkersConfig(): Promise<WorkersConfig> {
   }
   const configUrl = getConfigUrl();
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  const apiKey = process.env.WORKERS_CONFIG_API_KEY;
+  const apiKey = resolveWorkersConfigKey();
   if (apiKey) {
     headers['x-workers-config-key'] = apiKey;
   }
@@ -128,7 +132,7 @@ function createSyntheticAgent(workerId: string): WorkerAgent<any, any> {
         timestamp: new Date().toISOString(),
       };
       const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      const key = process.env.WORKERS_TRIGGER_API_KEY;
+      const key = resolveWorkersTriggerKey();
       if (key) {
         headers['x-workers-trigger-key'] = key;
       }
@@ -271,6 +275,38 @@ export async function getQueueRegistry(): Promise<WorkerQueueRegistry> {
     },
   };
   return registry as WorkerQueueRegistry;
+}
+
+/** A Zod-like schema (anything exposing safeParse), used for runtime validation. */
+export interface ParsableSchema {
+  safeParse(input: unknown): { success: true; data: unknown } | { success: false; error: unknown };
+}
+
+/**
+ * Resolves the HITL reviewer-input Zod schema (`hitl.inputSchema`) for a queue step
+ * from the local `app/ai/queues/*.queue.ts` modules. Returns null when the step has no
+ * HITL schema. Used to validate reviewer-supplied input before it is dispatched into the
+ * next pipeline step (SEC-5). Resolves locally (no network) since Zod schemas don't
+ * survive the JSON workers/config round-trip.
+ */
+export function getStepHitlInputSchema(queueId: string, stepIndex: number): ParsableSchema | null {
+  const hitl = resolveModuleStep(queueId, stepIndex)?.hitl as
+    | { inputSchema?: unknown }
+    | undefined;
+  const schema = hitl?.inputSchema;
+  if (schema && typeof (schema as ParsableSchema).safeParse === 'function') {
+    return schema as ParsableSchema;
+  }
+  return null;
+}
+
+/**
+ * Returns the JSON Schema for a worker's input, or null if not available.
+ * Schema is embedded in the workers-config response at CLI build time — no dynamic imports needed.
+ */
+export async function getWorkerSchema(workerId: string): Promise<unknown | null> {
+  const config = await fetchWorkersConfig();
+  return config.schemas?.[workerId] ?? null;
 }
 
 /**

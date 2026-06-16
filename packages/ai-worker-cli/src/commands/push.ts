@@ -1,6 +1,7 @@
 import { Command } from 'commander';
 import * as esbuild from 'esbuild';
 import { execSync } from 'child_process';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { pathToFileURL } from 'url';
@@ -595,6 +596,68 @@ export function getServiceNameFromProjectId(projectId: string, group?: string): 
   }
   const groupSlug = group.replace(/-/g, '').slice(0, 12);
   return `p-${cleanedProjectId}-${groupSlug}`;
+}
+
+/**
+ * Derives a stable worker API key from a projectId. Must stay in sync with
+ * `deriveWorkersApiKey` in `@microfox/ai-worker` (client.ts) so the deployed
+ * Lambdas and the consuming app resolve the same value. The raw projectId is
+ * never used as the header value — only this hash.
+ */
+function deriveWorkersApiKey(projectId: string): string {
+  return crypto
+    .createHash('sha256')
+    .update('microfox-workers:' + projectId)
+    .digest('hex');
+}
+
+export interface ResolvedWorkersApiKey {
+  /** The unified key to enforce on /workers/trigger, /workers/config, /queues/{id}/start. */
+  key: string;
+  /** Where the key came from (for logging). */
+  source: 'WORKERS_API_KEY' | 'projectId' | 'legacy';
+  /**
+   * Whether to write `WORKERS_API_KEY` into env.json. False for the legacy path,
+   * where distinct WORKERS_TRIGGER_API_KEY / WORKERS_CONFIG_API_KEY are already
+   * carried into env.json via the WORKERS_ prefix allowlist and must not be
+   * overridden by a single unified key.
+   */
+  writeToEnv: boolean;
+}
+
+/**
+ * Resolves the stable secret used to gate the generated worker endpoints (SEC-4 / Plan B).
+ *
+ * Precedence (first hit wins):
+ *   1. WORKERS_API_KEY (unified, recommended) → enforce + write to env.json.
+ *   2. legacy WORKERS_TRIGGER_API_KEY / WORKERS_CONFIG_API_KEY → enforce via those
+ *      vars (handlers still read them); not overridden by a unified key.
+ *   3. projectId (microfox.json / MICROFOX_PROJECT_ID) → sha256-derived key,
+ *      written to env.json (zero-config path).
+ *   4. nothing → null → public deploy (implicit --allow-public, with a warning).
+ *
+ * The source is stable across pushes, so re-pushing never rotates the secret.
+ */
+function resolveWorkersApiKey(
+  microfoxConfig: Record<string, any> | null,
+  env: Record<string, string>
+): ResolvedWorkersApiKey | null {
+  const pick = (k: string): string => (env[k] || process.env[k] || '').trim();
+
+  const unified = pick('WORKERS_API_KEY');
+  if (unified) return { key: unified, source: 'WORKERS_API_KEY', writeToEnv: true };
+
+  const legacy = pick('WORKERS_TRIGGER_API_KEY') || pick('WORKERS_CONFIG_API_KEY');
+  if (legacy) return { key: legacy, source: 'legacy', writeToEnv: false };
+
+  const projectId =
+    (microfoxConfig?.projectId && String(microfoxConfig.projectId).trim()) ||
+    pick('MICROFOX_PROJECT_ID');
+  if (projectId) {
+    return { key: deriveWorkersApiKey(projectId), source: 'projectId', writeToEnv: true };
+  }
+
+  return null;
 }
 
 /** Default external for esbuild (aws-sdk is always available in Lambda runtime). */
@@ -1707,6 +1770,7 @@ function generateTriggerHandler(
 
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { SQSClient, GetQueueUrlCommand, SendMessageCommand } from '@aws-sdk/client-sqs';
+import * as crypto from 'crypto';
 
 const SERVICE_NAME = ${JSON.stringify(serviceName)};
 const WORKER_GROUPS: Record<string, string> = ${JSON.stringify(
@@ -1715,6 +1779,13 @@ const WORKER_GROUPS: Record<string, string> = ${JSON.stringify(
     2
   )};
 const GROUP_SERVICE_NAMES: Record<string, string> = ${JSON.stringify(groupServiceNames, null, 2)};
+
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const ab = Buffer.from(String(a || ''));
+  const bb = Buffer.from(String(b || ''));
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
+}
 
 function jsonResponse(statusCode: number, body: any): APIGatewayProxyResult {
   return {
@@ -1728,11 +1799,12 @@ function jsonResponse(statusCode: number, body: any): APIGatewayProxyResult {
 }
 
 export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> => {
-  // Optional API key
-  const apiKey = process.env.WORKERS_TRIGGER_API_KEY;
+  // Require an API key when one is configured (unified WORKERS_API_KEY or legacy
+  // WORKERS_TRIGGER_API_KEY). Public only when neither is set.
+  const apiKey = process.env.WORKERS_API_KEY || process.env.WORKERS_TRIGGER_API_KEY;
   if (apiKey) {
-    const providedKey = event.headers['x-workers-trigger-key'] || event.headers['X-Workers-Trigger-Key'];
-    if (providedKey !== apiKey) {
+    const providedKey = (event.headers['x-workers-trigger-key'] || event.headers['X-Workers-Trigger-Key'] || '') as string;
+    if (!timingSafeEqualStr(providedKey, apiKey)) {
       return jsonResponse(401, { error: 'Unauthorized' });
     }
   }
@@ -1863,10 +1935,18 @@ function generateQueueHandler(
 
 import { SQSClient, GetQueueUrlCommand, SendMessageCommand } from '@aws-sdk/client-sqs';
 import { upsertInitialQueueJob } from '@microfox/ai-worker/queueJobStore';
+import * as crypto from 'crypto';
 
 const QUEUE_ID = ${JSON.stringify(queue.id)};
 const FIRST_WORKER_ID = ${JSON.stringify(firstWorkerId)};
 const SERVICE_NAME = ${JSON.stringify(serviceName)};
+
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const ab = Buffer.from(String(a || ''));
+  const bb = Buffer.from(String(b || ''));
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
+}
 
 function isHttpEvent(event: any): event is { body?: string; requestContext?: any } {
   return event && typeof event.requestContext === 'object' && (event.body !== undefined || event.httpMethod === 'POST');
@@ -1894,10 +1974,10 @@ export const handler = async (event: any) => {
   let webhookUrl: string | undefined;
 
   if (isHttpEvent(event)) {
-    const apiKey = process.env.WORKERS_TRIGGER_API_KEY;
+    const apiKey = process.env.WORKERS_API_KEY || process.env.WORKERS_TRIGGER_API_KEY;
     if (apiKey) {
       const provided = (event.headers && (event.headers['x-workers-trigger-key'] || event.headers['X-Workers-Trigger-Key'])) || '';
-      if (provided !== apiKey) {
+      if (!timingSafeEqualStr(provided, apiKey)) {
         return { statusCode: 401, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: 'Unauthorized' }) };
       }
     }
@@ -2017,6 +2097,14 @@ function generateWorkersConfigHandler(
 
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { SQSClient, GetQueueUrlCommand } from '@aws-sdk/client-sqs';
+import * as crypto from 'crypto';
+
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const ab = Buffer.from(String(a || ''));
+  const bb = Buffer.from(String(b || ''));
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
+}
 
 // Worker IDs, schemas, and queue definitions embedded at build time.
 const WORKER_IDS: string[] = ${JSON.stringify(workers.map(w => w.id), null, 2)};
@@ -2038,11 +2126,12 @@ export const handler = async (
   event: APIGatewayProxyEvent
 ): Promise<APIGatewayProxyResult> => {
 // ... same logic ...
-  // Check API key if configured
-  const apiKey = process.env.WORKERS_CONFIG_API_KEY;
+  // Require an API key when one is configured (unified WORKERS_API_KEY or legacy
+  // WORKERS_CONFIG_API_KEY). Public only when neither is set.
+  const apiKey = process.env.WORKERS_API_KEY || process.env.WORKERS_CONFIG_API_KEY;
   if (apiKey) {
-    const providedKey = event.headers['x-workers-config-key'] || event.headers['X-Workers-Config-Key'];
-    if (providedKey !== apiKey) {
+    const providedKey = (event.headers['x-workers-config-key'] || event.headers['X-Workers-Config-Key'] || '') as string;
+    if (!timingSafeEqualStr(providedKey, apiKey)) {
       return {
         statusCode: 401,
         headers: { 'Content-Type': 'application/json' },
@@ -2069,7 +2158,11 @@ export const handler = async (
   const workers: Record<string, { queueUrl: string; region: string; group: string }> = {};
   const attemptedQueueNames: string[] = [];
   const errors: Array<{ workerId: string; queueName: string; message: string; name?: string }> = [];
-  const debug = event.queryStringParameters?.debug === '1' || event.queryStringParameters?.debug === 'true';
+  // Only expose debug internals (attempted queue names, raw AWS errors) when a key
+  // is configured — i.e. the request above was authenticated. Never leak on public deploys.
+  const debug =
+    !!apiKey &&
+    (event.queryStringParameters?.debug === '1' || event.queryStringParameters?.debug === 'true');
 
   await Promise.all(
     WORKER_IDS.map(async (workerId) => {
@@ -2150,11 +2243,11 @@ export const handler = async (
 /**
  * Reads environment variables from .env file.
  */
-function loadEnvVars(envPath: string = '.env'): Record<string, string> {
+function loadEnvVars(envPath: string = '.env', opts: { silent?: boolean } = {}): Record<string, string> {
   const env: Record<string, string> = {};
 
   if (!fs.existsSync(envPath)) {
-    console.warn(chalk.yellow(`⚠️  .env file not found at ${envPath}`));
+    if (!opts.silent) console.warn(chalk.yellow(`⚠️  .env file not found at ${envPath}`));
     return env;
   }
 
@@ -2174,6 +2267,21 @@ function loadEnvVars(envPath: string = '.env'): Record<string, string> {
   }
 
   return env;
+}
+
+/**
+ * Loads the project's .env into process.env (non-overriding) so values like MICROFOX_PROJECT_ID
+ * are visible to microfox config resolution AND to microfox.config.ts evaluation (which reads
+ * process.env). Real shell/CI env vars always win — we never overwrite an existing value.
+ * This is why MICROFOX_PROJECT_ID works without putting it in microfox.json / deploymentConfig.
+ */
+function hydrateProcessEnvFromDotenv(envPath: string = '.env'): void {
+  const fromFile = loadEnvVars(envPath, { silent: true });
+  for (const [key, value] of Object.entries(fromFile)) {
+    if (process.env[key] === undefined || process.env[key] === '') {
+      process.env[key] = value;
+    }
+  }
 }
 
 /**
@@ -2823,6 +2931,9 @@ export const workersMap = ${JSON.stringify(queueUrls, null, 2)} as const;
 }
 
 async function build(args: any) {
+  // Make .env values (e.g. MICROFOX_PROJECT_ID) available to config resolution + microfox.config.ts.
+  hydrateProcessEnvFromDotenv();
+
   const stage = args.stage || process.env.STAGE || 'prod';
   const region = args.region || process.env.AWS_REGION || 'us-east-1';
   const aiPath = args.aiPath ?? args['ai-path'] ?? 'app/ai';
@@ -2945,6 +3056,43 @@ async function build(args: any) {
       );
     }
   }
+
+  // SEC-4 / Plan B: resolve a stable secret to gate the generated worker endpoints.
+  // Stable across pushes (never rotated automatically). Public-by-default when absent.
+  const workersApiKey = resolveWorkersApiKey(microfoxConfig, envVars);
+  const requireAuth = args.requireAuth ?? args['require-auth'] ?? false;
+  const allowPublic = args.allowPublic ?? args['allow-public'] ?? false;
+  if (workersApiKey) {
+    const label =
+      workersApiKey.source === 'WORKERS_API_KEY'
+        ? 'WORKERS_API_KEY'
+        : workersApiKey.source === 'legacy'
+          ? 'legacy WORKERS_TRIGGER_API_KEY/WORKERS_CONFIG_API_KEY'
+          : 'projectId-derived key';
+    console.log(chalk.green(`🔒 Worker endpoints require auth (source: ${label}).`));
+  } else if (requireAuth) {
+    console.error(
+      chalk.red(
+        '❌ --require-auth was set but no worker secret could be resolved.\n' +
+          '   Set WORKERS_API_KEY in .env, or add a projectId to microfox.json (or MICROFOX_PROJECT_ID).'
+      )
+    );
+    process.exit(1);
+  } else if (!allowPublic) {
+    console.log(
+      chalk.yellow(
+        '⚠️  Workers will be deployed PUBLICLY — anyone can trigger them, start queues, and read /workers/config.\n' +
+          '   Set WORKERS_API_KEY (recommended) or a projectId to require auth, or pass --allow-public to silence this.'
+      )
+    );
+  }
+
+  /** Apply the resolved unified key to an env.json map (no-op for the legacy path). */
+  const applyWorkersApiKey = (envMap: Record<string, string>): void => {
+    if (workersApiKey?.writeToEnv) {
+      envMap.WORKERS_API_KEY = workersApiKey.key;
+    }
+  };
 
   const queues = await scanQueues(aiPath);
   if (queues.length > 0) {
@@ -3139,6 +3287,7 @@ async function build(args: any) {
     for (const [k, v] of Object.entries(envVars)) {
       if (allowedPrefixes.some((p) => k.startsWith(p))) safeEnv[k] = v;
     }
+    applyWorkersApiKey(safeEnv);
     fs.writeFileSync(path.join(coreDir, 'env.json'), JSON.stringify(safeEnv, null, 2));
 
     for (const g of userGroups) {
@@ -3201,6 +3350,7 @@ async function build(args: any) {
         if (k.startsWith('AWS_')) continue;
         if (allowedPrefixes.some((p) => k.startsWith(p)) || referencedEnvKeysGroup.has(k)) safeEnvGroup[k] = v;
       }
+      applyWorkersApiKey(safeEnvGroup);
       fs.writeFileSync(path.join(groupDir, 'env.json'), JSON.stringify(safeEnvGroup, null, 2));
     }
 
@@ -3259,6 +3409,7 @@ async function build(args: any) {
       safeEnvVars[key] = value;
     }
   }
+  applyWorkersApiKey(safeEnvVars);
 
   fs.writeFileSync(
     path.join(serverlessDir, 'env.json'),
@@ -3272,6 +3423,9 @@ async function build(args: any) {
 }
 
 async function deploy(args: any) {
+  // Ensure .env values (e.g. MICROFOX_PROJECT_ID) are present for config resolution here too.
+  hydrateProcessEnvFromDotenv();
+
   const stage = args.stage || process.env.STAGE || 'prod';
   const region = args.region || process.env.AWS_REGION || 'us-east-1';
   const targetGroup = typeof args.group === 'string' ? args.group.trim() : '';
@@ -3337,7 +3491,7 @@ async function deploy(args: any) {
 
       const skipCore = args.skipCore ?? args['skip-core'] ?? false;
       const hasPerGroupDirs = fs.existsSync(path.join(serverlessDir, 'core', 'serverless.yml'));
-      const pushArgs = ['microfox@latest', 'push'];
+      const pushArgs = ['push'];
       if (targetGroup) {
         pushArgs.push(targetGroup);
         console.log(chalk.blue(`ℹ️  Deploying only group: ${targetGroup}`));
@@ -3351,7 +3505,21 @@ async function deploy(args: any) {
         }
       }
 
-      execSync('npx ' + pushArgs.join(' '), {
+      // Resolve which microfox CLI to invoke. Default: the published `microfox@latest`.
+      // Override with MICROFOX_CLI_SPEC for local testing — either an absolute path to a
+      // built CLI entry (e.g. .../microfox/packages/cli/dist/index.js) or an npm spec
+      // (e.g. "microfox@1.2.3" / "microfox").
+      const cliSpec = (process.env.MICROFOX_CLI_SPEC || '').trim();
+      const isLocalEntry =
+        cliSpec && (/\.(c|m)?js$/.test(cliSpec) || fs.existsSync(cliSpec));
+      const command = isLocalEntry
+        ? `node "${cliSpec}" ${pushArgs.join(' ')}`
+        : `npx ${cliSpec || 'microfox@latest'} ${pushArgs.join(' ')}`;
+      if (cliSpec) {
+        console.log(chalk.blue(`ℹ️  Using microfox CLI override: ${cliSpec}`));
+      }
+
+      execSync(command, {
         cwd: serverlessDir,
         stdio: 'inherit'
       });
@@ -3397,6 +3565,8 @@ export const pushCommand = new Command()
   .option('--skip-deploy', 'Skip deployment, only build', false)
   .option('--skip-install', 'Skip npm install in serverless directory', false)
   .option('--skip-core', 'When deploying via Microfox, skip deploying the core group', false)
+  .option('--require-auth', 'Fail the build if no worker secret (WORKERS_API_KEY / projectId) can be resolved', false)
+  .option('--allow-public', 'Deploy worker endpoints publicly without a warning when no secret is set', false)
   .action(async (group: string | undefined, options: any) => {
     const args = { ...options, group };
     await build(args);

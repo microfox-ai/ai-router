@@ -7,6 +7,8 @@
  * This avoids requiring AWS credentials in your Next.js app.
  */
 
+import * as crypto from 'crypto';
+
 import type { ZodType, z } from 'zod';
 import type { WorkerQueueConfig } from './queue.js';
 
@@ -172,6 +174,51 @@ export function getQueueStartUrl(queueId: string): string {
 }
 
 /**
+ * Derives a stable worker API key from a projectId.
+ *
+ * This is the zero-config fallback used when no explicit `WORKERS_API_KEY`
+ * (or legacy `WORKERS_TRIGGER_API_KEY` / `WORKERS_CONFIG_API_KEY`) is set. The
+ * same formula is used by `@microfox/ai-worker-cli` at build time when it writes
+ * the key into the deployed Lambda env, so both sides resolve the same value.
+ *
+ * The raw projectId is never sent as the header value — only this hash.
+ */
+export function deriveWorkersApiKey(projectId: string): string {
+  return crypto
+    .createHash('sha256')
+    .update('microfox-workers:' + projectId)
+    .digest('hex');
+}
+
+/**
+ * Resolve the key to send on `x-workers-trigger-key` for /workers/trigger and
+ * /queues/{id}/start. Precedence: explicit per-endpoint key → unified
+ * `WORKERS_API_KEY` → projectId-derived (MICROFOX_PROJECT_ID). Returns undefined
+ * when nothing resolves (the deployed endpoints are then public).
+ */
+export function resolveWorkersTriggerKey(): string | undefined {
+  const explicit =
+    process.env.WORKERS_TRIGGER_API_KEY || process.env.WORKERS_API_KEY;
+  if (explicit && explicit.trim()) return explicit.trim();
+  const projectId = process.env.MICROFOX_PROJECT_ID;
+  if (projectId && projectId.trim()) return deriveWorkersApiKey(projectId.trim());
+  return undefined;
+}
+
+/**
+ * Resolve the key to send on `x-workers-config-key` for /workers/config.
+ * Same precedence as {@link resolveWorkersTriggerKey} but with the config key.
+ */
+export function resolveWorkersConfigKey(): string | undefined {
+  const explicit =
+    process.env.WORKERS_CONFIG_API_KEY || process.env.WORKERS_API_KEY;
+  if (explicit && explicit.trim()) return explicit.trim();
+  const projectId = process.env.MICROFOX_PROJECT_ID;
+  if (projectId && projectId.trim()) return deriveWorkersApiKey(projectId.trim());
+  return undefined;
+}
+
+/**
  * Serializes context data for transmission to Lambda.
  * Only serializes safe, JSON-compatible properties.
  */
@@ -250,7 +297,7 @@ export async function dispatch<INPUT_SCHEMA extends ZodType<any>>(
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
   };
-  const triggerKey = process.env.WORKERS_TRIGGER_API_KEY;
+  const triggerKey = resolveWorkersTriggerKey();
   if (triggerKey) {
     headers['x-workers-trigger-key'] = triggerKey;
   }
@@ -314,7 +361,7 @@ export async function dispatchWorker(
     ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
   };
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  const triggerKey = process.env.WORKERS_TRIGGER_API_KEY;
+  const triggerKey = resolveWorkersTriggerKey();
   if (triggerKey) headers['x-workers-trigger-key'] = triggerKey;
   const response = await fetch(triggerUrl, {
     method: 'POST',
@@ -367,7 +414,7 @@ export async function dispatchQueue<InitialInput = any>(
       ? (initialInput as Record<string, unknown>)
       : { value: initialInput };
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  const triggerKey = process.env.WORKERS_TRIGGER_API_KEY;
+  const triggerKey = resolveWorkersTriggerKey();
   if (triggerKey) headers['x-workers-trigger-key'] = triggerKey;
   const userId = options.userId ?? (_ctx?.userId as string | undefined);
   const response = await fetch(queueStartUrl, {

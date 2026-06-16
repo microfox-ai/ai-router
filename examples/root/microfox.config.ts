@@ -55,7 +55,7 @@ export const StudioConfig = {
       },
     },
     deploymentConfig: {
-      projectId: process.env.MICROFOX_PROJECT_ID || '2bd2b78d-320d-48da-946d-53e2a5d06a7a',
+      projectId: process.env.MICROFOX_PROJECT_ID,
       publish: {
         subdomain: 'ai-router',
         agentName: 'ai-router',

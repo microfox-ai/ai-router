@@ -27,3 +27,6 @@ env.json
 .serverless
 
 *.plan
+
+# Private AI configuration frameworks
+.claude/

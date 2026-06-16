@@ -21,7 +21,9 @@
     "dev": "tsup --watch",
     "prepare": "npm run build",
     "lint": "eslint . --ext .ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "sync-boilerplate": "node scripts/sync-boilerplate.mjs",
+    "sync-boilerplate:check": "node scripts/sync-boilerplate.mjs --check"
   },
   "dependencies": {
     "@microfox/ai-worker": "*",

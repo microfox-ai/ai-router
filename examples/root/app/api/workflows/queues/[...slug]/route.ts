@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { dispatchQueue, dispatchWorker } from '@microfox/ai-worker';
-import { getClientId } from '../../auth';
+import { authorizeWorkflowRequest } from '../../auth';
 import {
   getQueueJob,
   listQueueJobs,
@@ -32,6 +32,14 @@ export async function POST(
     slug = slugParam ?? [];
     const [queueId, action] = slug;
 
+    // SECURITY: every mutating queue route requires a user session, the internal
+    // shared secret (Lambda callbacks), or an explicit public opt-out.
+    const auth = await authorizeWorkflowRequest(req);
+    if (!auth.ok) {
+      return NextResponse.json({ error: auth.error }, { status: auth.status });
+    }
+    const userId = auth.userId;
+
     if (action === 'update') {
       return handleQueueJobUpdate(req, queueId);
     }
@@ -56,7 +64,6 @@ export async function POST(
       body = {};
     }
     const { input = {}, metadata, jobId: providedJobId } = body;
-    const userId = await getClientId(req);
 
     const result = await dispatchQueue(queueId, input as Record<string, unknown>, {
       metadata: metadata ?? { source: 'queues-api' },
@@ -338,10 +345,37 @@ async function handleQueueApprove(req: NextRequest, queueId: string) {
     targetStep.input && typeof targetStep.input === 'object'
       ? (targetStep.input as Record<string, unknown>)
       : {};
-  const reviewerInput =
+  let reviewerInput =
     input && typeof input === 'object'
       ? (input as Record<string, unknown>)
       : {};
+
+  // SEC-5: validate reviewer-supplied input against the step's HITL schema BEFORE it is
+  // dispatched into the next pipeline step. Without this, an approver could inject arbitrary
+  // fields into the resumed worker's input.
+  try {
+    const { getStepHitlInputSchema } = await import('../../registry/workers');
+    const schema = getStepHitlInputSchema(queueId, targetStepIndex);
+    if (schema) {
+      const parsed = schema.safeParse(reviewerInput);
+      if (!parsed.success) {
+        return NextResponse.json(
+          { error: 'Reviewer input failed HITL schema validation', details: parsed.error },
+          { status: 400 }
+        );
+      }
+      // Use the validated/coerced value (strips unknown keys when the schema does).
+      reviewerInput = parsed.data as Record<string, unknown>;
+    }
+  } catch (validationSetupError: unknown) {
+    const e = validationSetupError instanceof Error ? validationSetupError : new Error(String(validationSetupError));
+    console.error(`${LOG} HITL schema validation could not run:`, e.message);
+    // Fail closed: if we intended to validate but couldn't load the schema resolver, reject.
+    return NextResponse.json(
+      { error: 'Unable to validate reviewer input' },
+      { status: 500 }
+    );
+  }
 
   const decisionMeta = {
     decision: 'approve' as const,

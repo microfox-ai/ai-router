@@ -1,5 +1,13 @@
 # @microfox/ai-worker-cli
 
+## 1.1.1
+
+### Patch Changes
+
+- 45fdfe3: Changes from PR #67: hitl-and-boilerplate-improvement
+- Updated dependencies [45fdfe3]
+  - @microfox/ai-worker@1.1.1
+
 ## 1.1.0
 
 ### Minor Changes

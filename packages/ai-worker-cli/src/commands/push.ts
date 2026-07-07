@@ -522,6 +522,14 @@ interface QueueStepInfo {
   hasResume?: boolean;
   // HITL metadata is resolved from queue module default export at runtime.
   hitl?: unknown;
+  /**
+   * HITL reviewer input as JSON Schema (from defineHitlConfig.inputSchema, a Zod schema, converted
+   * at build time). Embedded in /workers/config so the console can render + validate a generic
+   * reviewer form. Undefined when the step has no HITL inputSchema (or extraction failed).
+   */
+  hitlInputSchema?: Record<string, any>;
+  /** HITL reviewer form title (from defineHitlConfig.ui.title), for display. */
+  hitlTitle?: string;
 }
 
 interface QueueInfo {
@@ -1282,6 +1290,146 @@ export const exportedSchemaJSON: string | null = (() => {
 }
 
 /**
+ * esbuild plugin for evaluating a `*.queue.ts` module just enough to read its HITL `inputSchema`s.
+ * Unlike the worker extractor, queue files routinely import SHARED schema files (often via the `@/`
+ * path alias), so those project imports must resolve for REAL (the Zod schemas have to be genuine).
+ * We keep `zod` real, make `@microfox/ai-worker` an identity stub (so `defineWorkerQueue`/
+ * `defineHitlConfig`/`repeatStep` just return their config), let project-relative + alias imports
+ * resolve, and Proxy-stub every other bare package (AWS/Mongo/etc.) so module init can't throw.
+ */
+function createQueueSchemaExtractionPlugin(): esbuild.Plugin {
+  const PROXY_STUB = `
+const STUB = new Proxy(function(){}, {
+  get(t, p) { return typeof p === 'symbol' ? t[p] : STUB; },
+  apply() { return STUB; },
+  construct() { return Object.create({}); }
+});
+module.exports = STUB;
+`;
+  const AI_WORKER_STUB = `
+const STUB = new Proxy(function(){}, {
+  get(t, p) { return typeof p === 'symbol' ? undefined : STUB; },
+  apply() { return STUB; },
+  construct() { return Object.create({}); }
+});
+exports.defineWorkerQueue = function(config) { return config; };
+exports.defineHitlConfig = function(config) { return config; };
+exports.repeatStep = function(count, factory) { return Array.from({ length: count }, function(_, i){ return factory(i); }); };
+module.exports = new Proxy(exports, {
+  get(t, p) { return p in t ? t[p] : (typeof p === 'symbol' ? t[p] : STUB); }
+});
+`;
+  return {
+    name: 'queue-schema-extraction-stub',
+    setup(build) {
+      build.onResolve({ filter: /.*/ }, (args) => {
+        const p = args.path;
+        if (!args.importer) return undefined; // entry point
+        if (args.importer.includes('node_modules')) return undefined; // package internals resolve normally
+        if (p === 'zod' || p.startsWith('zod/')) return undefined; // genuine zod
+        if (p === '@microfox/ai-worker' || p.startsWith('@microfox/ai-worker/')) {
+          return { path: p, namespace: 'ai-worker-queue-stub-ns' };
+        }
+        // Project files (relative or path-alias) resolve for real so shared Zod schemas evaluate.
+        if (p.startsWith('.') || p.startsWith('@/') || p.startsWith('~/')) return undefined;
+        // Any other bare package → generic Proxy stub (never evaluate heavy SDKs during extraction).
+        return { path: p, namespace: 'queue-stub-ns' };
+      });
+      build.onLoad({ filter: /.*/, namespace: 'ai-worker-queue-stub-ns' }, () => ({ contents: AI_WORKER_STUB, loader: 'js' }));
+      build.onLoad({ filter: /.*/, namespace: 'queue-stub-ns' }, () => ({ contents: PROXY_STUB, loader: 'js' }));
+    },
+  };
+}
+
+/**
+ * Best-effort: evaluate a queue module via the stub bundle and convert each step's HITL Zod
+ * `inputSchema` to JSON Schema (+ capture the reviewer form title), merging the results onto
+ * `queue.steps` in place. Non-fatal — if extraction fails the console simply shows a raw-JSON
+ * reviewer form. `z.toJSONSchema` runs INSIDE the bundle so the same Zod instance that built the
+ * schema converts it (no cross-instance mismatch). `@/`-style aliases resolve via the project's
+ * tsconfig.
+ */
+async function extractQueueHitl(queue: QueueInfo, projectRoot: string, outputDir: string): Promise<void> {
+  const queueAbs = path.resolve(queue.filePath);
+  const nonce = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const entryFile = path.join(outputDir, `.hitl-extract-${nonce}.ts`);
+  const outFile = path.join(outputDir, `.hitl-extract-${nonce}.cjs`);
+  const tsconfigPath = path.join(projectRoot, 'tsconfig.json');
+
+  let relImport = path.relative(outputDir, queueAbs).replace(/\.ts$/, '').split(path.sep).join('/');
+  if (!relImport.startsWith('.')) relImport = './' + relImport;
+
+  try {
+    fs.mkdirSync(outputDir, { recursive: true });
+    fs.writeFileSync(
+      entryFile,
+      `import * as queueModule from '${relImport}';
+import { z } from 'zod';
+const q = (queueModule && (queueModule.default || queueModule.queue)) || queueModule;
+export const exportedHitlJSON: string | null = (() => {
+  try {
+    const steps = (q && Array.isArray(q.steps) ? q.steps : []).map((s) => {
+      let hitlInputSchema = null;
+      let hitlTitle = null;
+      try {
+        const inputSchema = s && s.hitl && s.hitl.inputSchema;
+        if (inputSchema) hitlInputSchema = (z).toJSONSchema(inputSchema);
+      } catch (e) {}
+      try {
+        const title = s && s.hitl && s.hitl.ui && s.hitl.ui.title;
+        if (typeof title === 'string') hitlTitle = title;
+      } catch (e) {}
+      return {
+        workerId: s && s.workerId,
+        requiresApproval: !!(s && s.requiresApproval),
+        hitlInputSchema: hitlInputSchema,
+        hitlTitle: hitlTitle,
+      };
+    });
+    return JSON.stringify(steps);
+  } catch (e) {
+    return null;
+  }
+})();
+`
+    );
+    await esbuild.build({
+      entryPoints: [entryFile],
+      bundle: true,
+      platform: 'node',
+      target: 'node20',
+      format: 'cjs',
+      outfile: outFile,
+      plugins: [createQueueSchemaExtractionPlugin()],
+      packages: 'bundle',
+      logLevel: 'silent',
+      ...(fs.existsSync(tsconfigPath) ? { tsconfig: tsconfigPath } : {}),
+    });
+    const mod = await import(pathToFileURL(path.resolve(outFile)).href);
+    if (!mod.exportedHitlJSON) return;
+    const parsed = JSON.parse(mod.exportedHitlJSON as string) as Array<{
+      workerId?: string;
+      requiresApproval?: boolean;
+      hitlInputSchema?: Record<string, any> | null;
+      hitlTitle?: string | null;
+    }>;
+    // Merge by index — the queue scanner preserves definition step order.
+    parsed.forEach((info, i) => {
+      const step = queue.steps[i];
+      if (!step) return;
+      if (info.hitlInputSchema) step.hitlInputSchema = info.hitlInputSchema;
+      if (info.hitlTitle) step.hitlTitle = info.hitlTitle;
+      if (info.requiresApproval && step.requiresApproval === undefined) step.requiresApproval = true;
+    });
+  } catch {
+    // Non-fatal: console falls back to a raw-JSON reviewer form until extraction succeeds.
+  } finally {
+    try { if (fs.existsSync(entryFile)) fs.unlinkSync(entryFile); } catch {}
+    try { if (fs.existsSync(outFile)) fs.unlinkSync(outFile); } catch {}
+  }
+}
+
+/**
  * Generates Lambda handler entrypoints for each worker.
  */
 async function generateHandlers(
@@ -1798,76 +1946,161 @@ function jsonResponse(statusCode: number, body: any): APIGatewayProxyResult {
   };
 }
 
-export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> => {
-  // Require an API key when one is configured (unified WORKERS_API_KEY or legacy
-  // WORKERS_TRIGGER_API_KEY). Public only when neither is set.
-  const apiKey = process.env.WORKERS_API_KEY || process.env.WORKERS_TRIGGER_API_KEY;
-  if (apiKey) {
-    const providedKey = (event.headers['x-workers-trigger-key'] || event.headers['X-Workers-Trigger-Key'] || '') as string;
-    if (!timingSafeEqualStr(providedKey, apiKey)) {
-      return jsonResponse(401, { error: 'Unauthorized' });
-    }
-  }
+export const handler = async (event: APIGatewayProxyEvent, context?: any): Promise<APIGatewayProxyResult> => {
+  // Structured, greppable logging so CloudWatch shows exactly what the trigger Lambda did.
+  const log = (level: 'INFO' | 'WARN' | 'ERROR', msg: string, data?: Record<string, unknown>) => {
+    const line = '[workers-trigger] [' + level + '] ' + msg;
+    if (level === 'ERROR') console.error(line, data ? JSON.stringify(data) : '');
+    else if (level === 'WARN') console.warn(line, data ? JSON.stringify(data) : '');
+    else console.log(line, data ? JSON.stringify(data) : '');
+  };
 
+  const requestId = (event as any)?.requestContext?.requestId || '';
   const stage =
     (event as any)?.requestContext?.stage ||
     process.env.ENVIRONMENT ||
     process.env.STAGE ||
     'prod';
   const region = process.env.AWS_REGION || 'us-east-1';
-
   const qsWorkerId = event.queryStringParameters?.workerId;
+
+  log('INFO', 'invoked', {
+    requestId,
+    stage,
+    region,
+    httpMethod: (event as any)?.httpMethod,
+    hasBody: !!event.body,
+    bodyLength: event.body ? event.body.length : 0,
+    qsWorkerId: qsWorkerId || null,
+  });
+
+  // Require an API key when one is configured (unified WORKERS_API_KEY or legacy
+  // WORKERS_TRIGGER_API_KEY). Public only when neither is set.
+  const apiKey = process.env.WORKERS_API_KEY || process.env.WORKERS_TRIGGER_API_KEY;
+  const keyEnvSource = process.env.WORKERS_API_KEY
+    ? 'WORKERS_API_KEY'
+    : process.env.WORKERS_TRIGGER_API_KEY
+      ? 'WORKERS_TRIGGER_API_KEY'
+      : 'none';
+  if (apiKey) {
+    const providedKey = (event.headers['x-workers-trigger-key'] || event.headers['X-Workers-Trigger-Key'] || '') as string;
+    const matched = timingSafeEqualStr(providedKey, apiKey);
+    // Never log the secret itself — only presence + lengths so a mismatch is diagnosable.
+    log(matched ? 'INFO' : 'WARN', 'auth check', {
+      keyConfigured: true,
+      keyEnvSource,
+      providedKeyPresent: !!providedKey,
+      providedKeyLength: providedKey.length,
+      expectedKeyLength: apiKey.length,
+      matched,
+    });
+    if (!matched) {
+      log('ERROR', 'rejected: API key mismatch (worker NOT triggered)', { requestId });
+      return jsonResponse(401, { error: 'Unauthorized' });
+    }
+  } else {
+    log('INFO', 'auth check', { keyConfigured: false, note: 'endpoint is public (no key set)' });
+  }
 
   let parsedBody: any = undefined;
   if (event.body) {
     try {
       parsedBody = JSON.parse(event.body);
-    } catch {
+    } catch (e: any) {
+      log('WARN', 'request body is not valid JSON; falling back to raw body', { error: String(e?.message || e) });
       parsedBody = undefined;
     }
   }
 
   const workerId = (parsedBody && parsedBody.workerId) || qsWorkerId;
   if (!workerId || typeof workerId !== 'string') {
+    log('ERROR', 'rejected: missing workerId', { requestId });
     return jsonResponse(400, { error: 'workerId is required (query param workerId or JSON body workerId)' });
+  }
+  const knownWorker = Object.prototype.hasOwnProperty.call(WORKER_GROUPS, workerId);
+  log('INFO', 'resolved workerId', { workerId, group: WORKER_GROUPS[workerId] || '(unknown)', knownWorker });
+  if (!knownWorker) {
+    // Not fatal (an older deploy may not list every worker), but a typo'd / undeployed workerId is
+    // the most common cause of "trigger returned ok but the worker never ran".
+    log('WARN', 'workerId is NOT in this deployment known-worker list — check spelling / redeploy', {
+      workerId,
+      knownWorkerIds: Object.keys(WORKER_GROUPS),
+    });
   }
 
   // Prefer JSON body fields, otherwise send raw event.body
   let messageBody: string | undefined;
+  let bodySource = '';
   if (parsedBody && typeof parsedBody.messageBody === 'string') {
     messageBody = parsedBody.messageBody;
+    bodySource = 'parsedBody.messageBody';
   } else if (parsedBody && parsedBody.body !== undefined) {
     messageBody = typeof parsedBody.body === 'string' ? parsedBody.body : JSON.stringify(parsedBody.body);
+    bodySource = 'parsedBody.body';
   } else if (event.body) {
     messageBody = event.body;
+    bodySource = 'raw event.body';
   }
 
   if (!messageBody) {
+    log('ERROR', 'rejected: no message body to enqueue', { requestId, workerId });
     return jsonResponse(400, { error: 'body/messageBody is required' });
   }
+  // Surface the jobId being enqueued so it can be cross-referenced with the worker Lambda's logs.
+  let enqueuedJobId: string | undefined;
+  try { enqueuedJobId = JSON.parse(messageBody)?.jobId; } catch {}
+  log('INFO', 'message body resolved', { bodySource, messageBodyLength: messageBody.length, jobId: enqueuedJobId || null });
+  // Authoritative jobId ↔ Lambda requestId marker (same strict format as the worker handler) so the
+  // console can pull THIS trigger invocation's exact CloudWatch batch by requestId.
+  console.log('[AIWORKER_TRIGGER] ' + JSON.stringify({ jobId: enqueuedJobId || null, workerId, awsRequestId: context && context.awsRequestId }));
 
   const envKey = 'WORKER_QUEUE_URL_' + workerId.replace(/-/g, '_').toUpperCase();
   let queueUrl: string | undefined = process.env[envKey];
   const sqs = new SQSClient({ region });
   let queueName: string | undefined;
-  if (!queueUrl) {
+  let queueResolution = '';
+  if (queueUrl) {
+    queueResolution = 'env';
+    log('INFO', 'queue URL taken from env', { envKey, queueUrl });
+  } else {
     // Use per-group service name so workers in non-core groups resolve their own queue.
     const workerGroup = WORKER_GROUPS[workerId] || 'default';
     const workerServiceName = GROUP_SERVICE_NAMES[workerGroup] || SERVICE_NAME;
     queueName = \`\${workerServiceName}-\${workerId}-\${stage}\`;
+    queueResolution = 'GetQueueUrl';
+    log('INFO', 'queue URL not in env; resolving via GetQueueUrl', {
+      envKey,
+      workerGroup,
+      workerServiceName,
+      queueName,
+    });
     try {
       const urlRes = await sqs.send(new GetQueueUrlCommand({ QueueName: queueName }));
       if (!urlRes.QueueUrl) {
+        log('ERROR', 'GetQueueUrl returned no URL (worker NOT triggered)', { queueName });
         return jsonResponse(404, { error: 'Queue URL not found', queueName });
       }
       queueUrl = String(urlRes.QueueUrl);
+      log('INFO', 'resolved queue URL via GetQueueUrl', { queueName, queueUrl });
     } catch (e: any) {
+      log('ERROR', 'GetQueueUrl failed (worker NOT triggered) — queue missing/undeployed or no permission', {
+        queueName,
+        errorName: e?.name,
+        message: String(e?.message || e),
+      });
       return jsonResponse(404, { error: 'Queue does not exist or not accessible', queueName, message: String(e?.message || e) });
     }
   }
 
   try {
+    log('INFO', 'sending message to SQS', { queueUrl, queueResolution, workerId, jobId: enqueuedJobId || null });
     const sendRes = await sqs.send(new SendMessageCommand({ QueueUrl: queueUrl, MessageBody: messageBody }));
+    log('INFO', 'message ENQUEUED — worker will pick it up from SQS', {
+      messageId: sendRes.MessageId || null,
+      queueUrl,
+      workerId,
+      jobId: enqueuedJobId || null,
+    });
     return jsonResponse(200, {
       ok: true,
       workerId,
@@ -1877,6 +2110,11 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
       messageId: sendRes.MessageId || null,
     });
   } catch (e: any) {
+    log('ERROR', 'SendMessage FAILED (worker NOT triggered)', {
+      queueUrl,
+      errorName: e?.name,
+      message: String(e?.message || e),
+    });
     return jsonResponse(500, { error: 'Failed to send message', message: String(e?.message || e) });
   }
 };
@@ -1911,7 +2149,9 @@ function generateQueueHandler(
   outputDir: string,
   queue: QueueInfo,
   serviceName: string,
-  externalPackages: string[] = []
+  externalPackages: string[] = [],
+  workers: WorkerInfo[] = [],
+  groupServiceNames: Record<string, string> = {}
 ): void {
   // File-safe queue id for path (keep dashes for readability, e.g. demo-data-processor)
   const queueFileId = queue.id.replace(/[^a-zA-Z0-9-]/g, '-').replace(/-+/g, '-');
@@ -1940,6 +2180,16 @@ import * as crypto from 'crypto';
 const QUEUE_ID = ${JSON.stringify(queue.id)};
 const FIRST_WORKER_ID = ${JSON.stringify(firstWorkerId)};
 const SERVICE_NAME = ${JSON.stringify(serviceName)};
+// The queue starter deploys in the CORE group, but the first worker may live in ANOTHER group
+// (e.g. a "test"-group demo worker). Its SQS queue name is derived from THAT group's service name,
+// not the starter's. These maps let us resolve the correct cross-group queue name (mirrors the
+// workers-trigger handler). Without this, a first worker outside core → "queue does not exist".
+const WORKER_GROUPS: Record<string, string> = ${JSON.stringify(
+    Object.fromEntries(workers.map((w) => [w.id, w.group || 'default'])),
+    null,
+    2
+  )};
+const GROUP_SERVICE_NAMES: Record<string, string> = ${JSON.stringify(groupServiceNames, null, 2)};
 
 function timingSafeEqualStr(a: string, b: string): boolean {
   const ab = Buffer.from(String(a || ''));
@@ -1956,7 +2206,10 @@ async function getFirstWorkerQueueUrl(region: string, stage: string): Promise<st
   const envKey = 'WORKER_QUEUE_URL_' + FIRST_WORKER_ID.replace(/-/g, '_').toUpperCase();
   const fromEnv = process.env[envKey];
   if (fromEnv) return fromEnv;
-  const queueName = \`\${SERVICE_NAME}-\${FIRST_WORKER_ID}-\${stage}\`;
+  // Resolve the first worker's queue via ITS OWN group's service name (cross-group safe).
+  const firstWorkerGroup = WORKER_GROUPS[FIRST_WORKER_ID] || 'default';
+  const firstWorkerServiceName = GROUP_SERVICE_NAMES[firstWorkerGroup] || SERVICE_NAME;
+  const queueName = \`\${firstWorkerServiceName}-\${FIRST_WORKER_ID}-\${stage}\`;
   const sqs = new SQSClient({ region });
   const { QueueUrl } = await sqs.send(new GetQueueUrlCommand({ QueueName: queueName }));
   if (!QueueUrl) throw new Error('Queue URL not found: ' + queueName);
@@ -1993,6 +2246,11 @@ export const handler = async (event: any) => {
     context = body.context && typeof body.context === 'object' ? body.context : {};
     metadata = body.metadata && typeof body.metadata === 'object' ? body.metadata : {};
     webhookUrl = typeof body.webhookUrl === 'string' ? body.webhookUrl : undefined;
+    // Trigger provenance: label API-started queue runs (a caller-supplied stamp — e.g. the
+    // console's {type:'console'} — wins). Persisted to the queue doc + step-0 job metadata.
+    if (metadata.__trigger === undefined) {
+      metadata.__trigger = { type: 'external', at: new Date().toISOString() };
+    }
 
     const response = { statusCode: 200, headers: { 'Content-Type': 'application/json' }, body: '' };
     try {
@@ -2010,8 +2268,10 @@ export const handler = async (event: any) => {
   // Scheduled invocation
   jobId = 'job-' + Date.now() + '-' + Math.random().toString(36).slice(2, 11);
   initialInput = {};
+  // Trigger provenance: cron-started queue runs are labeled 'schedule' (not derivable elsewhere).
+  metadata = { __trigger: { type: 'schedule', queueId: QUEUE_ID, at: new Date().toISOString() } };
   try {
-    await upsertInitialQueueJob({ queueJobId: jobId, queueId: QUEUE_ID, firstWorkerId: FIRST_WORKER_ID, firstWorkerJobId: jobId, metadata: {} });
+    await upsertInitialQueueJob({ queueJobId: jobId, queueId: QUEUE_ID, firstWorkerId: FIRST_WORKER_ID, firstWorkerJobId: jobId, metadata });
   } catch (_) {}
   const queueUrl = await getFirstWorkerQueueUrl(region, stage);
   await sendFirstMessage(region, queueUrl, jobId, initialInput, context, metadata, webhookUrl, 'schedule');
@@ -3097,6 +3357,13 @@ async function build(args: any) {
   const queues = await scanQueues(aiPath);
   if (queues.length > 0) {
     console.log(chalk.blue(`ℹ️  Found ${queues.length} queue(s): ${queues.map((q) => q.id).join(', ')}`));
+    // Expose each HITL step's reviewer inputSchema (Zod → JSON Schema) on /workers/config so the
+    // console can render + validate a generic approval form. Best-effort, never blocks the push.
+    for (const q of queues) {
+      await extractQueueHitl(q, process.cwd(), serverlessDir);
+    }
+    const hitlSteps = queues.reduce((n, q) => n + q.steps.filter((s) => s.hitlInputSchema).length, 0);
+    if (hitlSteps > 0) console.log(chalk.gray(`  ✓ extracted ${hitlSteps} HITL reviewer schema(s)`));
     generateQueueRegistry(queues, serverlessDir, process.cwd());
   }
 
@@ -3279,7 +3546,7 @@ async function build(args: any) {
     generateDocsHandler(coreDir, serviceNameCore, stage, region, coreExternalPackages);
     generateTriggerHandler(coreDir, serviceNameCore, coreExternalPackages, workers, coreGroupServiceNames);
     for (const queue of queues) {
-      generateQueueHandler(coreDir, queue, serviceNameCore, coreExternalPackages);
+      generateQueueHandler(coreDir, queue, serviceNameCore, coreExternalPackages, workers, coreGroupServiceNames);
     }
     const configCore = generateServerlessConfigCore(projectId, allWorkersByGroup, queues, stage, region, envVars, serviceNameCore, coreExternalPackages, microfoxConfig);
     fs.writeFileSync(path.join(coreDir, 'serverless.yml'), yaml.dump(configCore, { lineWidth: -1 }));
@@ -3379,7 +3646,7 @@ async function build(args: any) {
   generateTriggerHandler(serverlessDir, serviceName, externalPackages, workers, singleGroupServiceNames);
 
   for (const queue of queues) {
-    generateQueueHandler(serverlessDir, queue, serviceName, externalPackages);
+    generateQueueHandler(serverlessDir, queue, serviceName, externalPackages, workers, singleGroupServiceNames);
   }
 
   let calleeIds = await collectCalleeWorkerIds(workers, process.cwd());

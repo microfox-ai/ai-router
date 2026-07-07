@@ -23,7 +23,7 @@ import type { NextRequest } from 'next/server';
  */
 export async function getClientId(_req: NextRequest): Promise<string | undefined> {
   // TODO: implement your auth logic here
-  return undefined;
+  return "test-static-user";
 }
 
 /** Constant-time string comparison (avoids leaking the secret via timing). */

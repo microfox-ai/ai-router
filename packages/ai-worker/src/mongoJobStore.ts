@@ -17,7 +17,7 @@ const dbName =
 const collectionName =
   process.env.MONGODB_WORKER_JOBS_COLLECTION || 'worker_jobs';
 
-type InternalJobEntry = { jobId: string; workerId: string };
+type InternalJobEntry = { jobId: string; workerId: string; awaited?: boolean; delaySeconds?: number };
 
 type Doc = {
   _id: string;
@@ -175,7 +175,7 @@ export function createMongoJobStore(
         return null;
       }
     },
-    appendInternalJob: async (entry: { jobId: string; workerId: string }): Promise<void> => {
+    appendInternalJob: async (entry: InternalJobEntry): Promise<void> => {
       try {
         const coll = await getCollection();
         await coll.updateOne(

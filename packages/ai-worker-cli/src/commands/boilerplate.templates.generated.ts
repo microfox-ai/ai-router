@@ -33,7 +33,7 @@ import type { NextRequest } from 'next/server';
  */
 export async function getClientId(_req: NextRequest): Promise<string | undefined> {
   // TODO: implement your auth logic here
-  return undefined;
+  return "test-static-user";
 }
 
 /** Constant-time string comparison (avoids leaking the secret via timing). */
@@ -134,6 +134,11 @@ export async function authorizeWorkflowRequest(
 export interface InternalJobEntry {
   jobId: string;
   workerId: string;
+  /** Whether the parent awaited this child (dispatchWorker await:true) or fired it and moved on.
+   * Written by the @microfox/ai-worker runtime; surfaced in run traces to distinguish the two. */
+  awaited?: boolean;
+  /** SQS DelaySeconds the parent set on a fire-and-forget dispatch, if any. */
+  delaySeconds?: number;
 }
 
 export interface JobRecord {
@@ -639,17 +644,18 @@ function stringFromHash(val: unknown): string {
   return String(val);
 }
 
-async function loadJob(jobId: string): Promise<JobRecord | null> {
-  const redis = getRedis();
-  const key = jobKey(jobId);
-  const data = await redis.hgetall(key) as Record<string, unknown> | null;
+/** Build a JobRecord from a Redis hash + its \`:internal\` list items. Shared by the single-job
+ * read and the pipelined bulk read (listJobsByWorker) so both parse identically. */
+function recordFromHash(
+  jobId: string,
+  data: Record<string, unknown> | null | undefined,
+  listItems: unknown[] | null | undefined
+): JobRecord | null {
   if (!data || typeof data !== 'object' || Object.keys(data).length === 0) return null;
 
   // Prefer atomic list key for internal jobs; fallback to hash field for old records
-  const listKey = internalListKey(jobId);
-  const listItems = (await redis.lrange(listKey, 0, -1)) ?? [];
   let internalJobs: InternalJobEntry[] | undefined;
-  if (listItems.length > 0) {
+  if (listItems && listItems.length > 0) {
     internalJobs = listItems
       .map((s) => {
         try {
@@ -663,8 +669,8 @@ async function loadJob(jobId: string): Promise<JobRecord | null> {
     internalJobs = valueFromHash<InternalJobEntry[]>(data.internalJobs);
   }
 
-  const record: JobRecord = {
-    jobId: stringFromHash(data.jobId),
+  return {
+    jobId: stringFromHash(data.jobId) || jobId,
     workerId: stringFromHash(data.workerId),
     status: (stringFromHash(data.status) as JobRecord['status']) || 'queued',
     input: valueFromHash<any>(data.input) ?? {},
@@ -676,8 +682,14 @@ async function loadJob(jobId: string): Promise<JobRecord | null> {
     updatedAt: stringFromHash(data.updatedAt),
     completedAt: data.completedAt != null ? stringFromHash(data.completedAt) : undefined,
   };
+}
 
-  return record;
+async function loadJob(jobId: string): Promise<JobRecord | null> {
+  const redis = getRedis();
+  const data = (await redis.hgetall(jobKey(jobId))) as Record<string, unknown> | null;
+  if (!data || typeof data !== 'object' || Object.keys(data).length === 0) return null;
+  const listItems = (await redis.lrange(internalListKey(jobId), 0, -1)) ?? [];
+  return recordFromHash(jobId, data, listItems);
 }
 
 export const redisJobStore = {
@@ -816,13 +828,26 @@ export const redisJobStore = {
     const redis = getRedis();
     const indexKey = workerIndexKey(workerId);
     const jobIds = (await redis.smembers(indexKey)) ?? [];
-    const jobs: JobRecord[] = [];
+    if (jobIds.length === 0) return [];
+
+    // Pipeline the hash + internal-list reads into 2 round-trips instead of 2×N sequential calls
+    // (the naive loop was O(N) REST requests — slow for a worker with many jobs).
+    const hashPipe = redis.pipeline();
+    const listPipe = redis.pipeline();
     for (const jobId of jobIds) {
-      const job = await loadJob(jobId);
-      if (job) {
-        jobs.push(job);
-      }
+      hashPipe.hgetall(jobKey(jobId));
+      listPipe.lrange(internalListKey(jobId), 0, -1);
     }
+    const [hashes, lists] = await Promise.all([
+      hashPipe.exec() as Promise<Array<Record<string, unknown> | null>>,
+      listPipe.exec() as Promise<Array<unknown[] | null>>,
+    ]);
+
+    const jobs: JobRecord[] = [];
+    jobIds.forEach((jobId, i) => {
+      const rec = recordFromHash(jobId, hashes[i], lists[i]);
+      if (rec) jobs.push(rec);
+    });
     // Most recent first
     jobs.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     return jobs;

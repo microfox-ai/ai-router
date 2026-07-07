@@ -51,7 +51,7 @@ export interface JobRecord {
   output?: any;
   error?: { message: string; stack?: string };
   metadata?: Record<string, any>;
-  internalJobs?: Array<{ jobId: string; workerId: string }>;
+  internalJobs?: Array<{ jobId: string; workerId: string; awaited?: boolean; delaySeconds?: number }>;
   userId?: string;
   createdAt: string;
   updatedAt: string;
@@ -71,9 +71,16 @@ export interface JobStore {
   get(): Promise<JobRecord | null>;
   /**
    * Append an internal (child) job to the current job's internalJobs list.
-   * Used when this worker dispatches another worker (fire-and-forget or await).
+   * Used when this worker dispatches another worker. `awaited` records whether the parent
+   * blocked on the child (dispatchWorker await:true) or fired it and moved on (await:false),
+   * so observability can distinguish the two.
    */
-  appendInternalJob?(entry: { jobId: string; workerId: string }): Promise<void>;
+  appendInternalJob?(entry: {
+    jobId: string;
+    workerId: string;
+    awaited?: boolean;
+    delaySeconds?: number;
+  }): Promise<void>;
   /**
    * Get any job by jobId (e.g. to poll child job status when await: true).
    * @returns Job record or null if not found
@@ -838,7 +845,32 @@ function createDispatchWorker(
     const childJobId =
       options?.jobId ||
       `job-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
-    const metadata = options?.metadata ?? {};
+    // Provenance stamp (`metadata.__trigger`): records HOW this child run was triggered, persisted
+    // verbatim into the child's job record so observability can always show "triggered by" without
+    // walking the parent's internalJobs. Queue chain dispatches (input carries __workerQueue) are
+    // stamped `queue`; plain dispatchWorker calls are stamped `worker`. A caller-supplied
+    // metadata.__trigger wins (e.g. the queue starter or console stamping a more precise origin).
+    const dispatchQueueCtx =
+      input !== null && typeof input === 'object' && WORKER_QUEUE_KEY in input
+        ? ((input as Record<string, unknown>)[WORKER_QUEUE_KEY] as WorkerQueueContext)
+        : undefined;
+    const metadata: Record<string, any> = { ...(options?.metadata ?? {}) };
+    if (metadata.__trigger === undefined) {
+      metadata.__trigger = dispatchQueueCtx?.id
+        ? {
+            type: 'queue',
+            queueId: dispatchQueueCtx.id,
+            queueJobId: dispatchQueueCtx.queueJobId,
+            parentJobId,
+            parentWorkerId,
+          }
+        : {
+            type: 'worker',
+            parentJobId,
+            parentWorkerId,
+            awaited: options?.await === true,
+          };
+    }
     const serializedContext: Record<string, any> = {};
     if (parentContext.requestId) serializedContext.requestId = parentContext.requestId;
     if (parentContext.userId) serializedContext.userId = parentContext.userId;
@@ -875,7 +907,12 @@ function createDispatchWorker(
       const messageId = sendResult.MessageId ?? undefined;
 
       if (jobStore?.appendInternalJob) {
-        await jobStore.appendInternalJob({ jobId: childJobId, workerId: calleeWorkerId });
+        await jobStore.appendInternalJob({
+          jobId: childJobId,
+          workerId: calleeWorkerId,
+          awaited: options?.await === true,
+          ...(delaySeconds !== undefined ? { delaySeconds } : {}),
+        });
       }
 
       if (options?.await && jobStore?.getJob) {
@@ -979,6 +1016,13 @@ export function createLambdaHandler<INPUT, OUTPUT>(
   options?: { retry?: SmartRetryConfig }
 ): (event: SQSEvent, context: LambdaContext) => Promise<void> {
   return async (event: SQSEvent, lambdaContext: LambdaContext) => {
+    // Unambiguous entry log: confirms the worker Lambda was actually invoked by SQS (vs. the
+    // message never arriving). Pair this with the [workers-trigger] "message ENQUEUED" log to
+    // see whether a trigger reached its worker.
+    console.log('[Worker] SQS event received', {
+      records: event.Records?.length ?? 0,
+      awsRequestId: lambdaContext?.awsRequestId,
+    });
     const promises = event.Records.map(async (record: SQSRecord) => {
       let messageBody: SQSMessageBody | null = null;
       try {
@@ -988,6 +1032,15 @@ export function createLambdaHandler<INPUT, OUTPUT>(
           messageBody;
         // userId flows from dispatch options → context.userId → messageBody.userId
         const userId: string | undefined = (context.userId as string | undefined) ?? messageUserId;
+
+        // Authoritative jobId ↔ Lambda requestId marker. A single strict-JSON line on a unique,
+        // greppable token so the console can map our custom jobId to the AWS requestId, then pull
+        // the EXACT CloudWatch invocation batch (START..REPORT for that requestId) — not just the
+        // lines that happen to mention the jobId.
+        console.log(
+          '[AIWORKER_RUN] ' +
+            JSON.stringify({ jobId, workerId, awsRequestId: lambdaContext?.awsRequestId })
+        );
 
         // Idempotency: skip if this job was already completed or failed (e.g. SQS redelivery or duplicate trigger).
         // Only the Lambda that processes a message creates/updates that job's key; parent workers only append to internalJobs and poll – they never write child job documents.

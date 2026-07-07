@@ -72,17 +72,18 @@ export async function loadJob(jobId: string): Promise<JobRecord | null> {
   // Prefer atomic list key for internal jobs; fallback to hash field for old records
   const listKey = internalListKey(jobId);
   const listItems = await redis.lrange<string>(listKey, 0, -1);
-  let internalJobs: Array<{ jobId: string; workerId: string }> | undefined;
+  type InternalRef = { jobId: string; workerId: string; awaited?: boolean; delaySeconds?: number };
+  let internalJobs: Array<InternalRef> | undefined;
   if (listItems && listItems.length > 0) {
     internalJobs = listItems.map((s) => {
       try {
-        return JSON.parse(s) as { jobId: string; workerId: string };
+        return JSON.parse(s) as InternalRef;
       } catch {
         return null;
       }
-    }).filter(Boolean) as Array<{ jobId: string; workerId: string }>;
+    }).filter(Boolean) as Array<InternalRef>;
   } else {
-    internalJobs = parseJson<Array<{ jobId: string; workerId: string }>>(data.internalJobs);
+    internalJobs = parseJson<Array<InternalRef>>(data.internalJobs);
   }
   const record: JobRecord = {
     jobId: data.jobId,

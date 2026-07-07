@@ -28,6 +28,11 @@
 export interface InternalJobEntry {
   jobId: string;
   workerId: string;
+  /** Whether the parent awaited this child (dispatchWorker await:true) or fired it and moved on.
+   * Written by the @microfox/ai-worker runtime; surfaced in run traces to distinguish the two. */
+  awaited?: boolean;
+  /** SQS DelaySeconds the parent set on a fire-and-forget dispatch, if any. */
+  delaySeconds?: number;
 }
 
 export interface JobRecord {

@@ -3691,6 +3691,9 @@ Deploying:
   )
   .action(async (group: string | undefined, options: any) => {
     await build({ ...options, group });
+    // Config extraction import()s the user's bundled worker code, which may open
+    // DB/SDK connections that keep the event loop alive — exit explicitly.
+    process.exit(0);
   });
 
 // Deprecated alias. `push` used to build AND deploy (shelling out to `microfox push`
@@ -3710,4 +3713,6 @@ export const pushCommand = attachBuildOptions(new Command())
     if (!options.skipDeploy) {
       console.log(chalk.blue('ℹ️  Nothing was deployed. To deploy: npx microfox@latest push (or "microfox deploy" for compile + push).'));
     }
+    // Same as compile: user worker imports can hold the event loop open.
+    process.exit(0);
   });

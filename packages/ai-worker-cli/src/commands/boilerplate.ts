@@ -331,7 +331,7 @@ export const boilerplateCommand = new Command()
             `  1. Configure your job store in microfox.config.ts (workflowSettings.jobStore)\n` +
             `  2. Set environment variables (MONGODB_URI or UPSTASH_REDIS_*)\n` +
             `  3. Create your first worker: ${chalk.yellow('npx ai-worker new <worker-id>')}\n` +
-            `  4. Deploy workers: ${chalk.yellow('npx ai-worker push')}\n` +
+            `  4. Deploy workers: ${chalk.yellow('npx microfox@latest deploy')} (compile + push)\n` +
             `  5. Use ${chalk.yellow('hooks/useWorkflowJob.ts')} in client components to trigger and poll workers/queues`
         )
       );

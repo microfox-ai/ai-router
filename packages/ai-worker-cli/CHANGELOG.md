@@ -1,5 +1,11 @@
 # @microfox/ai-worker-cli
 
+## 1.1.3
+
+### Patch Changes
+
+- af6e5ca: Changes from PR #71: hitl-and-boilerplate-improvement
+
 ## 1.1.2
 
 ### Patch Changes

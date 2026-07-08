@@ -186,13 +186,13 @@ export const newCommand = new Command()
           });
           spinner.succeed(
             `Created worker: ${chalk.cyan(relativePath)}\n` +
-              `Next: run ${chalk.yellow('npx ai-worker push')} to build & deploy.`
+              `Next: run ${chalk.yellow('npx microfox@latest deploy')} to compile & deploy (or ${chalk.yellow('npx ai-worker compile')} to only build).`
           );
         } else {
           const relativePath = scaffoldQueue(projectRoot, id, dirOpt);
           spinner.succeed(
             `Created queue: ${chalk.cyan(relativePath)}\n` +
-              `Edit steps (workerId) to match your workers, then run ${chalk.yellow('npx ai-worker push')} to build & deploy.`
+              `Edit steps (workerId) to match your workers, then run ${chalk.yellow('npx microfox@latest deploy')} to compile & deploy.`
           );
         }
       } catch (error: unknown) {

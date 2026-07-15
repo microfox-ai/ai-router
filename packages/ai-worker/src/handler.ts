@@ -25,6 +25,12 @@ import {
   upsertInitialQueueJob,
   getQueueJob,
 } from './queueJobStore';
+import {
+  createLocalJobStore,
+  upsertLocalJob,
+  loadLocalJob,
+} from './localJobStore';
+import { getLocalDispatchBridge } from './localBridge';
 import type { WorkerQueueContext, ChainContext, HitlResumeContext, QueueStepOutput, LoopContext } from './queue';
 import { QUEUE_ORCHESTRATION_KEYS } from './queue';
 import { type SmartRetryConfig, type RetryContext, executeWithRetry, matchesRetryPattern } from './retryConfig.js';
@@ -801,6 +807,34 @@ export interface WebhookPayload {
 const DEFAULT_POLL_INTERVAL_MS = 2000;
 const DEFAULT_POLL_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
 
+/** Job store backend selected by WORKER_DATABASE_TYPE. 'local' must be set explicitly (dev server); it is never a fallback. */
+export type JobStoreKind = 'mongodb' | 'upstash-redis' | 'local';
+
+export function getJobStoreKind(): JobStoreKind {
+  const raw = (process.env.WORKER_DATABASE_TYPE || 'upstash-redis').toLowerCase();
+  if (raw === 'mongodb') return 'mongodb';
+  if (raw === 'local') return 'local';
+  return 'upstash-redis';
+}
+
+/**
+ * Load any job record via the configured store. Selection mirrors createLambdaHandler:
+ * explicit 'local' > redis (when selected AND configured) > mongo (when selected OR configured).
+ */
+export async function loadJobRecordById(jobId: string): Promise<JobRecord | null> {
+  const kind = getJobStoreKind();
+  if (kind === 'local') {
+    return loadLocalJob(jobId);
+  }
+  if (kind === 'upstash-redis' && isRedisJobStoreConfigured()) {
+    return loadRedisJob(jobId);
+  }
+  if (kind === 'mongodb' || isMongoJobStoreConfigured()) {
+    return getMongoJobById(jobId);
+  }
+  return null;
+}
+
 function sanitizeWorkerIdForEnv(workerId: string): string {
   return workerId.replace(/-/g, '_').toUpperCase();
 }
@@ -885,18 +919,34 @@ function createDispatchWorker(
       timestamp: new Date().toISOString(),
     };
 
-    const queueUrl = await resolveQueueUrlForWorker(calleeWorkerId);
+    // SQS message timer (per-message DelaySeconds): message stays invisible for N seconds.
+    // Calling worker returns immediately; no computation during delay. See:
+    // https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-delay-queues.html
+    // The local bridge honors the same clamped value via setTimeout.
+    const delaySeconds =
+      options?.await !== true && options?.delaySeconds != null
+        ? Math.min(SQS_MAX_DELAY_SECONDS, Math.max(0, Math.floor(options.delaySeconds)))
+        : undefined;
 
-    if (queueUrl) {
+    let messageId: string | undefined;
+    const localBridge = getLocalDispatchBridge();
+    if (localBridge) {
+      // Local dev mode (`ai-worker dev`): hand the message to the in-process queue
+      // instead of SQS. Only reachable when the dev server installed the bridge
+      // global AND set AI_WORKER_LOCAL=1 — never in a deployed Lambda.
+      const result = await localBridge.enqueue(calleeWorkerId, messageBody, delaySeconds);
+      messageId = result?.messageId;
+    } else {
+      const queueUrl = await resolveQueueUrlForWorker(calleeWorkerId);
+      if (!queueUrl) {
+        // No queue URL found — env var missing and WORKER_SERVICE_NAME not set for SQS fallback.
+        throw new Error(
+          `Cannot dispatch to worker "${calleeWorkerId}": WORKER_QUEUE_URL_${sanitizeWorkerIdForEnv(calleeWorkerId)} is not set` +
+            ' and WORKER_SERVICE_NAME is not configured for SQS fallback lookup.'
+        );
+      }
       const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-east-1';
       const sqs = new SQSClient({ region });
-      // SQS message timer (per-message DelaySeconds): message stays invisible for N seconds.
-      // Calling worker returns immediately; no computation during delay. See:
-      // https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-delay-queues.html
-      const delaySeconds =
-        options?.await !== true && options?.delaySeconds != null
-          ? Math.min(SQS_MAX_DELAY_SECONDS, Math.max(0, Math.floor(options.delaySeconds)))
-          : undefined;
       const sendResult = await sqs.send(
         new SendMessageCommand({
           QueueUrl: queueUrl,
@@ -904,51 +954,45 @@ function createDispatchWorker(
           ...(delaySeconds !== undefined && delaySeconds > 0 ? { DelaySeconds: delaySeconds } : {}),
         })
       );
-      const messageId = sendResult.MessageId ?? undefined;
-
-      if (jobStore?.appendInternalJob) {
-        await jobStore.appendInternalJob({
-          jobId: childJobId,
-          workerId: calleeWorkerId,
-          awaited: options?.await === true,
-          ...(delaySeconds !== undefined ? { delaySeconds } : {}),
-        });
-      }
-
-      if (options?.await && jobStore?.getJob) {
-        const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-        const pollTimeoutMs = options.pollTimeoutMs ?? DEFAULT_POLL_TIMEOUT_MS;
-        const deadline = Date.now() + pollTimeoutMs;
-        while (Date.now() < deadline) {
-          const child = await jobStore.getJob(childJobId);
-          if (!child) {
-            await new Promise((r) => setTimeout(r, pollIntervalMs));
-            continue;
-          }
-          if (child.status === 'completed') {
-            return { jobId: childJobId, messageId, output: child.output };
-          }
-          if (child.status === 'failed') {
-            const err = child.error;
-            throw new Error(
-              err?.message ?? `Child worker ${calleeWorkerId} failed`
-            );
-          }
-          await new Promise((r) => setTimeout(r, pollIntervalMs));
-        }
-        throw new Error(
-          `Child worker ${calleeWorkerId} (${childJobId}) did not complete within ${pollTimeoutMs}ms`
-        );
-      }
-
-      return { jobId: childJobId, messageId };
+      messageId = sendResult.MessageId ?? undefined;
     }
 
-    // No queue URL found — env var missing and WORKER_SERVICE_NAME not set for SQS fallback.
-    throw new Error(
-      `Cannot dispatch to worker "${calleeWorkerId}": WORKER_QUEUE_URL_${sanitizeWorkerIdForEnv(calleeWorkerId)} is not set` +
-        ' and WORKER_SERVICE_NAME is not configured for SQS fallback lookup.'
-    );
+    if (jobStore?.appendInternalJob) {
+      await jobStore.appendInternalJob({
+        jobId: childJobId,
+        workerId: calleeWorkerId,
+        awaited: options?.await === true,
+        ...(delaySeconds !== undefined ? { delaySeconds } : {}),
+      });
+    }
+
+    if (options?.await && jobStore?.getJob) {
+      const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+      const pollTimeoutMs = options.pollTimeoutMs ?? DEFAULT_POLL_TIMEOUT_MS;
+      const deadline = Date.now() + pollTimeoutMs;
+      while (Date.now() < deadline) {
+        const child = await jobStore.getJob(childJobId);
+        if (!child) {
+          await new Promise((r) => setTimeout(r, pollIntervalMs));
+          continue;
+        }
+        if (child.status === 'completed') {
+          return { jobId: childJobId, messageId, output: child.output };
+        }
+        if (child.status === 'failed') {
+          const err = child.error;
+          throw new Error(
+            err?.message ?? `Child worker ${calleeWorkerId} failed`
+          );
+        }
+        await new Promise((r) => setTimeout(r, pollIntervalMs));
+      }
+      throw new Error(
+        `Child worker ${calleeWorkerId} (${childJobId}) did not complete within ${pollTimeoutMs}ms`
+      );
+    }
+
+    return { jobId: childJobId, messageId };
   };
 }
 
@@ -1044,34 +1088,23 @@ export function createLambdaHandler<INPUT, OUTPUT>(
 
         // Idempotency: skip if this job was already completed or failed (e.g. SQS redelivery or duplicate trigger).
         // Only the Lambda that processes a message creates/updates that job's key; parent workers only append to internalJobs and poll – they never write child job documents.
-        const raw = (process.env.WORKER_DATABASE_TYPE || 'upstash-redis').toLowerCase();
-        const jobStoreType: 'mongodb' | 'upstash-redis' =
-          raw === 'mongodb' ? 'mongodb' : 'upstash-redis';
-        if (jobStoreType === 'upstash-redis' && isRedisJobStoreConfigured()) {
-          const existing = await loadRedisJob(jobId);
-          if (existing && (existing.status === 'completed' || existing.status === 'failed')) {
-            console.log('[Worker] Skipping already terminal job (idempotent):', {
-              jobId,
-              workerId,
-              status: existing.status,
-            });
-            return;
-          }
-        } else if (jobStoreType === 'mongodb' || isMongoJobStoreConfigured()) {
-          const existing = await getMongoJobById(jobId);
-          if (existing && (existing.status === 'completed' || existing.status === 'failed')) {
-            console.log('[Worker] Skipping already terminal job (idempotent):', {
-              jobId,
-              workerId,
-              status: existing.status,
-            });
-            return;
-          }
+        const jobStoreType = getJobStoreKind();
+        const existing = await loadJobRecordById(jobId);
+        if (existing && (existing.status === 'completed' || existing.status === 'failed')) {
+          console.log('[Worker] Skipping already terminal job (idempotent):', {
+            jobId,
+            workerId,
+            status: existing.status,
+          });
+          return;
         }
 
         // Select job store and upsert this message's job only (never write child job documents from parent).
         let jobStore: JobStore | undefined;
-        if (
+        if (jobStoreType === 'local') {
+          await upsertLocalJob(jobId, workerId, input, metadata, userId);
+          jobStore = createLocalJobStore(workerId, jobId, input, metadata, userId);
+        } else if (
           jobStoreType === 'upstash-redis' &&
           isRedisJobStoreConfigured()
         ) {

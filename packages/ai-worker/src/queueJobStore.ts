@@ -12,6 +12,12 @@
 import type { Redis } from '@upstash/redis';
 import { Redis as UpstashRedis } from '@upstash/redis';
 import { MongoClient, type Collection } from 'mongodb';
+import {
+  upsertInitialLocalQueueJob,
+  updateLocalQueueJobStep,
+  appendLocalQueueJobStep,
+  getLocalQueueJob,
+} from './localJobStore';
 
 type QueueJobStep = {
   workerId: string;
@@ -187,9 +193,16 @@ async function saveQueueJobRedis(record: QueueJobRecord): Promise<void> {
 
 // === Backend selection ===
 
-function getStoreType(): 'mongodb' | 'upstash-redis' {
+function getStoreType(): 'mongodb' | 'upstash-redis' | 'local' {
   const t = (process.env.WORKER_DATABASE_TYPE || 'upstash-redis').toLowerCase();
-  return t === 'mongodb' ? 'mongodb' : 'upstash-redis';
+  if (t === 'mongodb') return 'mongodb';
+  if (t === 'local') return 'local';
+  return 'upstash-redis';
+}
+
+/** Local in-memory store — only when WORKER_DATABASE_TYPE=local is set explicitly (dev server). */
+function preferLocal(): boolean {
+  return getStoreType() === 'local';
 }
 
 function preferMongo(): boolean {
@@ -197,7 +210,7 @@ function preferMongo(): boolean {
 }
 
 function preferRedis(): boolean {
-  return getStoreType() !== 'mongodb' && Boolean((redisUrl || '').trim() && (redisToken || '').trim());
+  return getStoreType() === 'upstash-redis' && Boolean((redisUrl || '').trim() && (redisToken || '').trim());
 }
 
 // === Public API used from handler.ts ===
@@ -212,6 +225,11 @@ export async function upsertInitialQueueJob(options: {
 }): Promise<void> {
   const { queueJobId, queueId, firstWorkerId, firstWorkerJobId, metadata, userId } = options;
   const now = new Date().toISOString();
+
+  if (preferLocal()) {
+    await upsertInitialLocalQueueJob(options);
+    return;
+  }
 
   if (preferMongo()) {
     const coll = await getMongoQueueCollection();
@@ -312,6 +330,11 @@ export async function updateQueueJobStepInStore(options: {
   const { queueJobId, stepIndex, status, input, output, error } = options;
   const now = new Date().toISOString();
 
+  if (preferLocal()) {
+    await updateLocalQueueJobStep(options);
+    return;
+  }
+
   if (preferMongo()) {
     const coll = await getMongoQueueCollection();
     const existing = await coll.findOne({ _id: queueJobId });
@@ -397,6 +420,11 @@ export async function appendQueueJobStepInStore(options: {
   const { queueJobId, workerId, workerJobId } = options;
   const now = new Date().toISOString();
 
+  if (preferLocal()) {
+    await appendLocalQueueJobStep({ queueJobId, workerId, workerJobId });
+    return;
+  }
+
   if (preferMongo()) {
     const coll = await getMongoQueueCollection();
     await coll.updateOne(
@@ -440,6 +468,21 @@ export async function getQueueJob(queueJobId: string): Promise<{
   status: string;
   steps: Array<{ workerId: string; workerJobId: string; status: string; output?: unknown }>;
 } | null> {
+  if (preferLocal()) {
+    const record = await getLocalQueueJob(queueJobId);
+    if (!record) return null;
+    return {
+      id: record.id,
+      queueId: record.queueId,
+      status: record.status,
+      steps: (record.steps ?? []).map((s) => ({
+        workerId: s.workerId,
+        workerJobId: s.workerJobId,
+        status: s.status,
+        output: s.output,
+      })),
+    };
+  }
   if (preferMongo()) {
     const coll = await getMongoQueueCollection();
     const doc = await coll.findOne({ _id: queueJobId });

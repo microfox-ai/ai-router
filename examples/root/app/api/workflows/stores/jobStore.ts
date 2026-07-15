@@ -5,7 +5,8 @@
  * in-memory storage is not shared across processes, so a persistent store is required.
  *
  * Configure via `microfox.config.ts` -> `workflowSettings.jobStore` or env:
- * - WORKER_DATABASE_TYPE: 'mongodb' | 'upstash-redis' (default: upstash-redis)
+ * - WORKER_DATABASE_TYPE: 'mongodb' | 'upstash-redis' (default: upstash-redis),
+ *   or 'local' in development to proxy to a running `ai-worker dev` server
  * - DATABASE_MONGODB_URI or MONGODB_URI (required for mongodb)
  * - DATABASE_MONGODB_DB or MONGODB_DB; MONGODB_WORKER_JOBS_COLLECTION (default: worker_jobs)
  * - WORKER_UPSTASH_REDIS_* / WORKER_JOBS_TTL_SECONDS for Redis
@@ -76,6 +77,14 @@ function getStorageAdapter(): JobStoreAdapter {
     }
     jobStoreType = jobStoreType || process.env.WORKER_DATABASE_TYPE || 'upstash-redis';
     const normalized = jobStoreType.toLowerCase();
+
+    // DEV ONLY: workers run in-process under `ai-worker dev` with its local
+    // file-persisted store; reads/writes proxy to the dev server over HTTP.
+    if (normalized === 'local') {
+      const { localDevJobStore } = require('./localDevAdapter');
+      console.log('[JobStore] Ready (local ai-worker dev server via WORKER_BASE_URL)');
+      return localDevJobStore;
+    }
 
     if (normalized === 'upstash-redis' || normalized === 'redis') {
       const { redisJobStore } = require('./redisAdapter');

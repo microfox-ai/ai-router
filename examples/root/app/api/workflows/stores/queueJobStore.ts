@@ -36,9 +36,16 @@ export interface QueueJobRecord {
 
 // === Backend selection ===
 
-function getStoreType(): 'mongodb' | 'upstash-redis' {
+function getStoreType(): 'mongodb' | 'upstash-redis' | 'local' {
   const t = (process.env.WORKER_DATABASE_TYPE || 'upstash-redis').toLowerCase();
-  return t === 'mongodb' ? 'mongodb' : 'upstash-redis';
+  if (t === 'mongodb') return 'mongodb';
+  if (t === 'local') return 'local';
+  return 'upstash-redis';
+}
+
+/** DEV ONLY: proxy reads/writes to a running `ai-worker dev` server (WORKER_BASE_URL). */
+function preferLocal(): boolean {
+  return getStoreType() === 'local';
 }
 
 function preferMongo(): boolean {
@@ -46,7 +53,7 @@ function preferMongo(): boolean {
 }
 
 function preferRedis(): boolean {
-  return getStoreType() !== 'mongodb';
+  return getStoreType() === 'upstash-redis';
 }
 
 // === MongoDB backend ===
@@ -147,6 +154,10 @@ export async function createQueueJob(
   firstStep: { workerId: string; workerJobId: string },
   metadata?: Record<string, unknown>
 ): Promise<void> {
+  if (preferLocal()) {
+    const { createQueueJobLocal } = require('./localDevAdapter');
+    return createQueueJobLocal(id, queueId, firstStep, metadata);
+  }
   const now = new Date().toISOString();
   const record: QueueJobRecord = {
     id,
@@ -209,6 +220,10 @@ export async function updateQueueStep(
     completedAt?: string;
   }
 ): Promise<void> {
+  if (preferLocal()) {
+    const { updateQueueStepLocal } = require('./localDevAdapter');
+    return updateQueueStepLocal(queueJobId, stepIndex, update);
+  }
   if (preferRedis()) {
     const redis = getRedis();
     const key = queueKey(queueJobId);
@@ -291,6 +306,10 @@ export async function appendQueueStep(
   queueJobId: string,
   step: { workerId: string; workerJobId: string }
 ): Promise<void> {
+  if (preferLocal()) {
+    const { appendQueueStepLocal } = require('./localDevAdapter');
+    return appendQueueStepLocal(queueJobId, step);
+  }
   if (preferRedis()) {
     const redis = getRedis();
     const key = queueKey(queueJobId);
@@ -334,6 +353,10 @@ export async function updateQueueJob(
   queueJobId: string,
   update: { status?: QueueJobRecord['status']; completedAt?: string }
 ): Promise<void> {
+  if (preferLocal()) {
+    const { updateQueueJobLocal } = require('./localDevAdapter');
+    return updateQueueJobLocal(queueJobId, update);
+  }
   const now = new Date().toISOString();
   if (preferRedis()) {
     const redis = getRedis();
@@ -356,6 +379,10 @@ export async function updateQueueJob(
 }
 
 export async function getQueueJob(queueJobId: string): Promise<QueueJobRecord | null> {
+  if (preferLocal()) {
+    const { getQueueJobLocal } = require('./localDevAdapter');
+    return getQueueJobLocal(queueJobId);
+  }
   if (preferRedis()) {
     return loadQueueJobRedis(queueJobId);
   }
@@ -370,6 +397,10 @@ export async function listQueueJobs(
   queueId?: string,
   limit = 50
 ): Promise<QueueJobRecord[]> {
+  if (preferLocal()) {
+    const { listQueueJobsLocal } = require('./localDevAdapter');
+    return listQueueJobsLocal(queueId, limit);
+  }
   if (preferRedis()) {
     // Redis: scan for keys matching prefix, then load each
     // Note: This is less efficient than MongoDB queries, but acceptable for small datasets

@@ -1,12 +1,14 @@
 ---
 title: 'Worker CLI Reference'
 sidebarTitle: 'Worker CLI'
-description: 'Complete CLI reference for @microfox/ai-worker-cli - deployment and scaffolding tool.'
+description: 'Complete CLI reference for @microfox/ai-worker-cli - local dev, build, and scaffolding tool. Deployment is handled by the microfox CLI.'
 ---
 
 ## Overview
 
-`@microfox/ai-worker-cli` provides command-line tools for deploying workers to AWS Lambda and scaffolding new worker files. It scans your codebase for worker definitions, builds Lambda handlers, and generates Serverless Framework configuration.
+`@microfox/ai-worker-cli` provides command-line tools for running workers locally, compiling them into a deployable serverless build, and scaffolding new worker files. It scans your codebase for worker definitions, builds Lambda handlers, and generates Serverless Framework configuration.
+
+**Deployment is handled by the `microfox` CLI** (`npx microfox deploy` / `npx microfox push`) — the `ai-worker` CLI never deploys. See [Deploying with the microfox CLI](#deploying-with-the-microfox-cli) below.
 
 ## Installation
 
@@ -21,72 +23,133 @@ npx @microfox/ai-worker-cli@latest <command>
 You can run the CLI in any of these ways:
 
 - **Direct**: `npx @microfox/ai-worker-cli <command>`
-- **Via microfox CLI**: `npx ai-worker <command>` (e.g. `npx ai-worker push`, `npx ai-worker new`)
-- **Build only** (no deploy): `npx microfox compile` — same as `npx ai-worker push --skip-deploy`
-- **Deploy only** (no build): `npx microfox push` — deploys only; same as `npx ai-worker push --deploy-only`. Use `npx ai-worker push` for build and deploy.
+- **Short alias**: `npx ai-worker <command>` (e.g. `npx ai-worker dev`, `npx ai-worker compile`, `npx ai-worker new`)
 
-The `microfox` CLI package proxies these commands to `@microfox/ai-worker-cli`.
+**Typical workflow:**
+
+```bash
+npx ai-worker new                # 1. scaffold a worker or queue in app/ai/
+npx ai-worker boilerplate        # 2. add the Next.js API routes + job stores (once per app)
+npx ai-worker dev                # 3. run + test workers locally (no AWS needed)
+npx microfox@latest deploy       # 4. compile + push to the Microfox platform
+```
 
 ## Commands
 
-### `push`
+### `dev` (local dev server)
 
-Builds and deploys workers to AWS Lambda using Serverless Framework.
+Runs your workers locally with **zero AWS and zero Microfox account**: one HTTP server exposing the same routes as a deployed core group, workers invoked in-process, an in-memory queue standing in for SQS, and hot reload.
 
 ```bash
-npx @microfox/ai-worker-cli push [options]
-# or
-npx ai-worker push [options]
-# or
-npx microfox push [options]
+npx ai-worker dev
+# custom port
+npx ai-worker dev --port 4200
 ```
 
 **Options:**
 
-- `--stage <stage>` - Deployment stage (default: `dev`)
-- `--region <region>` - AWS region (default: `us-east-1`)
-- `--service-name <name>` - Serverless service name (default: auto-detected)
-- `--ai-path <path>` - Base path for scanning workers and queues (default: `app/ai`)
-- `--workers-dir <path>` - Directory pattern to scan for workers (default: `app/ai/**/*.worker.ts`)
-- `--queues-dir <path>` - Directory pattern to scan for queues (default: `app/ai/**/*.queue.ts`)
-- `--output-dir <path>` - Output directory for generated files (default: `.serverless-workers`)
-- `--build-only` - Build only, don't deploy
-- `--deploy-only` - Deploy only (assumes build already done)
-- `--skip-build` - Skip build step (use existing build)
-- `--skip-deploy` - Skip deploy step (build only)
-- `--env-file <path>` - Path to environment variables file (default: `.env`)
-- `--env-prefix <prefix>` - Prefix for environment variables (default: none)
-- `--no-bundle` - Don't bundle dependencies (use Lambda layers instead)
-- `--bundle-deps` - Bundle all dependencies (default: auto-detect)
-- `--verbose` - Enable verbose logging
+- `-p, --port <port>` - HTTP port (default: `4100`)
+- `--ai-path <path>` - Directory scanned for `*.worker.ts` / `*.queue.ts` files (default: `app/ai`)
+- `-c, --concurrency <n>` - Max concurrent runs per worker (default: `5`)
+- `--max-receive-count <n>` - Delivery attempts before a message lands in the local DLQ (default: `3`)
+
+**Routes** — the same routes as a deployed core group, with the same request/response shapes:
+
+- `POST /workers/trigger` - trigger a worker
+- `GET /workers/config` - worker registry/config
+- `GET /docs.json` - generated docs
+- `POST /queues/{id}/start` - start a queue
+
+Point your app at it by setting:
+
+```bash
+WORKER_BASE_URL=http://localhost:4100
+```
+
+The auth rule matches production: endpoints are open unless `WORKERS_API_KEY` is set — then the `x-workers-trigger-key` header is required.
+
+**Dev-only extras:**
+
+- `GET /jobs/{jobId}` - job run tree + queue doc for one job
+- `GET /jobs` - all local jobs
+- `GET /dlq` - locally dead-lettered messages
+- `GET /health` - health check
+
+**Environment:** loads `.env` → `.env.local` → `.env.dev` → `.env.dev.local` (later files win; real shell env wins over all files) and forces `ENVIRONMENT`/`STAGE`/`NODE_ENV` to `dev`.
+
+**Job store:** uses a local file-persisted store (`.microfox/dev-state.json`, auto-gitignored) when no Upstash/Mongo env is present. If `UPSTASH_*`/`MONGODB_URI` env exists (or `WORKER_DATABASE_TYPE` is set), the real store is used instead. Parked HITL approvals and job history survive dev-server restarts via the state file.
+
+**Using your app's UI against the local store:** set `WORKER_DATABASE_TYPE=local` for **both** the dev server and your Next.js app (plus `WORKER_BASE_URL=http://localhost:4100`). The boilerplate's `stores/localDevAdapter.ts` then proxies all app-side job/queue store reads *and* writes to the dev server's `/dev-store/*` API, so trigger → poll → HITL approve/reject all work in the browser with no Redis or Mongo. The `/dev-store` routes are only served when the dev server itself runs on the local store, and follow the same `WORKERS_API_KEY` auth rule. ⚠️ `WORKER_DATABASE_TYPE=local` is dev-only — never deploy with it (compile prints a loud warning if it would ship into `env.json`).
+
+**Hot reload:** edit any worker/queue/lib file while the server runs — the next invocation uses the new code, no restart needed. Adding or removing `*.worker.ts`/`*.queue.ts` files is picked up live. Type `rs` + Enter to force a re-scan.
+
+**Differences from AWS (fidelity limits):**
+
+- Queue schedules are printed at startup but **not executed** locally — start scheduled queues manually via `POST /queues/{id}/start`.
+- All workers share one Node event loop (CPU-bound work blocks other runs) and one `process.env`.
+- Delivery is exactly-once (SQS is at-least-once).
+- A handler error recorded in the job store is **not redelivered** (same effective behavior as prod idempotency) — the local DLQ only receives failures that never reached the store (e.g. module-load/syntax errors).
+
+### `compile`
+
+Compiles workers into a deployable build in `.serverless-workers/`. **It does not deploy** — deploy the build with `npx microfox push` (or use `npx microfox deploy` to compile + push in one step).
+
+```bash
+npx @microfox/ai-worker-cli compile [group] [options]
+# or
+npx ai-worker compile [group] [options]
+```
+
+<Note>
+`compile` was previously called `push` (which built **and** deployed). `push` still exists as a hidden, deprecated alias that only compiles and never deploys; its old flags (`--build-only`, `--deploy-only`, `--skip-deploy`, `--skip-core`) are gone or ignored. Use `compile` + `microfox deploy` instead.
+</Note>
+
+**Arguments:**
+
+- `[group]` - Optional. Compile only this group (multi-group layout, e.g. `core`, `default`, `workflows`)
+
+**Options:**
+
+- `-s, --stage <stage>` - Deployment stage baked into the build (default: `STAGE` env var, then `prod`). Stage names must match `[a-z0-9-]`, max 20 characters. See [Multi-stage deploys](#multi-stage-deploys).
+- `-r, --region <region>` - AWS region baked into the generated serverless config (default: `us-east-1`)
+- `--ai-path <path>` - Path to the AI directory containing workers (default: `app/ai`)
+- `--service-name <name>` - Override serverless service name (default: `ai-router-workers-<stage>`)
+- `--skip-group <groups>` - Comma-separated groups to skip building (multi-group layout, e.g. `"core,workflows"`)
+- `--require-auth` - Fail the build if no worker secret (`WORKERS_API_KEY` / projectId) can be resolved
+- `--allow-public` - Build worker endpoints as public without a warning when no secret is set
 
 **What it does:**
 
 1. **Scans** for worker files (`*.worker.ts`) and queue files (`*.queue.ts`)
-2. **Reads** optional `microfox.json` `worker` config (externalDeps, includeNodeModules, groups) for bundling and multi-group behavior
+2. **Reads** optional `worker` and `env` config from `microfox.json` / `microfox.config.ts` (externalDeps, includeNodeModules, groups, env shipping rules)
 3. **Extracts** worker configurations (`workerConfig` exports, including `group`)
 4. **Analyzes** dependencies and environment variable usage
 5. **Detects** worker-to-worker calls (`ctx.dispatchWorker`)
 6. **Generates** Lambda handler files (one Serverless stack per group; core stack for trigger/config/queues)
-7. **Generates** `serverless.yml` configuration
+7. **Generates** `serverless.yml` configuration and `env.json` (see [Controlling shipped env vars](#controlling-shipped-env-vars-env-block))
 8. **Builds** handlers with esbuild (per-group options from `worker.groups`)
-9. **Deploys** to AWS (unless `--build-only`)
+
+**Output:**
+
+- `.serverless-workers/` - single-group build (serverless.yml + bundled handlers)
+- `.serverless-workers/<group>/` - per-group builds when workers declare multiple groups
 
 See [Worker Architecture – Multi-group and Project config](../advanced/worker-architecture#multi-group-deployments) for groups and `microfox.json` details.
 
 **Example:**
 
 ```bash
-# Build and deploy to dev stage
-npx ai-worker push --stage dev --region us-east-1
+# Compile everything (stage defaults to prod)
+npx ai-worker compile
 
-# Build only (no deploy)
-npx ai-worker push --build-only
-# or: npx microfox compile
+# Compile for a specific stage
+npx ai-worker compile --stage staging
 
-# Deploy only (after build)
-npx ai-worker push --deploy-only --stage prod
-# or: npx microfox push --stage prod
+# Compile only the "core" build
+npx ai-worker compile core
+
+# Compile everything except core
+npx ai-worker compile --skip-group core
 ```
 
 ### `new`
@@ -134,7 +197,7 @@ npx ai-worker new data-processor --dir app/workers
 
 **Generated queue file** (e.g. `app/ai/queues/cost-usage.queue.ts`):
 
-- Uses `defineWorkerQueue` with `id` and a `steps` array. Includes commented-out examples for `chain` (input mapping), `requiresApproval`/`resume` (HITL), and `delaySeconds`. Replace `first-worker` with your real worker IDs and run `npx ai-worker push`.
+- Uses `defineWorkerQueue` with `id` and a `steps` array. Includes commented-out examples for `chain` (input mapping), `requiresApproval`/`resume` (HITL), and `delaySeconds`. Replace `first-worker` with your real worker IDs, test with `npx ai-worker dev`, and deploy with `npx microfox@latest deploy`.
 
 ### `boilerplate`
 
@@ -200,13 +263,162 @@ npx ai-worker boilerplate --skip-config
 
 For a runnable example that includes repository references, see [Workers + Orchestration Proof](../examples/workers-orchestration-proof).
 
-## How `push` Works
+## Deploying with the microfox CLI
+
+Deployment lives in the `microfox` CLI, which uploads your compiled build to the Microfox platform — the platform runs `serverless deploy` for you, so **you do not need AWS credentials locally**. It requires a `microfox.json` (or `microfox.config.ts` with `workflowSettings.deploymentConfig`) containing a `projectId`, and authentication via `npx microfox login` (or a `MICROFOX_TOKEN` env var in CI).
+
+### `microfox deploy`
+
+Compile + push in one step (equivalent to `microfox compile` then `microfox push`). This is the everyday command — use it for first deploys and for every rebuild/redeploy after a change.
+
+```bash
+npx microfox@latest deploy [groupname] [options]
+```
+
+**Options:**
+
+- `[groupname]` - Compile and push only this group (e.g. `core`, `default`, `workflows`)
+- `--skip-group <groups>` - Comma-separated list of groups to skip (e.g. `"core,workflows"`)
+- `-s, --stage <stage>` - Stage baked into the generated serverless config (see [Multi-stage deploys](#multi-stage-deploys))
+- `-r, --region <region>` - AWS region baked into the generated serverless config
+- `--ai-path <path>` - Path to the AI directory containing workers (default: `app/ai`)
+- `--skip-compile` - Push the existing `.serverless-workers` build without recompiling
+
+**Examples:**
+
+```bash
+npx microfox@latest deploy                      # compile + push all groups
+npx microfox@latest deploy core                 # compile + push only the "core" group
+npx microfox@latest deploy --skip-group core    # compile + push everything except core
+npx microfox@latest deploy --skip-compile       # push the last build without recompiling
+```
+
+### `microfox compile` and `microfox push`
+
+The two halves of `deploy`, when you want them separately:
+
+- `npx microfox compile [group] [--skip-group ...] [--stage ...]` - build only (runs `ai-worker compile` under the hood, writes to `.serverless-workers/`, nothing is uploaded)
+- `npx microfox push [group] [--skip-group ...] [--stage ...]` - upload only (bundles the existing `.serverless-workers/` build as a ZIP and uploads it to the Microfox platform for deployment; per group when using the per-group layout)
+
+If `--stage` is omitted on `push`, the stage the build was compiled with is used (read from the build's `env.json`), defaulting to `prod`. Passing a `--stage` that differs from the compiled build prints a mismatch warning — recompile with that stage to avoid a mixed deploy.
+
+### Multi-stage deploys
+
+Both CLIs support deployment **stages**, so you can run `staging` and `prod` (or any stage) side by side:
+
+```bash
+# Build + deploy a staging stack alongside prod
+npx microfox@latest deploy --stage staging
+
+# Or as separate steps
+npx ai-worker compile --stage staging
+npx microfox@latest push --stage staging
+```
+
+- The stage is **baked into the build** at compile time (via `--stage` or the `STAGE` env var; default `prod`): `env.json`'s `ENVIRONMENT`/`STAGE`/`NODE_ENV`, the `serverless.yml` stage fallback, and SQS queue names all carry it, so each stage deploys as a **parallel CloudFormation stack**.
+- Stage names must match `[a-z0-9-]`, max 20 characters.
+- Stage-scoped env files load automatically: `.env` → `.env.local` → `.env.{stage}` → `.env.{stage}.local` (later wins). See [Environment files](#environment-files-env-cascade).
+
+<Warning>
+Platform-side (console) support for non-prod stages is still rolling out — until it lands, non-prod deployments may appear as prod in the Microfox console.
+</Warning>
+
+### Monitoring deployments (`status`, `logs`, `metrics`)
+
+Every `microfox push`/`deploy` returns a **Deployment ID**, which is also saved locally so `latest` resolves to your most recent deployment(s):
+
+```bash
+npx microfox status latest          # status of the most recent deployment
+npx microfox status latest -n 3     # the 3 most recent (e.g. one per group)
+npx microfox status <deploymentId>  # a specific deployment
+
+npx microfox logs latest            # deployment logs
+npx microfox logs latest --step compiling     # one phase: compiling | deploying | post_deployment
+npx microfox logs <id> --limit 200 --cursor <iso-timestamp>
+
+npx microfox metrics <deploymentId> # timing, CPU/memory, image size, data transfer
+```
+
+- **`status`** shows the deployment's state, group, error message (if any), start/end time, and — once deployed — the **Base URL** of your workers API. Point `WORKER_BASE_URL` at that URL.
+- **`logs`** streams the platform-side build logs in three phases: `compiling`, `deploying`, and `post_deployment`. This is where to look when a deployment fails.
+- **`metrics`** shows deployment timing (per step), resource usage (CPU/memory peaks), and network transfer.
+
+The same information is available in the **Microfox console**: each deployment appears under your project with its status, logs, and the deployed endpoints. The CLI commands and the console read the same records — use whichever is closer at hand. For runtime (post-deploy) behavior, worker runs are tracked in your **job store** (see [Worker Architecture – Monitoring](../advanced/worker-architecture#monitoring-and-observability)); each job records status, progress, output, and errors, queryable via `GET /api/workflows/workers/:workerId/:jobId`.
+
+## Environment files (.env cascade)
+
+`compile` (and `microfox compile`/`deploy`) reads env vars from a **stage-scoped cascade** of env files, dotenv-flow style — later files win on key conflicts:
+
+```
+.env  →  .env.local  →  .env.{stage}  →  .env.{stage}.local
+```
+
+- The `--stage` flag (or `STAGE` env var) decides which stage files load — e.g. `--stage staging` loads `.env` → `.env.local` → `.env.staging` → `.env.staging.local`.
+- Real shell/CI environment variables always win over all files.
+- `ai-worker dev` uses the same cascade with the stage fixed to `dev` (`.env.dev`, `.env.dev.local`).
+
+### Stage isolation (`files: 'isolated'`)
+
+If you'd rather have each stage declare its **complete** env (no inheritance from `.env`), set `files: 'isolated'` in the `env` block:
+
+```ts
+env: {
+  files: 'isolated',  // default: 'cascade'
+},
+```
+
+- A staged build then reads **only** `.env.{stage}` → `.env.{stage}.local` — nothing leaks in from `.env`/`.env.local`.
+- Compile **hard-errors** if neither stage file exists. Note this includes the default stage: with isolation on, a plain `compile` (stage `prod`) requires a `.env.prod`.
+- The build log lists which base-`.env` keys are not available to the isolated build.
+- `WORKERS_API_KEY` resolution is stage-scoped too: if the stage file doesn't define one, the projectId-derived key is used — not the `.env` one.
+- Real shell/CI env vars still win over files in both modes. `ai-worker dev` always uses the cascade (local runs, nothing ships).
+
+## Controlling shipped env vars (`env` block)
+
+By default, the CLI ships env vars into the deployed Lambda's `env.json` using a **prefix allowlist** (`OPENAI_*`, `ANTHROPIC_*`, `DATABASE_*`, `MONGODB_*`, `REDIS_*`, `UPSTASH_*`, `WORKER_*`, `WORKERS_*`, `WORKFLOW_*`, `REMOTION_*`, `QUEUE_JOB_*`) plus any key your worker code actually references via `process.env.KEY`.
+
+To control this precisely, add an optional `env` block to your microfox config — the root of `microfox.json`, or `workflowSettings.deploymentConfig` in `microfox.config.ts` (the same object that carries `worker.externalDeps` / `worker.groups`):
+
+```ts
+env: {
+  // 'all-detected' (default): prefix allowlist + keys detected from code — unchanged if omitted
+  // 'explicit': ONLY the include list (+ platform keys) ships, nothing else
+  mode: 'all-detected',
+
+  // Extra keys to ship ('*' wildcard supported); shipped if present in the env file cascade
+  include: ['SOME_SDK_KEY', 'MYAPP_*'],
+
+  // Keys to never ship — wins over include and the prefix allowlist
+  exclude: ['DEBUG_*', 'LOCAL_ONLY_TOKEN'],
+
+  // Per-group overlays — only affect that group's env.json.
+  // include/exclude lists APPEND to the project lists; `mode` OVERRIDES the
+  // project mode for that one group (e.g. lock down a single group to an
+  // explicit key list while the rest stay on the default allowlist).
+  groups: {
+    video: { include: ['REMOTION_LICENSE_KEY'] },
+    core:  { exclude: ['HEAVY_FEATURE_FLAG'] },
+    billing: { mode: 'explicit', include: ['STRIPE_KEY'] },
+  },
+},
+```
+
+**Rules:**
+
+- **Always shipped, cannot be excluded**: `ENVIRONMENT`, `STAGE`, `NODE_ENV`, and `WORKERS_API_KEY` (when resolved).
+- **`AWS_*` never ships**, regardless of config (reserved by Lambda).
+- **Precedence per key**: platform keys → `AWS_*` block → `exclude` → `include` → mode (`all-detected` allowlist+detected, or `explicit` = nothing else).
+- **Per-group `mode`** overrides the project mode for that group's env.json only; a group without `mode` inherits the project mode. Group `include`/`exclude` lists always append to the project lists.
+- `include` patterns that match nothing in your env files print a warning at compile time; in `explicit` mode the CLI logs exactly which keys ship.
+- **No `env` block = behavior is 100% unchanged** from previous versions.
+
+## How `compile` Works
 
 ### 1. Worker Discovery
 
-Scans for files matching patterns:
-- Workers: `app/ai/**/*.worker.ts` (configurable via `--workers-dir`)
-- Queues: `app/ai/**/*.queue.ts` (configurable via `--queues-dir`)
+Scans for files under `--ai-path` (default `app/ai`):
+- Workers: `**/*.worker.ts`
+- Queues: `**/*.queue.ts`
 
 For each worker file:
 - Extracts `workerConfig` export
@@ -227,8 +439,8 @@ For each worker, analyzes:
 
 **Environment variable detection:**
 - Scans for `process.env.KEY` patterns
-- Separates runtime vs buildtime variables
-- Adds to Lambda environment configuration
+- Resolves values from the [env file cascade](#environment-files-env-cascade)
+- Writes shipped keys to `env.json` per the [`env` block rules](#controlling-shipped-env-vars-env-block)
 
 **Worker-to-worker detection:**
 - Scans handler code for `ctx.dispatchWorker('worker-id', ...)`
@@ -261,9 +473,9 @@ For queues, generates:
 Generates `serverless.yml` with:
 
 - **Functions**: One Lambda per worker (and queue starter)
-- **SQS Queues**: One queue per worker (with DLQ if configured)
+- **SQS Queues**: One queue per worker (with DLQ if configured); queue names carry the stage
 - **Event Sources**: SQS triggers for worker functions, schedules for queue starters
-- **Environment Variables**: Extracted from worker code
+- **Environment Variables**: From `env.json`
 - **Layers**: If `layers` specified in `workerConfig`
 - **IAM Roles**: Permissions for SQS, Lambda, and job store access
 
@@ -277,7 +489,7 @@ provider:
   name: aws
   runtime: nodejs20.x
   region: us-east-1
-  stage: dev
+  stage: prod
   environment:
     STAGE: ${self:provider.stage}
     AWS_REGION: ${self:provider.region}
@@ -324,42 +536,39 @@ resources:
 Uses `esbuild` to bundle handlers:
 
 - **Entry points**: Generated handler files
-- **External dependencies**: Excluded (installed in Lambda layer or runtime)
+- **External dependencies**: Excluded per `worker.externalDeps` / `worker.includeNodeModules` config
 - **Output**: `.serverless-workers/dist/`
 - **Format**: CommonJS (for Lambda compatibility)
 
-### 7. Deploy Process
+### 7. Deploy Process (microfox CLI)
 
-Runs `serverless deploy`:
+`microfox push` bundles the build as a ZIP and uploads it to the Microfox platform, which then:
 
-- Packages Lambda functions
-- Creates/updates SQS queues
-- Creates/updates Lambda functions
-- Sets up event source mappings
-- Updates environment variables
+- Runs `serverless deploy` server-side
+- Creates/updates SQS queues, Lambda functions, and event source mappings
+- Applies the environment variables from `env.json`
+- Records the deployment (visible via `microfox status`/`logs` and the console)
 
 ## Configuration Files
 
-### `.env` File
+### Env files
 
-The CLI reads environment variables from `.env` (or `--env-file`):
+The CLI reads environment variables from the [stage-scoped cascade](#environment-files-env-cascade) (`.env` → `.env.local` → `.env.{stage}` → `.env.{stage}.local`):
 
 ```bash
-# Required
+# Required (adapt to your job store)
 MONGODB_URI=mongodb://...
-AWS_REGION=us-east-1
-STAGE=dev
 
-# Optional
-WORKERS_TRIGGER_API_KEY=secret-key
+# Recommended: shared secret for deployed worker endpoints
+WORKERS_API_KEY=secret-key
+
+# Anything your workers reference via process.env
 OPENAI_API_KEY=sk-...
 ```
 
 ### `serverless.yml` (Generated)
 
-The CLI generates `serverless.yml` in `.serverless-workers/`. You can customize it after generation, but it will be overwritten on next `push`.
-
-**Customization:** Use `--output-dir` to generate in a different location, then copy to your project root if needed.
+The CLI generates `serverless.yml` in `.serverless-workers/`. You can inspect it, but it is overwritten on the next `compile`.
 
 ## Worker Configuration Extraction
 
@@ -385,6 +594,7 @@ export default createWorker({
 - `memorySize` - Lambda memory (MB, 128-10240)
 - `layers` - Lambda layer ARNs
 - `schedule` - Schedule events (cron/rate)
+- `group` - Deployment group (multi-group layout)
 - `sqs.maxReceiveCount` - DLQ threshold
 - `sqs.messageRetentionPeriod` - Queue retention (seconds)
 - `sqs.visibilityTimeout` - Queue visibility timeout (seconds)
@@ -420,7 +630,7 @@ The CLI automatically injects environment variables:
 
 **From worker code:**
 - Scans for `process.env.*` usage
-- Adds to Lambda environment
+- Adds detected keys to the Lambda environment (subject to the [`env` block rules](#controlling-shipped-env-vars-env-block))
 
 **For worker-to-worker:**
 - Detects `ctx.dispatchWorker('worker-id', ...)`
@@ -437,25 +647,26 @@ The CLI automatically injects environment variables:
 
 **Issue:** Handler build fails with import errors
 
-**Solution:** Check that all dependencies are listed in `package.json`. The CLI bundles external packages, but local imports must be resolvable.
+**Solution:** Check that all dependencies are listed in `package.json`. The CLI bundles external packages, but local imports must be resolvable. For packages that should not be bundled, use `worker.externalDeps` in your microfox config.
 
 ### Deployment Failures
 
-**Issue:** `serverless deploy` fails with permission errors
+**Issue:** `microfox push` / `deploy` fails or the deployment errors out
 
-**Solution:** Ensure AWS credentials are configured (`aws configure`) and IAM role has permissions for:
-- Lambda (create/update functions)
-- SQS (create/update queues)
-- IAM (create/update roles)
+**Solution:**
+- Run `npx microfox logs latest` to see the platform-side build logs (`compiling`/`deploying` phases usually contain the root cause)
+- Ensure you are logged in (`npx microfox login`) and your config has a valid `projectId`
+- A 401 response means you are not authenticated — run `microfox login` (or set `MICROFOX_TOKEN` in CI)
 
 ### Missing Environment Variables
 
 **Issue:** Lambda fails with missing env vars
 
-**Solution:** 
-- Add variables to `.env` file
-- Use `--env-file` to specify custom file
-- Check that variables are in `serverless.yml` environment section
+**Solution:**
+- Add variables to your env files (remember the cascade: `.env` → `.env.local` → `.env.{stage}` → `.env.{stage}.local`)
+- If the key doesn't match the default prefix allowlist and isn't referenced via `process.env.KEY` in worker code, add it to `env.include`
+- Check for an `env.exclude` pattern accidentally matching the key
+- Verify what shipped by inspecting the build's `env.json` in `.serverless-workers/`
 
 ### Worker-to-Worker Not Working
 
@@ -464,17 +675,18 @@ The CLI automatically injects environment variables:
 **Solution:**
 - Ensure callee worker is deployed
 - Check that `WORKER_QUEUE_URL_<SANITIZED_ID>` is in caller's Lambda environment
-- For cross-service calls, set env var manually
+- For cross-group calls, set env var manually (see [Worker Architecture](../advanced/worker-architecture#multi-group-deployments))
 
 ## Best Practices
 
-1. **Export `workerConfig` separately** - Makes it easy for CLI to extract
-2. **Use consistent worker IDs** - Matches filename (without `.worker.ts`)
-3. **Group workers by feature** - Use subdirectories (`app/ai/workers/video/`)
-4. **Version control `.serverless-workers/`** - Or add to `.gitignore` if regenerated
-5. **Use stages** - Deploy to `dev`, `stage`, `prod` separately
-6. **Monitor Lambda logs** - Use CloudWatch for debugging
-7. **Test locally first** - Use `mode: 'local'` in development
+1. **Develop against `ai-worker dev`** - Fast local iteration with the same routes as production, no AWS needed
+2. **Export `workerConfig` separately** - Makes it easy for CLI to extract
+3. **Use consistent worker IDs** - Matches filename (without `.worker.ts`)
+4. **Group workers by feature** - Use subdirectories (`app/ai/workers/video/`) and deployment groups for heavy dependencies
+5. **Add `.serverless-workers/` to `.gitignore`** - It is regenerated on every compile
+6. **Use stages** - Deploy `staging` and `prod` as parallel stacks with `--stage`
+7. **Keep secrets scoped** - Use the `env` block (`mode: 'explicit'` or `exclude`) so only intended keys ship
+8. **Monitor deployments** - `microfox status latest` / `microfox logs latest` after each deploy
 
 ## Integration with CI/CD
 
@@ -496,53 +708,33 @@ jobs:
         with:
           node-version: '20'
       - run: npm install
-      - run: |
-          npx ai-worker push \
-            --stage prod \
-            --region us-east-1 \
-            --env-file .env.production
+      - run: npx microfox@latest deploy --stage prod
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          MICROFOX_TOKEN: ${{ secrets.MICROFOX_TOKEN }}
+          MICROFOX_PROJECT_ID: ${{ secrets.MICROFOX_PROJECT_ID }}
 ```
+
+No AWS credentials are needed in CI — the Microfox platform performs the AWS deployment. `MICROFOX_TOKEN` replaces interactive `microfox login`; the `STAGE` env var can replace `--stage`.
 
 ## Advanced Usage
 
-### Custom Build Configuration
-
-The CLI uses `esbuild` internally. To customize:
-
-1. Generate config with `--build-only`
-2. Modify `.serverless-workers/esbuild.config.js` (if exists)
-3. Rebuild manually if needed
-
-### Multiple Services
-
-To deploy workers to different Serverless services:
+### Compile without deploying
 
 ```bash
-# Service 1
-npx ai-worker push \
-  --service-name video-workers \
-  --workers-dir app/ai/workers/video/**/*.worker.ts
-
-# Service 2
-npx ai-worker push \
-  --service-name data-workers \
-  --workers-dir app/ai/workers/data/**/*.worker.ts
+npx ai-worker compile --stage staging
+# inspect .serverless-workers/ (serverless.yml, env.json, dist/)
+npx microfox@latest push --stage staging
 ```
 
-### Custom Output Directory
+### Per-group workflows
 
 ```bash
-npx ai-worker push \
-  --output-dir .build/workers \
-  --build-only
-```
+# Recompile and redeploy just one heavy group
+npx microfox@latest deploy scraper
 
-Then manually deploy:
+# Everything except core (e.g. when only worker code changed)
+npx microfox@latest deploy --skip-group core
 
-```bash
-cd .build/workers
-serverless deploy --stage prod
+# Remove a group's stack from the platform
+npx microfox delete-group <groupname>
 ```

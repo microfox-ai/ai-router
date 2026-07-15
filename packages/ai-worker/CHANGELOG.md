@@ -1,5 +1,11 @@
 # @microfox/ai-worker
 
+## 1.1.2
+
+### Patch Changes
+
+- 5e5d989: Changes from PR #73: local-workers-and-env-control
+
 ## 1.1.1
 
 ### Patch Changes

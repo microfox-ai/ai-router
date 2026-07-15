@@ -1,5 +1,13 @@
 # @microfox/ai-worker-cli
 
+## 1.1.4
+
+### Patch Changes
+
+- 5e5d989: Changes from PR #73: local-workers-and-env-control
+- Updated dependencies [5e5d989]
+  - @microfox/ai-worker@1.1.2
+
 ## 1.1.3
 
 ### Patch Changes

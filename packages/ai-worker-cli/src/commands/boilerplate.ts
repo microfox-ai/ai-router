@@ -52,6 +52,17 @@ const WORKFLOW_SETTINGS_SNIPPET = `  // Workflow + worker runtime configuration 
         apiMode: process.env.MICROFOX_API_MODE || 'staging',
         apiVersion: process.env.MICROFOX_API_VERSION || 'v2',
       },
+      // Optional: control which env vars ship into the deployed Lambda's env.json.
+      // Without an env block, behavior is unchanged: the prefix allowlist
+      // (OPENAI_*, DATABASE_*, WORKER_*, ...) plus keys referenced via process.env in code.
+      // env: {
+      //   mode: 'all-detected', // or 'explicit' to ship ONLY the include list (+ platform keys)
+      //   include: ['SOME_SDK_KEY', 'MYAPP_*'], // '*' wildcards supported
+      //   exclude: ['DEBUG_*', 'LOCAL_ONLY_TOKEN'], // wins over include; never ships
+      //   groups: {
+      //     video: { include: ['REMOTION_LICENSE_KEY'] }, // per-group overlay
+      //   },
+      // },
     },
   },`;
 

@@ -94,8 +94,11 @@ export async function POST(request: NextRequest) {
 ### 4. Deploy Workers
 
 ```bash
-# Scan app/ai/**/*.worker.ts and deploy to AWS
-npx @microfox/ai-worker-cli@latest push
+# Scan app/ai/**/*.worker.ts and compile into .serverless-workers/ (build only)
+npx @microfox/ai-worker-cli@latest compile
+
+# Deploy to the Microfox platform (or use this alone — it compiles + pushes in one step)
+npx microfox@latest deploy
 ```
 
 ## Configuration

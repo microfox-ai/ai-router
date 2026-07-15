@@ -20,6 +20,8 @@ export * from './hitlConfig.js';
 export * from './retryConfig.js';
 export { TokenBudgetExceededError } from './tokenBudget.js';
 export type { TokenUsage, TokenBudgetState } from './tokenBudget.js';
+export * from './localBridge.js';
+export * from './localJobStore.js';
 
 /**
  * Schedule event configuration for a worker.

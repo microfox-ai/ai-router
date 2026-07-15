@@ -35,6 +35,7 @@ const TEMPLATE_SOURCES = {
   'stores/mongoAdapter.ts': 'app/api/workflows/stores/mongoAdapter.ts',
   'stores/redisAdapter.ts': 'app/api/workflows/stores/redisAdapter.ts',
   'stores/queueJobStore.ts': 'app/api/workflows/stores/queueJobStore.ts',
+  'stores/localDevAdapter.ts': 'app/api/workflows/stores/localDevAdapter.ts',
   'registry/workers.ts': 'app/api/workflows/registry/workers.ts',
   'workers/[...slug]/route.ts': 'app/api/workflows/workers/[...slug]/route.ts',
   'queues/[...slug]/route.ts': 'app/api/workflows/queues/[...slug]/route.ts',

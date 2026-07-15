@@ -129,7 +129,7 @@ function extractEnvVarUsageFromSource(source: string): {
   return { runtimeKeys, buildtimeKeys };
 }
 
-async function collectEnvUsageForWorkers(
+export async function collectEnvUsageForWorkers(
   workerEntryFiles: string[],
   projectRoot: string
 ): Promise<{ runtimeKeys: Set<string>; buildtimeKeys: Set<string> }> {
@@ -511,7 +511,7 @@ function buildDependenciesMap(projectRoot: string, deps: Set<string>): Record<st
   return out;
 }
 
-interface QueueStepInfo {
+export interface QueueStepInfo {
   workerId: string;
   delaySeconds?: number;
   requiresApproval?: boolean;
@@ -531,14 +531,14 @@ interface QueueStepInfo {
   hitlTitle?: string;
 }
 
-interface QueueInfo {
+export interface QueueInfo {
   id: string;
   filePath: string;
   steps: QueueStepInfo[];
   schedule?: string | { rate: string; enabled?: boolean; input?: Record<string, any> };
 }
 
-interface WorkerInfo {
+export interface WorkerInfo {
   id: string;
   filePath: string;
   // Module path WITHOUT extension and WITHOUT ".handler" suffix.
@@ -780,7 +780,7 @@ function validateGroupNames(workers: WorkerInfo[]): void {
 /**
  * Scans for all *.worker.ts files in app/ai directory.
  */
-async function scanWorkers(aiPath: string = 'app/ai'): Promise<WorkerInfo[]> {
+export async function scanWorkers(aiPath: string = 'app/ai'): Promise<WorkerInfo[]> {
   const pattern = path.join(aiPath, '**/*.worker.ts').replace(/\\/g, '/');
   const files = await glob(pattern);
 
@@ -840,7 +840,7 @@ async function scanWorkers(aiPath: string = 'app/ai'): Promise<WorkerInfo[]> {
 /**
  * Scans for *.queue.ts files and parses defineWorkerQueue configs.
  */
-async function scanQueues(aiPath: string = 'app/ai'): Promise<QueueInfo[]> {
+export async function scanQueues(aiPath: string = 'app/ai'): Promise<QueueInfo[]> {
   const base = aiPath.replace(/\\/g, '/');
   const pattern = `${base}/queues/**/*.queue.ts`;
   const files = await glob(pattern);
@@ -2486,15 +2486,11 @@ export const handler = async (
 }
 
 /**
- * Reads environment variables from .env file.
+ * Reads environment variables from a single .env-style file.
  */
-function loadEnvVars(envPath: string = '.env', opts: { silent?: boolean } = {}): Record<string, string> {
+function loadEnvFile(envPath: string): Record<string, string> {
   const env: Record<string, string> = {};
-
-  if (!fs.existsSync(envPath)) {
-    if (!opts.silent) console.warn(chalk.yellow(`⚠️  .env file not found at ${envPath}`));
-    return env;
-  }
+  if (!fs.existsSync(envPath)) return env;
 
   const content = fs.readFileSync(envPath, 'utf-8');
   const lines = content.split('\n');
@@ -2515,18 +2511,200 @@ function loadEnvVars(envPath: string = '.env', opts: { silent?: boolean } = {}):
 }
 
 /**
- * Loads the project's .env into process.env (non-overriding) so values like MICROFOX_PROJECT_ID
- * are visible to microfox config resolution AND to microfox.config.ts evaluation (which reads
- * process.env). Real shell/CI env vars always win — we never overwrite an existing value.
- * This is why MICROFOX_PROJECT_ID works without putting it in microfox.json / deploymentConfig.
+ * Stage-scoped env file cascade (dotenv-flow convention): later files win on key conflict.
+ * `.env` -> `.env.local` -> `.env.{stage}` -> `.env.{stage}.local`.
+ * With `isolated`, the shared base files are skipped entirely — ONLY
+ * `.env.{stage}` -> `.env.{stage}.local` are read (env.files='isolated', Plan D).
  */
-function hydrateProcessEnvFromDotenv(envPath: string = '.env'): void {
-  const fromFile = loadEnvVars(envPath, { silent: true });
-  for (const [key, value] of Object.entries(fromFile)) {
+export function loadEnvFiles(stage: string, opts: { silent?: boolean; isolated?: boolean } = {}): { env: Record<string, string>; filesRead: string[] } {
+  const candidates = opts.isolated
+    ? [`.env.${stage}`, `.env.${stage}.local`]
+    : ['.env', '.env.local', `.env.${stage}`, `.env.${stage}.local`];
+  const env: Record<string, string> = {};
+  const filesRead: string[] = [];
+
+  for (const candidate of candidates) {
+    if (!fs.existsSync(candidate)) continue;
+    filesRead.push(candidate);
+    Object.assign(env, loadEnvFile(candidate));
+  }
+
+  if (filesRead.length === 0 && !opts.silent) {
+    console.warn(chalk.yellow(`⚠️  No env file found (looked for ${candidates.join(', ')})`));
+  }
+
+  return { env, filesRead };
+}
+
+/**
+ * Loads the project's stage-scoped env cascade into process.env (non-overriding) so values like
+ * MICROFOX_PROJECT_ID are visible to microfox config resolution AND to microfox.config.ts
+ * evaluation (which reads process.env). Real shell/CI env vars always win — we never overwrite
+ * an existing value. This is why MICROFOX_PROJECT_ID works without putting it in microfox.json.
+ */
+/**
+ * Keys hydrateProcessEnvFromDotenv copied into process.env (i.e. NOT real shell/CI
+ * env). Lets the env.files='isolated' path un-hydrate base-.env keys after the
+ * config is resolved, without ever touching genuine shell env.
+ */
+const hydratedEnvKeys = new Set<string>();
+
+export function hydrateProcessEnvFromDotenv(stage: string): void {
+  const { env: fromFiles } = loadEnvFiles(stage, { silent: true });
+  for (const [key, value] of Object.entries(fromFiles)) {
     if (process.env[key] === undefined || process.env[key] === '') {
       process.env[key] = value;
+      hydratedEnvKeys.add(key);
     }
   }
+}
+
+/** Legacy hardcoded prefix allowlist — the compiled-in default of `env.mode: 'all-detected'`. */
+const ALLOWED_ENV_PREFIXES = [
+  'OPENAI_', 'ANTHROPIC_', 'DATABASE_', 'MONGODB_', 'REDIS_', 'UPSTASH_',
+  'WORKER_', 'WORKERS_', 'WORKFLOW_', 'REMOTION_', 'QUEUE_JOB_', 'DEBUG_WORKER_QUEUES',
+];
+
+/** `env` block shape read from microfox.config.ts / microfox.json (Plan D). */
+interface MicrofoxEnvConfig {
+  mode?: 'all-detected' | 'explicit';
+  /**
+   * How stage env files combine (Plan D addendum):
+   * - 'cascade' (default): dotenv-flow convention — `.env` -> `.env.local` ->
+   *   `.env.{stage}` -> `.env.{stage}.local`, later wins; stage files OVERRIDE the shared base.
+   * - 'isolated': a staged build reads ONLY `.env.{stage}` / `.env.{stage}.local`
+   *   (nothing inherits from `.env`). Compile hard-errors when neither file exists,
+   *   so a stage can never silently ship the base `.env` values.
+   */
+  files?: 'cascade' | 'isolated';
+  include?: string[];
+  exclude?: string[];
+  /** Per-group overlay: lists are appended to the project lists; `mode` overrides the project mode for that group only. */
+  groups?: Record<
+    string,
+    { mode?: 'all-detected' | 'explicit'; include?: string[]; exclude?: string[] }
+  >;
+}
+
+/** Matches `key` against a list of patterns; `*` is a wildcard (prefix/suffix/middle), rest is literal. */
+function matchesGlobList(key: string, patterns: string[] | undefined): boolean {
+  if (!patterns || patterns.length === 0) return false;
+  return patterns.some((pattern) => {
+    if (!pattern.includes('*')) return key === pattern;
+    const escaped = pattern
+      .split('*')
+      .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+      .join('.*');
+    return new RegExp(`^${escaped}$`).test(key);
+  });
+}
+
+function getEnvConfig(microfoxConfig: Record<string, any> | null): MicrofoxEnvConfig {
+  const env = microfoxConfig?.env;
+  return env && typeof env === 'object' ? (env as MicrofoxEnvConfig) : {};
+}
+
+/** Project-level include/exclude lists merged with the given group's overlay (group lists appended). */
+function resolveGroupEnvLists(
+  envConfig: MicrofoxEnvConfig,
+  group?: string | null
+): { include: string[]; exclude: string[] } {
+  const projectInclude = Array.isArray(envConfig.include) ? envConfig.include : [];
+  const projectExclude = Array.isArray(envConfig.exclude) ? envConfig.exclude : [];
+  const groupCfg = group ? envConfig.groups?.[group] : undefined;
+  const groupInclude = Array.isArray(groupCfg?.include) ? groupCfg!.include : [];
+  const groupExclude = Array.isArray(groupCfg?.exclude) ? groupCfg!.exclude : [];
+  return {
+    include: [...projectInclude, ...groupInclude],
+    exclude: [...projectExclude, ...groupExclude],
+  };
+}
+
+/**
+ * Builds the env.json content for one deployable unit (single-group build, or one group /
+ * core in a multi-group build). Shared by all three env.json call sites so the resolution
+ * order — platform defaults, exclude, include, mode, AWS_ block — stays in one place.
+ *
+ * Resolution order per key: platform defaults (always win, un-excludable) > AWS_* (never ships)
+ * > exclude > include > mode `all-detected` (legacy prefix allowlist + detected keys) or
+ * `explicit` (nothing else ships).
+ */
+function buildEnvJson(
+  envVars: Record<string, string>,
+  referencedEnvKeys: Set<string>,
+  microfoxConfig: Record<string, any> | null,
+  group: string | null,
+  platformDefaults: Record<string, string>,
+  envFilesRead: string[] = []
+): Record<string, string> {
+  const envConfig = getEnvConfig(microfoxConfig);
+  // Group `mode` overrides the project mode for that group's env.json only;
+  // any other/missing value inherits the project mode (default all-detected).
+  const groupMode = group ? envConfig.groups?.[group]?.mode : undefined;
+  const effectiveMode =
+    groupMode === 'explicit' || groupMode === 'all-detected' ? groupMode : envConfig.mode;
+  const mode = effectiveMode === 'explicit' ? 'explicit' : 'all-detected';
+  const { include, exclude } = resolveGroupEnvLists(envConfig, group);
+
+  const result: Record<string, string> = { ...platformDefaults };
+  const shippedKeys: string[] = [];
+
+  for (const [key, value] of Object.entries(envVars)) {
+    // AWS_ prefix is reserved by Lambda, never ships regardless of config.
+    // https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars.html
+    if (key.startsWith('AWS_')) continue;
+    // Platform-required keys (ENVIRONMENT/STAGE/NODE_ENV) already set above and cannot be excluded.
+    if (key in result) continue;
+
+    if (matchesGlobList(key, exclude)) continue;
+
+    if (matchesGlobList(key, include)) {
+      result[key] = value;
+      shippedKeys.push(key);
+      continue;
+    }
+
+    if (mode === 'all-detected') {
+      if (ALLOWED_ENV_PREFIXES.some((prefix) => key.startsWith(prefix)) || referencedEnvKeys.has(key)) {
+        result[key] = value;
+        shippedKeys.push(key);
+      }
+    }
+  }
+
+  const missingIncludes = include.filter((pattern) =>
+    pattern.includes('*') ? !Object.keys(envVars).some((k) => matchesGlobList(k, [pattern])) : !(pattern in envVars)
+  );
+  if (missingIncludes.length > 0) {
+    const readLabel = envFilesRead.length ? envFilesRead.join(', ') : 'any env file';
+    console.warn(
+      chalk.yellow(
+        `⚠️  env.include key(s) not found in ${readLabel}${group ? ` (group: ${group})` : ''}: ${missingIncludes.join(', ')}`
+      )
+    );
+  }
+
+  if (mode === 'explicit') {
+    console.log(
+      chalk.gray(
+        `  ℹ env mode "explicit"${group ? ` (${group})` : ''}: shipping ${shippedKeys.length} key(s): ${shippedKeys.join(', ') || '(none)'}`
+      )
+    );
+  }
+
+  // The 'local' job store only works inside `ai-worker dev` — deployed Lambdas
+  // can't use it (read-only FS, per-container memory). Shipping it is almost
+  // always a leftover dev line in .env; warn loudly (but honor it, since the
+  // user set it explicitly).
+  if ((result.WORKER_DATABASE_TYPE || '').toLowerCase() === 'local') {
+    console.warn(
+      chalk.yellow(
+        `⚠️  WORKER_DATABASE_TYPE=local is being baked into env.json${group ? ` (group: ${group})` : ''} — deployed workers CANNOT use the local dev store. Remove the line from your .env (it is meant for \`ai-worker dev\` only) unless you really intend this.`
+      )
+    );
+  }
+
+  return result;
 }
 
 /**
@@ -2727,7 +2905,13 @@ function generateServerlessConfig(
       Description: `Queue URL for worker ${worker.id}`,
       Value: { Ref: queueLogicalId },
       Export: {
-        Name: `\${self:service}-${worker.id}-queue-url`,
+        // Stage-qualify the export name. CloudFormation export names must be unique per
+        // region/account, but `self:service` is stage-independent (only the STACK name
+        // carries -prod/-staging). Without the stage here, a staging stack collides with
+        // its prod counterpart ("Export ... is already exported by stack ...-prod") and
+        // rolls back. This export is informational (cross-stack queue URLs are built by
+        // string interpolation, not Fn::ImportValue), so renaming it breaks nothing.
+        Name: `\${self:service}-\${opt:stage, env:ENVIRONMENT, '${stage}'}-${worker.id}-queue-url`,
       },
     };
 
@@ -3092,10 +3276,21 @@ function generateServerlessConfigCore(
 }
 
 async function build(args: any) {
-  // Make .env values (e.g. MICROFOX_PROJECT_ID) available to config resolution + microfox.config.ts.
-  hydrateProcessEnvFromDotenv();
-
   const stage = args.stage || process.env.STAGE || 'prod';
+  // Fixed stage set (decision D3): the standard AWS stages, not free-form names.
+  // They embed into CloudFormation stack / Lambda / SQS names and the {sub}.microfox.app/{stage}
+  // route path, so the platform relies on this exact set.
+  const VALID_STAGES = ['prod', 'staging', 'dev'];
+  if (!VALID_STAGES.includes(stage)) {
+    console.error(
+      chalk.red(`❌ Invalid stage "${stage}". Valid stages: ${VALID_STAGES.join(', ')}.`)
+    );
+    process.exit(1);
+  }
+  // Make the stage-scoped .env cascade values (e.g. MICROFOX_PROJECT_ID) available to config
+  // resolution + microfox.config.ts.
+  hydrateProcessEnvFromDotenv(stage);
+
   const region = args.region || process.env.AWS_REGION || 'us-east-1';
   const aiPath = args.aiPath ?? args['ai-path'] ?? 'app/ai';
   // Group selection (multi-group layout only): build a single group, or skip groups.
@@ -3175,11 +3370,11 @@ async function build(args: any) {
 
   // No tsconfig.json needed as we are deploying bundled JS
 
-  const envVars = loadEnvVars();
+  let { env: envVars, filesRead: envFilesRead } = loadEnvFiles(stage);
 
   // Detect env usage from worker entry files + their local dependency graph.
   // We use this to populate env.json with only envs that are actually referenced,
-  // but ONLY if they exist in .env (we don't invent values).
+  // but ONLY if they exist in the env file cascade (we don't invent values).
   const workerEntryFiles = workers.map((w) => w.filePath);
   const { runtimeKeys: runtimeEnvKeys, buildtimeKeys: buildtimeEnvKeys } =
     await collectEnvUsageForWorkers(workerEntryFiles, process.cwd());
@@ -3203,7 +3398,7 @@ async function build(args: any) {
     if (missingFromDotEnv.length > 0) {
       console.log(
         chalk.yellow(
-          `⚠️  These referenced envs were not found in .env (so they will NOT be written to env.json): ${missingFromDotEnv
+          `⚠️  These referenced envs were not found in ${envFilesRead.length ? envFilesRead.join(', ') : 'any env file'} (so they will NOT be written to env.json): ${missingFromDotEnv
             .slice(0, 25)
             .join(', ')}${missingFromDotEnv.length > 25 ? ' ...' : ''}`
         )
@@ -3229,6 +3424,50 @@ async function build(args: any) {
       }
       console.log(
         chalk.blue(`ℹ️  Using service name from ${resolvedMicrofoxConfig.source}: ${serviceName}`)
+      );
+    }
+  }
+
+  // Plan D addendum — env.files='isolated': re-source env values from the stage
+  // files ONLY (no inheritance from .env/.env.local). Must happen after config
+  // resolution (the setting lives in the config) and before anything that reads
+  // envVars (incl. the workers API key below, so auth secrets are stage-scoped too).
+  if (getEnvConfig(microfoxConfig).files === 'isolated') {
+    const isolatedLoad = loadEnvFiles(stage, { isolated: true, silent: true });
+    if (isolatedLoad.filesRead.length === 0) {
+      console.error(
+        chalk.red(
+          `❌ env.files is 'isolated' but neither .env.${stage} nor .env.${stage}.local exists.\n` +
+            `   Create .env.${stage} with ALL env vars this stage needs, or remove files: 'isolated' to use the .env cascade.`
+        )
+      );
+      process.exit(1);
+    }
+    const droppedKeys = Object.keys(envVars)
+      .filter((k) => !(k in isolatedLoad.env))
+      .sort();
+    envVars = isolatedLoad.env;
+    envFilesRead = isolatedLoad.filesRead;
+    // Un-hydrate: keys the pre-config hydration copied from the CASCADE into
+    // process.env must not leak past isolation (e.g. WORKERS_API_KEY resolution
+    // reads process.env as a fallback). Only touches keys hydration itself set —
+    // real shell/CI env still wins, unchanged. Config evaluation already happened,
+    // so MICROFOX_PROJECT_ID etc. served their purpose.
+    for (const key of hydratedEnvKeys) {
+      if (key in isolatedLoad.env) {
+        process.env[key] = isolatedLoad.env[key];
+      } else {
+        delete process.env[key];
+      }
+    }
+    console.log(
+      chalk.blue(`ℹ️  env.files=isolated: values sourced ONLY from ${envFilesRead.join(', ')}`)
+    );
+    if (droppedKeys.length > 0) {
+      console.log(
+        chalk.yellow(
+          `   ${droppedKeys.length} key(s) from .env/.env.local are NOT available to this build: ${droppedKeys.slice(0, 25).join(', ')}${droppedKeys.length > 25 ? ' ...' : ''}`
+        )
       );
     }
   }
@@ -3451,8 +3690,6 @@ async function build(args: any) {
     for (const g of userGroups) {
       allWorkersByGroup.set(g, workers.filter((w) => w.group === g));
     }
-    const allowedPrefixes = ['OPENAI_', 'ANTHROPIC_', 'DATABASE_', 'MONGODB_', 'REDIS_', 'UPSTASH_', 'WORKER_', 'WORKERS_', 'WORKFLOW_', 'REMOTION_', 'QUEUE_JOB_', 'DEBUG_WORKER_QUEUES'];
-
     if (emitCore) {
       const coreDir = path.join(serverlessDir, 'core');
       fs.mkdirSync(coreDir, { recursive: true });
@@ -3488,10 +3725,14 @@ async function build(args: any) {
       }
       const configCore = generateServerlessConfigCore(projectId, allWorkersByGroup, queues, stage, region, envVars, serviceNameCore, coreExternalPackages, microfoxConfig);
       fs.writeFileSync(path.join(coreDir, 'serverless.yml'), yaml.dump(configCore, { lineWidth: -1 }));
-      const safeEnv: Record<string, string> = { ENVIRONMENT: 'prod', STAGE: 'prod', NODE_ENV: 'prod' };
-      for (const [k, v] of Object.entries(envVars)) {
-        if (allowedPrefixes.some((p) => k.startsWith(p))) safeEnv[k] = v;
-      }
+      const safeEnv = buildEnvJson(
+        envVars,
+        new Set<string>(),
+        microfoxConfig,
+        'core',
+        { ENVIRONMENT: stage, STAGE: stage, NODE_ENV: stage },
+        envFilesRead
+      );
       applyWorkersApiKey(safeEnv);
       fs.writeFileSync(path.join(coreDir, 'env.json'), JSON.stringify(safeEnv, null, 2));
     }
@@ -3544,18 +3785,21 @@ async function build(args: any) {
         group: g,
       });
       fs.writeFileSync(path.join(groupDir, 'serverless.yml'), yaml.dump(configUser, { lineWidth: -1 }));
-      // Per-group env: only keys referenced by this group's workers + allowedPrefixes
+      // Per-group env: keys referenced by this group's workers, plus config-driven include/exclude.
       const { runtimeKeys: runtimeEnvKeysGroup, buildtimeKeys: buildtimeEnvKeysGroup } =
         await collectEnvUsageForWorkers(workersForGroup.map((w) => w.filePath), process.cwd());
       const referencedEnvKeysGroup = new Set<string>([
         ...Array.from(runtimeEnvKeysGroup),
         ...Array.from(buildtimeEnvKeysGroup),
       ]);
-      const safeEnvGroup: Record<string, string> = { ENVIRONMENT: 'prod', STAGE: 'prod', NODE_ENV: 'prod' };
-      for (const [k, v] of Object.entries(envVars)) {
-        if (k.startsWith('AWS_')) continue;
-        if (allowedPrefixes.some((p) => k.startsWith(p)) || referencedEnvKeysGroup.has(k)) safeEnvGroup[k] = v;
-      }
+      const safeEnvGroup = buildEnvJson(
+        envVars,
+        referencedEnvKeysGroup,
+        microfoxConfig,
+        g,
+        { ENVIRONMENT: stage, STAGE: stage, NODE_ENV: stage },
+        envFilesRead
+      );
       applyWorkersApiKey(safeEnvGroup);
       fs.writeFileSync(path.join(groupDir, 'env.json'), JSON.stringify(safeEnvGroup, null, 2));
     }
@@ -3607,28 +3851,16 @@ async function build(args: any) {
   const config = generateServerlessConfig(workers, stage, region, envVars, serviceName, calleeIds, queues, { externalPackages, microfoxConfig });
 
   // Always generate env.json now as serverless.yml relies on it.
-  // Backward-compatible behavior: if root microfox.json exists, force prod env stage.
-  // Also force prod when config-based deployment config is present.
-  const hasRootMicrofoxJson = fs.existsSync(path.join(process.cwd(), 'microfox.json'));
-  const envStage = hasRootMicrofoxJson || resolvedMicrofoxConfig ? 'prod' : stage;
-  const safeEnvVars: Record<string, string> = {
-    ENVIRONMENT: envStage,
-    STAGE: envStage,
-    NODE_ENV: envStage,
-  };
-  const allowedPrefixes = ['OPENAI_', 'ANTHROPIC_', 'DATABASE_', 'MONGODB_', 'REDIS_', 'UPSTASH_', 'WORKER_', 'WORKERS_', 'WORKFLOW_', 'REMOTION_', 'QUEUE_JOB_', 'DEBUG_WORKER_QUEUES'];
-
-  for (const [key, value] of Object.entries(envVars)) {
-    // AWS_ prefix is reserved by Lambda, do not include it in environment variables
-    // https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars.html
-    if (key.startsWith('AWS_')) continue;
-
-    // Keep legacy behavior for known-safe prefixes,
-    // and also include any env that is referenced by worker code.
-    if (allowedPrefixes.some((prefix) => key.startsWith(prefix)) || referencedEnvKeys.has(key)) {
-      safeEnvVars[key] = value;
-    }
-  }
+  // The env stage follows --stage (default 'prod') — Plan E: the old force-prod override
+  // for microfox projects is gone so multi-stage deploys of the same project work.
+  const safeEnvVars = buildEnvJson(
+    envVars,
+    referencedEnvKeys,
+    microfoxConfig,
+    userGroups[0] ?? null,
+    { ENVIRONMENT: stage, STAGE: stage, NODE_ENV: stage },
+    envFilesRead
+  );
   applyWorkersApiKey(safeEnvVars);
 
   fs.writeFileSync(
@@ -3644,7 +3876,9 @@ async function build(args: any) {
 
 const attachBuildOptions = (cmd: Command): Command =>
   cmd
-    .option('-s, --stage <stage>', 'Stage baked into the generated serverless config', 'prod')
+    // No commander default: build() falls back to process.env.STAGE, then 'prod',
+    // so CI can drive the stage via env without passing the flag.
+    .option('-s, --stage <stage>', 'Deployment stage (default: STAGE env var, then "prod")')
     .option('-r, --region <region>', 'AWS region baked into the generated serverless config', 'us-east-1')
     .option('--ai-path <path>', 'Path to the AI directory containing workers', 'app/ai')
     .option(

@@ -350,7 +350,7 @@ Token usage is persisted to the job store after each `reportTokenUsage()` call, 
 
 ### Lambda deployment (WorkerConfig)
 
-When you deploy workers with `npx ai-worker push`, the CLI generates Lambda functions and SQS queues from your worker definitions. You can customize each worker’s Lambda and queue behavior by exporting a **`WorkerConfig`** from the same file as the worker.
+When you compile workers with `npx ai-worker compile` (or deploy with `npx microfox deploy`), the CLI generates Lambda functions and SQS queues from your worker definitions. You can customize each worker’s Lambda and queue behavior by exporting a **`WorkerConfig`** from the same file as the worker.
 
 **Best practice:** Export `workerConfig` as a **separate const** from your worker file. The CLI reads this export when building `serverless.yml`; you do not pass it into `createWorker()`.
 
@@ -682,6 +682,8 @@ In development (`NODE_ENV === 'development'` and `WORKERS_LOCAL_MODE !== 'false'
 
 Perfect for fast iteration and debugging.
 
+You can also run a full local worker stack with `npx ai-worker dev` — an HTTP server on `localhost:4100` exposing the same routes as a deployed core group (trigger, config, queue start), with in-process worker execution, hot reload, and a file-persisted job store. Point your app at it with `WORKER_BASE_URL=http://localhost:4100`. See the [CLI reference](../api-reference/ai-worker-cli#dev-local-dev-server) for details.
+
 ### Remote mode (production)
 
 In production or when `mode: 'remote'`, `dispatch()` sends messages to SQS which triggers Lambda functions:
@@ -694,12 +696,12 @@ In production or when `mode: 'remote'`, `dispatch()` sends messages to SQS which
 Deploy workers with:
 
 ```bash
-npx ai-worker push --stage prod
+npx microfox@latest deploy
 ```
 
-See the [CLI reference](../api-reference/ai-worker-cli) for deployment details. Use `npx ai-worker push` for build and deploy; `npx microfox compile` for build only, `npx microfox push` for deploy only.
+See the [CLI reference](../api-reference/ai-worker-cli) for deployment details. `npx microfox deploy` compiles and pushes in one step; `npx ai-worker compile` (or `npx microfox compile`) builds only, and `npx microfox push` uploads an existing build. Add `--stage <stage>` for parallel staging/prod stacks.
 
-**Push parameters (multi-group):** When using multiple groups, you can deploy a single group or skip groups: `npx microfox push [groupname]` deploys only that group; `npx microfox push --skip-group "g1,g2,g3"` deploys all groups except the listed ones. From the ai-worker CLI, `npx ai-worker push --skip-core` deploys every group except core (it runs `npx microfox push --skip-group "core"`).
+**Deploy parameters (multi-group):** When using multiple groups, you can deploy a single group or skip groups: `npx microfox deploy [groupname]` compiles and deploys only that group; `npx microfox deploy --skip-group "g1,g2,g3"` deploys all groups except the listed ones. The same selection works on `microfox compile` and `microfox push` separately.
 
 **Cross-group dispatch:** Same-group workers get `WORKER_QUEUE_URL_*` and IAM automatically. For queue chains, the next-step worker's queue URL and IAM are injected even when that worker is in another group. For ad-hoc worker-to-worker across groups, add `WORKER_QUEUE_URL_<SANITIZED_ID>` and IAM in that stack's serverless.yml.
 

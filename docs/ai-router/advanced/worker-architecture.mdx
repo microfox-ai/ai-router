@@ -9,7 +9,7 @@ description: 'Deep dive into the architecture of @microfox/ai-worker and @microf
 The worker system consists of two main packages:
 
 - **`@microfox/ai-worker`** - Runtime library for defining and executing workers
-- **`@microfox/ai-worker-cli`** - Deployment tooling for AWS Lambda
+- **`@microfox/ai-worker-cli`** - Build + local dev tooling (`compile`, `dev`); deployment to AWS Lambda happens through the `microfox` CLI (`microfox deploy`)
 
 Together, they enable durable, scalable background job execution with worker-to-worker communication, job state management, and seamless local/production execution.
 
@@ -20,7 +20,7 @@ flowchart TD
   App["Next.js App<br/>(or any server)"]
   WorkersAPI["Workers HTTP API<br/>(/api/workflows/workers/*)"]
   WorkerDef["Worker Definition<br/>(.worker.ts)"]
-  CLI["@microfox/ai-worker-cli<br/>(push command)"]
+  CLI["@microfox/ai-worker-cli<br/>(compile) + microfox CLI (deploy)"]
   SQS["AWS SQS Queue"]
   Lambda["AWS Lambda Function"]
   JobStore["Job Store<br/>(MongoDB or Redis)"]
@@ -260,9 +260,9 @@ A **worker queue** is a fixed sequence of workers (e.g. step A → step B → st
 
 **Defining queues:** Use `.queue.ts` files with `defineWorkerQueue({ id, steps: [...], schedule? })`. Each step: `{ workerId, delaySeconds?, chain?, resume?, requiresApproval?, hitl?, loop? }`. `chain` maps the previous step's output to the current step's input. `requiresApproval: true` pauses the queue for human review (HITL). The CLI scans queues and generates queue-starter Lambdas when `schedule` is set. See [HITL Queues](../advanced/hitl-queues) for the full guide.
 
-### 7. CLI Deployment Layer
+### 7. CLI Build & Deployment Layer
 
-The CLI (`@microfox/ai-worker-cli`) handles deployment:
+The build CLI (`@microfox/ai-worker-cli`, via `ai-worker compile`) produces the deployable build; the `microfox` CLI (`microfox push` / `microfox deploy`) uploads it to the Microfox platform, which performs the AWS deployment:
 
 **Scanning Phase:**
 
@@ -286,12 +286,13 @@ The CLI (`@microfox/ai-worker-cli`) handles deployment:
 2. **External deps**: Exclude node_modules (use Lambda layers or install)
 3. **Output**: Write to `.serverless-workers/dist/`
 
-**Deploy Phase:**
+**Deploy Phase** (`microfox push` / `microfox deploy`):
 
-1. **Package**: Create deployment package
-2. **Deploy**: Run `serverless deploy`
+1. **Package**: Bundle the `.serverless-workers/` build as a ZIP (per group in multi-group layouts)
+2. **Upload**: Send it to the Microfox platform, which runs `serverless deploy` server-side (no local AWS credentials needed)
 3. **Create resources**: SQS queues, Lambda functions, IAM roles
-4. **Update configs**: Environment variables, event sources
+4. **Update configs**: Environment variables (from `env.json`), event sources
+5. **Record**: The deployment is tracked with a Deployment ID — check it with `microfox status` / `microfox logs` or in the Microfox console
 
 ### Multi-group deployments
 
@@ -302,6 +303,7 @@ You can split workers into **groups**, each deployed as a separate Serverless pr
 - **Worker queues in core**: Queues are group-agnostic; their steps can reference workers from any group. Queue definitions and queue-starter Lambdas are built and deployed only in core, so starting a queue uses the same base URL as triggering a worker.
 - **Group in worker config**: Export `group: 'workflows'` (or any name except `core`, max 12 characters) in `workerConfig` to assign that worker to a different stack. Workers without `group` go to the `default` group.
 - **Cross-group dispatch**: For a Lambda in group A to call a worker in group B (outside of a queue next-step), add `WORKER_QUEUE_URL_<SANITIZED_B_ID>` and IAM `sqs:SendMessage` for that queue in that stack's serverless.yml. Queue next-steps across groups are injected automatically by the CLI.
+- **Selective builds/deploys**: `npx microfox deploy [group]` compiles + pushes only that group; `npx microfox deploy --skip-group "core,workflows"` skips the listed groups. The same `[group]`/`--skip-group` selection works on `microfox compile`, `microfox push`, and `ai-worker compile`.
 
 ### Project config (microfox.json)
 
@@ -334,6 +336,8 @@ The CLI reads optional **worker** configuration from the project root `microfox.
 ```
 
 Workers with `group: 'scraper'` are then built with `node_modules` included for that stack only; `default` and other groups use the project default (no node_modules). The CLI merges `worker.*` with `worker.groups[groupName]` when building each group.
+
+The same config object also accepts an optional **`env`** block (with its own per-group overlays) that controls which environment variables ship into each build's `env.json` — see [CLI reference – Controlling shipped env vars](../api-reference/ai-worker-cli#controlling-shipped-env-vars-env-block).
 
 ## Data Flow Examples
 
@@ -473,6 +477,16 @@ Workers with `group: 'scraper'` are then built with `node_modules` included for 
 
 ## Monitoring and Observability
 
+### Deployment monitoring (microfox CLI + console)
+
+Every `microfox push`/`deploy` is tracked by the platform with a Deployment ID:
+
+- `npx microfox status latest` – deployment state, error (if any), timing, and the deployed **Base URL** (`-n 3` shows the last 3, e.g. one per group)
+- `npx microfox logs latest` – platform-side build logs in three phases (`compiling`, `deploying`, `post_deployment`)
+- `npx microfox metrics <deploymentId>` – build timing per step, CPU/memory peaks, image size, data transfer
+
+The **Microfox console** shows the same deployment records under your project — status, logs, and endpoints — so you can monitor from either the CLI or the browser.
+
 ### CloudWatch Metrics
 
 **Lambda metrics:**
@@ -507,7 +521,7 @@ Workers with `group: 'scraper'` are then built with `node_modules` included for 
 4. **Error handling**: Always update job status on errors
 5. **Progress updates**: Use `jobStore.update({ progress })` for long-running jobs
 6. **Worker-to-worker**: Prefer fire-and-forget unless you need output
-7. **Testing**: Test locally with `mode: 'local'` before deploying
+7. **Testing**: Test locally with `npx ai-worker dev` (or `mode: 'local'`) before deploying
 8. **Monitoring**: Set up CloudWatch alarms for error rates
 9. **Documentation**: Document worker inputs/outputs in Zod schemas
 10. **Versioning**: Use stages (dev/stage/prod) for safe deployments
@@ -560,7 +574,7 @@ After setting up the boilerplate, configure your job store:
 
 3. **Deploy workers** (optional, for production):
    ```bash
-   npx ai-worker push --stage prod   # build and deploy; use npx microfox push for deploy only
+   npx microfox@latest deploy   # compile + push; or npx ai-worker compile then npx microfox push
    ```
 
 4. **Set WORKER_BASE_URL** (if using deployed workers):

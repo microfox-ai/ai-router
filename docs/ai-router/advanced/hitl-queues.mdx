@@ -469,5 +469,5 @@ See the calculator-session example in the repository:
 | Worker schema includes `__hitlInput` or `__workerQueue` | Remove them — the runtime strips envelope keys before the handler |
 | Using `busy={polling}` instead of `busy={loading}` | Use `loading` (true only during submit); `polling` stays true while waiting |
 | `stepIndex` mismatch after loops | Use `hitlTask.stepIndex` (array index) not the queue definition index |
-| Forgot to re-deploy after registry change | Run `npx ai-worker push` to redeploy the worker Lambda |
+| Forgot to re-deploy after registry change | Run `npx microfox@latest deploy` to rebuild and redeploy the worker Lambda |
 | `resume()` missing — reviewer input not merged | Add a `resume` function or rely on the default shallow merge |
